@@ -100,16 +100,39 @@ public sealed partial class CloudContentConfirmationTests
         await using Fixture fixture = await Fixture.StartAsync();
         const long length = (1L << 32) + 17;
         const int segment = 1024 * 1024;
+        (long Offset, byte[] Bytes)[] markers =
+        [
+            (0, "low-offset"u8.ToArray()),
+            ((1L << 31) + 31, "middle-offset"u8.ToArray()),
+            ((1L << 32) + 3, "high-offset"u8.ToArray()),
+        ];
         await using (FileStream stream = new(fixture.File.FullPath, FileMode.CreateNew, FileAccess.Write))
         {
             stream.SetLength(length);
+            foreach ((long offset, byte[] bytes) in markers)
+            {
+                stream.Position = offset;
+                await stream.WriteAsync(bytes);
+            }
         }
 
-        byte[] zeros = new byte[segment];
+        byte[] block = new byte[segment];
         using IncrementalHash digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        for (long remaining = length; remaining > 0; remaining -= Math.Min(remaining, zeros.Length))
+        for (long offset = 0; offset < length; offset += segment)
         {
-            digest.AppendData(zeros, 0, (int)Math.Min(remaining, zeros.Length));
+            Array.Clear(block);
+            int count = (int)Math.Min(length - offset, block.Length);
+            // Compute the expected digest independently of native reads. Distinct markers
+            // below and above 4 GiB expose offset truncation that all-zero content could hide.
+            foreach ((long markerOffset, byte[] bytes) in markers)
+            {
+                if (markerOffset >= offset && markerOffset < offset + count)
+                {
+                    bytes.CopyTo(block.AsSpan((int)(markerOffset - offset)));
+                }
+            }
+
+            digest.AppendData(block, 0, count);
         }
 
         CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
