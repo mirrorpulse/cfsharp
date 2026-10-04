@@ -28,6 +28,7 @@ public sealed class CloudItemUsnTests
         WithFileSystemAsync(policy, async (fileSystem, rootPath) =>
         {
             CloudFile file = fileSystem.GetFile("ordinary.bin");
+            CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await file.InspectAsync()).LocalBinding);
             Assert.True(await file.ReadUsnAsync() > 0);
             Assert.True(await fileSystem.GetDirectory("Folder").ReadUsnAsync() > 0);
             await Assert.ThrowsAsync<InvalidOperationException>(() => fileSystem
@@ -47,6 +48,7 @@ public sealed class CloudItemUsnTests
             _output.WriteLine($"ConvertUsn={converted.OperationUsn}; ObservedUsn={await file.ReadUsnAsync()}");
             Assert.True(await file.ReadUsnAsync() > 0);
             Assert.Equal(OriginalContent, await File.ReadAllBytesAsync(file.FullPath));
+            Assert.Equal(binding, (await file.InspectAsync()).LocalBinding);
 
             long beforeWriteUsn = await file.ReadUsnAsync();
             await ChangeContentAsync(file.FullPath);
@@ -67,6 +69,7 @@ public sealed class CloudItemUsnTests
             CloudFile onlineOnly = fileSystem.GetFile("online-only.bin");
             Assert.True(await onlineOnly.ReadUsnAsync() > 0);
             Assert.Equal(CloudContentAvailability.OnlineOnly, (await onlineOnly.InspectAsync()).ContentAvailability);
+            Assert.NotNull((await onlineOnly.InspectAsync()).LocalBinding);
             await file.RevertToRegularItemAsync();
             Assert.True(await file.ReadUsnAsync() > 0);
             await fileSystem.DisposeAsync();

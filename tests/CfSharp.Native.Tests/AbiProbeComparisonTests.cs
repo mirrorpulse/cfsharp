@@ -36,6 +36,14 @@ public sealed class AbiProbeComparisonTests
         AssertProbe(probe, "overlappedSize", Marshal.SizeOf<OverlappedRead.Overlapped>());
         AssertOffset<OverlappedRead.Overlapped>(probe, "overlappedOffsetOffset", "Offset");
         AssertOffset<OverlappedRead.Overlapped>(probe, "overlappedEventOffset", "Event");
+        AssertProbe(probe, "fileIdInfoSize", Marshal.SizeOf<WindowsFileMetadata.FileIdentity>());
+        AssertOffset<WindowsFileMetadata.FileIdentity>(probe, "fileIdInfoIdOffset", "FileId");
+        AssertProbe(probe, "fileStandardInfoSize", Marshal.SizeOf<WindowsFileMetadata.FileStandardInfo>());
+        AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoLengthOffset", "EndOfFile");
+        AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoLinksOffset", "NumberOfLinks");
+        AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoDeleteOffset", "DeletePending");
+        AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoDirectoryOffset", "Directory");
+        AssertProbe(probe, "fileAttributeTagInfoSize", Marshal.SizeOf<WindowsFileMetadata.FileAttributeTagInfo>());
         AssertProbe(probe, "readFileUsnDataSize", Marshal.SizeOf<WindowsFileUsn.ReadFileUsnData>());
         AssertOffset<WindowsFileUsn.ReadFileUsnData>(probe, "readFileUsnDataMaxMajorVersionOffset", "MaxMajorVersion");
         AssertProbe(probe, "usnRecordV2UsnOffset", WindowsFileUsn.Version2UsnOffset);

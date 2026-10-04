@@ -492,7 +492,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         ICloudStateStore stateStore,
         CancellationToken cancellationToken)
     {
-        LocalCloudItemInspection local = CloudItemInspector.Inspect(item.FullPath, item.Kind);
+        LocalCloudItemInspection local = CloudItemInspector.Inspect(item.FullPath, item.Kind, item.SyncRootPath);
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -527,7 +527,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
             local.PropertyDataSize,
             local.PlaceholderIdentity,
             durableState,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            local.LocalBinding);
     }
 
     private void EnsureStarted()

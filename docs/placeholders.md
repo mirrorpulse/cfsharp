@@ -44,6 +44,13 @@ succeeds.
 
 ## Conditional in-sync confirmation
 
+`CloudItemSnapshot.LocalBinding` exposes the complete native volume, actual sync-root directory,
+and 128-bit file object IDs for ordinary files and placeholders. Inspection reads metadata without
+hydrating content. Capture the binding before uploading and retain it with the accepted proof;
+re-observing the same path after replacement cannot establish that it is the uploaded object.
+Bindings are immutable comparison values, not locks or conditional USN tokens. The existing
+nullable 64-bit snapshot IDs retain their previous meaning and availability.
+
 `OperationUsn` preserves the value returned by the Cloud Files mutation. Windows can successfully
 convert, update, or set the in-sync state while returning zero. Zero is not a conditional token:
 [`CfSetInSyncState`](https://learn.microsoft.com/windows/win32/api/cfapi/nf-cfapi-cfsetinsyncstate)
