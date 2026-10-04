@@ -1,6 +1,11 @@
 using CfSharp;
 using CfSharp.Storage.Sqlite;
 
+if (args.Length == 3 && args[2] == "protected-confirmation" && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
+{
+    return await ProtectedConfirmationCrash.RunAsync(args[0], args[1]);
+}
+
 if (args.Length == 3 && args[2] == "protected-write")
 {
     using EventWaitHandle ready = EventWaitHandle.OpenExisting(args[1]);
