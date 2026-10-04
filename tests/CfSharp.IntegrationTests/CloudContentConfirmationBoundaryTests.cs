@@ -1,10 +1,70 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 
+using CfSharp.Native;
+
 namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    [Theory]
+    [InlineData(false, "oplock")]
+    [InlineData(true, "oplock")]
+    [InlineData(false, "guard")]
+    [InlineData(true, "guard")]
+    [InlineData(false, "metadata")]
+    [InlineData(true, "metadata")]
+    [InlineData(false, "read")]
+    [InlineData(true, "read")]
+    public async Task ShortReferencesRemainUsableWithoutACompetingMutation(bool placeholder, string operation)
+    {
+        await using Fixture fixture = await Fixture.StartAsync();
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        if (placeholder)
+        {
+            await fixture.File.ConvertToPlaceholderAsync(new CloudPlaceholderIdentity(Guid.NewGuid(), "reference-object", "revision-1"));
+        }
+
+        output.WriteLine($"OS={Environment.OSVersion.Version}; Placeholder={placeholder}; Operation={operation}");
+        if (operation == "oplock")
+        {
+            using SafeCloudFilesProtectedHandle owner = SafeCloudFilesProtectedHandle.Open(fixture.File.FullPath,
+                CfOpenFileFlags.Exclusive | CfOpenFileFlags.WriteAccess, "Confirmation.ReferenceContract");
+            for (int index = 0; index < 3; index++)
+            {
+                output.WriteLine($"Reference={index}");
+                using (SafeCloudFilesProtectedHandle.CloudFilesHandleReference reference = owner.AcquireReference())
+                {
+                    Assert.NotEqual(0, reference.Win32Handle);
+                }
+                await Task.Delay(20);
+            }
+        }
+        else
+        {
+            using CloudProtectedContentSession owner = new(fixture.File.FullPath, fixture.Root);
+            byte[] buffer = new byte[content.Length];
+            for (int index = 0; index < 3; index++)
+            {
+                output.WriteLine($"Reference={index}");
+                using (ICloudProtectedContentReference reference = owner.Reference())
+                {
+                    if (operation == "metadata")
+                    {
+                        Assert.Equal(content.Length, reference.Inspect().Length);
+                    }
+                    else if (operation == "read")
+                    {
+                        Assert.Equal(content.Length, reference.Read(buffer, buffer.Length, 0, TimeSpan.FromSeconds(2), CancellationToken.None));
+                        Assert.Equal(content, buffer);
+                    }
+                }
+                await Task.Delay(20);
+            }
+        }
+    }
+
     [Fact]
     public async Task RecreatedRootCannotReuseTheProofEvenWhenTheFileIdIsPreserved()
     {
