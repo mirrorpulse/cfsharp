@@ -9,7 +9,7 @@ using Xunit.Abstractions;
 namespace CfSharp.IntegrationTests;
 
 [SupportedOSPlatform("windows10.0.16299")]
-public sealed class CloudContentConfirmationTests(ITestOutputHelper output)
+public sealed partial class CloudContentConfirmationTests(ITestOutputHelper output)
 {
     [Theory]
     [InlineData(0)]
@@ -176,11 +176,12 @@ public sealed class CloudContentConfirmationTests(ITestOutputHelper output)
         }
 
         internal string Root { get; }
-        internal CloudFileSystem System { get; }
+        internal CloudFileSystem System { get; private set; }
         internal CloudFile File => System.GetFile("content.bin");
         internal UnexpectedProvider Provider { get; }
+        private ICloudStateStoreFactory? _restartFactory;
 
-        internal static async Task<Fixture> StartAsync()
+        internal static async Task<Fixture> StartAsync(Func<string, ICloudStateStoreFactory>? createStore = null)
         {
             // This acceptance fixture fails on unavailable Windows capabilities; it never
             // silently returns success when native confirmation has not actually executed.
@@ -189,8 +190,10 @@ public sealed class CloudContentConfirmationTests(ITestOutputHelper output)
             string root = Path.Combine(directory, "root");
             Directory.CreateDirectory(root);
             UnexpectedProvider provider = new();
+            string databasePath = Path.Combine(directory, "state.db");
+            ICloudStateStoreFactory factory = createStore?.Invoke(databasePath) ?? new SqliteCloudStateStoreFactory(databasePath);
             CloudFileSystem system = CloudFileSystem.CreateBuilder(root)
-                .WithStateStore(new SqliteCloudStateStoreFactory(Path.Combine(directory, "state.db")))
+                .WithStateStore(factory)
                 .WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
                     .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
                     .WithInSyncPolicy(CloudInSyncPolicy.TrackAll).Build())
@@ -198,7 +201,7 @@ public sealed class CloudContentConfirmationTests(ITestOutputHelper output)
             try
             {
                 await system.StartAsync();
-                return new Fixture(directory, root, system, provider);
+                return new Fixture(directory, root, system, provider) { _restartFactory = factory };
             }
             catch
             {
@@ -206,6 +209,14 @@ public sealed class CloudContentConfirmationTests(ITestOutputHelper output)
                 Directory.Delete(directory, recursive: true);
                 throw;
             }
+        }
+
+        internal async Task RestartAsync()
+        {
+            await System.DisposeAsync();
+            System = CloudFileSystem.CreateBuilder(Root).WithStateStore(_restartFactory!)
+                .WithContentProvider(Provider).Build();
+            await System.StartAsync();
         }
 
         public async ValueTask DisposeAsync()
