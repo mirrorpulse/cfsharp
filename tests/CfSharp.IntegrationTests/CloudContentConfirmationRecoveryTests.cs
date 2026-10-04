@@ -6,6 +6,69 @@ namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    [Theory]
+    [InlineData("move")]
+    [InlineData("dehydrate")]
+    [InlineData("remote")]
+    public async Task SameItemMutationsWaitUntilConfirmationProjectionCompletes(string mutation)
+    {
+        FaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new FaultFactory(path));
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(binding, content, CloudContentPreparation.ConvertRegularFile);
+        TaskCompletionSource entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        factory!.BeforeCommit = () =>
+        {
+            entered.SetResult();
+            return new ValueTask(release.Task);
+        };
+        Task<CloudContentConfirmationResult> confirming = fixture.File.ConfirmUploadedContentAsync(proof).AsTask();
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            CloudRemoteChange change = new("update", CloudRemoteChangeKind.FileUpsert,
+                proof.AcceptedIdentity.RemoteId, "revision-3", CloudItemKind.File, "content.bin",
+                previousRemoteRevision: proof.AcceptedIdentity.RemoteRevision, length: content.Length,
+                metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
+            Task subsequent = mutation switch
+            {
+                "move" => fixture.File.MoveToAsync(fixture.System.Root, "moved.bin").AsTask(),
+                "dehydrate" => fixture.File.DehydrateAsync(CloudFileRange.ToEnd(0)).AsTask(),
+                _ => fixture.System.ApplyRemoteChangesAsync(new CloudRemoteChangeBatch("update-batch", Array.Empty<byte>(), [change], new byte[] { 1 })).AsTask(),
+            };
+            await Task.Delay(50);
+            Assert.False(subsequent.IsCompleted);
+            release.SetResult();
+            Assert.Equal(CloudContentConfirmationOutcome.Confirmed,
+                (await confirming.WaitAsync(TimeSpan.FromSeconds(5))).Outcome);
+            await subsequent.WaitAsync(TimeSpan.FromSeconds(10));
+            if (mutation == "move")
+            {
+                Assert.Equal(binding, (await fixture.System.GetFile("moved.bin").InspectAsync()).LocalBinding);
+                Assert.False((await fixture.File.InspectAsync()).Exists);
+            }
+            else if (mutation == "dehydrate")
+            {
+                Assert.Equal(CloudContentAvailability.OnlineOnly, (await fixture.File.InspectAsync()).ContentAvailability);
+            }
+            else
+            {
+                CloudRemoteApplyResult applied = await (Task<CloudRemoteApplyResult>)subsequent;
+                Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+                Assert.Equal("revision-3", (await fixture.File.InspectAsync()).RemoteRevision);
+            }
+
+            Assert.Equal(0, fixture.Provider.Fetches);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
     [Fact]
     public async Task DeadlineAndCancellationCoverWaitingForTheItemLease()
     {

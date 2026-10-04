@@ -6,6 +6,35 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Fact]
+    public async Task RecreatedRootCannotReuseTheProofEvenWhenTheFileIdIsPreserved()
+    {
+        await using Fixture fixture = await Fixture.StartAsync();
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        CloudLocalFileBinding original = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(original, content, CloudContentPreparation.ConvertRegularFile);
+        await fixture.System.DisposeAsync();
+        CloudSyncRoot.Open(fixture.Root).Unregister();
+        string preserved = Path.Combine(Path.GetDirectoryName(fixture.Root)!, "preserved.bin");
+        File.Move(fixture.File.FullPath, preserved);
+        Directory.Delete(fixture.Root);
+        Directory.CreateDirectory(fixture.Root);
+        File.Move(preserved, fixture.File.FullPath);
+        await fixture.RestartAsync(register: true);
+        CloudItemSnapshot recreated = await fixture.File.InspectAsync();
+        CloudLocalFileBinding current = Assert.IsType<CloudLocalFileBinding>(recreated.LocalBinding);
+        Assert.Equal(original.LocalFileId, current.LocalFileId);
+        Assert.Equal(original.VolumeSerialNumber, current.VolumeSerialNumber);
+        Assert.NotEqual(original.SyncRootFileId, current.SyncRootFileId);
+        CloudContentConfirmationResult rejected = await fixture.File.ConfirmUploadedContentAsync(proof);
+        Assert.Equal(CloudContentConfirmationOutcome.LocalObjectMismatch, rejected.Outcome);
+        Assert.False(rejected.NativeIdentityPrepared);
+        Assert.False(rejected.NativeApplied);
+        Assert.False((await fixture.File.InspectAsync()).IsPlaceholder);
+        Assert.Equal(content, await File.ReadAllBytesAsync(fixture.File.FullPath));
+    }
+
+    [Fact]
     public async Task ContentBeyondFourGiBUsesFullOffsetsAndBoundedMemory()
     {
         await using Fixture fixture = await Fixture.StartAsync();

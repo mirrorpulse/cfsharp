@@ -212,11 +212,19 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             }
         }
 
-        internal async Task RestartAsync()
+        internal async Task RestartAsync(bool register = false)
         {
             await System.DisposeAsync();
-            System = CloudFileSystem.CreateBuilder(Root).WithStateStore(_restartFactory!)
-                .WithContentProvider(Provider).Build();
+            CloudFileSystem.Builder builder = CloudFileSystem.CreateBuilder(Root).WithStateStore(_restartFactory!)
+                .WithContentProvider(Provider);
+            if (register)
+            {
+                builder.WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
+                    .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
+                    .WithInSyncPolicy(CloudInSyncPolicy.TrackAll).Build());
+            }
+
+            System = builder.Build();
             await System.StartAsync();
             File = System.GetFile("content.bin");
         }
@@ -243,6 +251,8 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
         public ValueTask<CloudProviderPolicyDecision> ApproveRenameAsync(CloudProviderRenameRequest request,
             CancellationToken cancellationToken) => ValueTask.FromResult(CloudProviderPolicyDecision.Allow);
         public ValueTask<CloudProviderPolicyDecision> ApproveDeleteAsync(CloudProviderDeleteRequest request,
+            CancellationToken cancellationToken) => ValueTask.FromResult(CloudProviderPolicyDecision.Allow);
+        public ValueTask<CloudProviderPolicyDecision> ApproveDehydrateAsync(CloudProviderDehydrateRequest request,
             CancellationToken cancellationToken) => ValueTask.FromResult(CloudProviderPolicyDecision.Allow);
     }
 }
