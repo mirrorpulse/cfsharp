@@ -13,6 +13,7 @@ $workspaceRoot = Join-Path $artifactRoot 'workspace'
 $outputRoot = Join-Path $artifactRoot 'cfsharp'
 $articlesRoot = Join-Path $workspaceRoot 'articles'
 $manifestPath = Join-Path $outputRoot 'manifest.json'
+. (Join-Path $PSScriptRoot 'source-links.ps1')
 
 function Set-Utf8File {
     param(
@@ -121,32 +122,9 @@ try {
     # authored files. Rewrite contribution links back to their real sources
     # before publishing the bundle; otherwise "Edit this page" points at the
     # non-existent artifacts/docs/workspace tree.
-    $sourceLinkReplacements = @(
-        @{
-            Old = 'https://github.com/mirrorpulse/cfsharp/blob/main/artifacts/docs/workspace/index.md/#L'
-            New = 'https://github.com/mirrorpulse/cfsharp/blob/main/README.md#L'
-        },
-        @{
-            Old = 'https://github.com/mirrorpulse/cfsharp/blob/main/artifacts/docs/workspace/articles/'
-            New = 'https://github.com/mirrorpulse/cfsharp/blob/main/docs/'
-        }
-    )
-
     foreach ($htmlFile in Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.html') {
         $htmlText = Get-Content -LiteralPath $htmlFile.FullName -Raw
-        $rewritten = $htmlText
-        foreach ($replacement in $sourceLinkReplacements) {
-            $rewritten = $rewritten.Replace($replacement.Old, $replacement.New)
-        }
-        $rewritten = [regex]::Replace(
-            $rewritten,
-            'https://github\.com/mirrorpulse/cfsharp/blob/[^"\r\n<>]+/artifacts/docs/workspace/index\.md/?#L',
-            'https://github.com/mirrorpulse/cfsharp/blob/main/README.md#L')
-        $rewritten = [regex]::Replace(
-            $rewritten,
-            'https://github\.com/mirrorpulse/cfsharp/blob/[^"\r\n<>]+/artifacts/docs/workspace/articles/',
-            'https://github.com/mirrorpulse/cfsharp/blob/main/docs/')
-        $rewritten = $rewritten.Replace('.md/#L', '.md#L')
+        $rewritten = Convert-DocumentationSourceLinks $htmlText
 
         # The modern template does not load a custom public/main.js by itself.
         # Load it from every generated page so breadcrumb repairs apply to

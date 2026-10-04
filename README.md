@@ -41,7 +41,7 @@ git clone https://github.com/mirrorpulse/cfsharp.git
 cd CfSharp
 dotnet restore CfSharp.sln
 dotnet build CfSharp.sln --configuration Release --no-restore
-dotnet test CfSharp.sln --configuration Release --no-build
+dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak"
 ```
 
 The first sample provider is available under
@@ -127,10 +127,14 @@ in a public issue or pull request.
 ```powershell
 dotnet format CfSharp.sln --verify-no-changes --no-restore
 dotnet build CfSharp.sln --configuration Release --no-restore
-dotnet test CfSharp.sln --configuration Release --no-build
+dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak"
 pwsh ./eng/verify-platform-matrix.ps1
 pwsh ./eng/verify-runtime-boundaries.ps1 -Configuration Release
 ```
+
+This ordinary suite uses the same category filter as CI. Run the separate
+[API baseline and native ABI gates](CONTRIBUTING.md) with their required
+inputs; an unfiltered solution test run also selects those gates and the manual long soak.
 
 ## License
 
