@@ -140,11 +140,11 @@ try {
         }
         $rewritten = [regex]::Replace(
             $rewritten,
-            'https://github\.com/mirrorpulse/cfsharp/blob/[^/]+/artifacts/docs/workspace/index\.md/#L',
+            'https://github\.com/mirrorpulse/cfsharp/blob/[^"\r\n<>]+/artifacts/docs/workspace/index\.md/?#L',
             'https://github.com/mirrorpulse/cfsharp/blob/main/README.md#L')
         $rewritten = [regex]::Replace(
             $rewritten,
-            'https://github\.com/mirrorpulse/cfsharp/blob/[^/]+/artifacts/docs/workspace/articles/',
+            'https://github\.com/mirrorpulse/cfsharp/blob/[^"\r\n<>]+/artifacts/docs/workspace/articles/',
             'https://github.com/mirrorpulse/cfsharp/blob/main/docs/')
         $rewritten = $rewritten.Replace('.md/#L', '.md#L')
 
