@@ -14,13 +14,36 @@ public sealed partial class CloudFileSystem
         CloudFile file, CloudContentConfirmationRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        long started = Stopwatch.GetTimestamp();
+        using CancellationTokenSource deadline = new(request.Deadline);
         using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken, _contentConfirmationStopping.Token);
-        using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
-            [CloudItemOperationScope.Exact(file.FullPath)], stop.Token).ConfigureAwait(false);
-        CloudContentConfirmationResult native = await CloudProtectedContentConfirmation.RunAsync(
+            cancellationToken, _contentConfirmationStopping.Token, deadline.Token);
+        CloudFileSystemOperationLease acquired;
+        try
+        {
+            acquired = await AcquireOperationAsync(
+                [CloudItemOperationScope.Exact(file.FullPath)], stop.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException exception) when (stop.IsCancellationRequested)
+        {
+            return new(request, TimedOut() ? CloudContentConfirmationOutcome.DeadlineExceeded : CloudContentConfirmationOutcome.Canceled,
+                CloudContentConfirmationStage.Open, false, false, false, false, 0, 0,
+                Stopwatch.GetElapsedTime(started), TimeSpan.Zero, null,
+                TimedOut() ? new TimeoutException("The confirmation deadline expired while waiting for the item lease.", exception) : exception);
+        }
+
+        using CloudFileSystemOperationLease operation = acquired;
+        CloudContentConfirmationResult receipt = await CloudProtectedContentConfirmation.RunAsync(
             () => new CloudProtectedContentSession(file.FullPath, SyncRootPath), request, file.FullPath,
             stop.Token).ConfigureAwait(false);
+        bool expired = receipt.Outcome == CloudContentConfirmationOutcome.Canceled && TimedOut();
+        CloudContentConfirmationResult native = new(request,
+            expired ? CloudContentConfirmationOutcome.DeadlineExceeded : receipt.Outcome, receipt.Stage,
+            receipt.NativeIdentityPrepared, receipt.NativeApplied, receipt.NativeConfirmationVerified,
+            receipt.DurableProjectionCommitted, receipt.BytesVerified, receipt.SegmentsRead,
+            Stopwatch.GetElapsedTime(started), receipt.LongestReference, receipt.PreparationUsn,
+            expired ? new TimeoutException("The confirmation deadline expired.", receipt.Error) : receipt.Error,
+            receipt.ObservedSynchronizationState, receipt.PreparationHResult, receipt.NativeMarkHResult);
         if (!native.NativeConfirmationVerified && !native.NativeIdentityPrepared)
         {
             return native;
@@ -67,5 +90,8 @@ public sealed partial class CloudFileSystem
                 projected, native.BytesVerified, native.SegmentsRead,
                 native.Elapsed + Stopwatch.GetElapsedTime(projectionStarted), native.LongestReference,
                 native.PreparationUsn, error, observed, native.PreparationHResult, native.NativeMarkHResult);
+
+        bool TimedOut() => deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested &&
+            !_contentConfirmationStopping.IsCancellationRequested;
     }
 }

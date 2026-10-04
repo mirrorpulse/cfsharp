@@ -33,7 +33,7 @@ public sealed class CloudContentConfirmationRequest
     /// <param name="expectedPlaceholderIdentity">Complete previous opaque identity, required only for replacement.</param>
     /// <param name="segmentSize">Bytes per reference, from 1 through 16 MiB; defaults to 1 MiB.</param>
     /// <param name="referenceBudget">Positive read/reference budget up to one minute; defaults to 250 ms.</param>
-    /// <param name="deadline">Positive total budget up to one day; defaults to ten minutes.</param>
+    /// <param name="deadline">Positive total budget including item-lease waiting, up to one day; defaults to ten minutes.</param>
     /// <exception cref="ArgumentNullException">A required object is null.</exception>
     /// <exception cref="ArgumentException">A hash, preparation, identity, or budget is invalid.</exception>
     /// <remarks>
@@ -101,7 +101,7 @@ public sealed class CloudContentConfirmationRequest
     public int SegmentSize { get; }
     /// <summary>Gets the maximum budget for each referenced read segment.</summary>
     public TimeSpan ReferenceBudget { get; }
-    /// <summary>Gets the total budget before native confirmation.</summary>
+    /// <summary>Gets the total budget including lease waiting before native confirmation.</summary>
     public TimeSpan Deadline { get; }
 
     internal ReadOnlySpan<byte> Hash => _hash;

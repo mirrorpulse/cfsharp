@@ -4,7 +4,7 @@ public sealed partial class CloudFile
 {
     /// <summary>Verifies remotely accepted content and confirms the same protected local file object.</summary>
     /// <param name="request">Copied upload-time object binding, length, full hash, and accepted identity.</param>
-    /// <param name="cancellationToken">Cancellation observed before marking and while draining reads.</param>
+    /// <param name="cancellationToken">Cancellation observed during lease admission, before marking, and while draining reads.</param>
     /// <returns>A typed outcome and receipt retaining native preparation, commit, and projection facts.</returns>
     /// <remarks>
     /// <para>
@@ -29,7 +29,6 @@ public sealed partial class CloudFile
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">The request is null.</exception>
-    /// <exception cref="OperationCanceledException">Admission was canceled before any native work.</exception>
     /// <exception cref="ObjectDisposedException">The owning file system is stopping or disposed.</exception>
     /// <exception cref="InvalidOperationException">The owning file system has not started.</exception>
     public ValueTask<CloudContentConfirmationResult> ConfirmUploadedContentAsync(

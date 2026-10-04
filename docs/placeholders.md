@@ -151,8 +151,11 @@ not USN CAS. Existing positive-USN conditional APIs keep their contract.
 Ordinary files and fully local placeholders are supported. Directories, hard links, arbitrary
 reparse targets, and partial or online-only content are rejected without hydration. Default reads
 use a 1 MiB buffer, a 250 ms reference budget, and a ten-minute total deadline; immutable request
-options can adjust finite budgets. Pending cancellation is requested with `CancelIoEx` and drained
-before buffers, events, or references are freed. Driver cancellation drain and synchronous native
+options can adjust finite budgets.
+The total deadline includes waiting for the library's item lease. Cancellation or expiry while
+waiting returns an uncommitted receipt at the `Open` stage.
+Pending cancellation is requested with `CancelIoEx` and drained before buffers, events, or
+references are freed. Driver cancellation drain and synchronous native
 calls may exceed a budget; expired budgets stop subsequent work and marking.
 
 | Outcome | Caller action |

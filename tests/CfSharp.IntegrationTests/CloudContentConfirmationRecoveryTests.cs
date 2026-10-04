@@ -7,6 +7,36 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Fact]
+    public async Task DeadlineAndCancellationCoverWaitingForTheItemLease()
+    {
+        await using Fixture fixture = await Fixture.StartAsync();
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(binding, content, CloudContentPreparation.ConvertRegularFile);
+        await using CloudItemLease lease = await fixture.File.AcquireLeaseAsync(CloudItemLeaseOptions.ExclusiveWrite);
+        CloudContentConfirmationRequest shortDeadline = new(binding, proof.AcceptedIdentity, content.Length,
+            proof.ExpectedSha256.Span, proof.Preparation, referenceBudget: TimeSpan.FromMilliseconds(10),
+            deadline: TimeSpan.FromMilliseconds(50));
+        CloudContentConfirmationResult expired = await fixture.File.ConfirmUploadedContentAsync(shortDeadline)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, expired.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Open, expired.Stage);
+        Assert.IsType<TimeoutException>(expired.Error);
+        Assert.False(expired.NativeIdentityPrepared);
+        Assert.False(expired.NativeApplied);
+        using CancellationTokenSource cancellation = new();
+        Task<CloudContentConfirmationResult> waiting = fixture.File.ConfirmUploadedContentAsync(proof, cancellation.Token).AsTask();
+        cancellation.Cancel();
+        CloudContentConfirmationResult canceled = await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(CloudContentConfirmationOutcome.Canceled, canceled.Outcome);
+        Assert.Equal(0, canceled.BytesVerified);
+        Assert.False(canceled.NativeApplied);
+        await lease.DisposeAsync();
+        Assert.Equal(CloudContentConfirmationOutcome.Confirmed, (await fixture.File.ConfirmUploadedContentAsync(proof)).Outcome);
+    }
+
+    [Fact]
     public async Task NativeCommitAndFailedProjectionReplayAfterReopeningTheOfficialStore()
     {
         FaultFactory? factory = null;
