@@ -7,7 +7,8 @@ public enum CloudContentPreparation
     None,
     /// <summary>Converts an ordinary file after checking its object binding and complete content.</summary>
     ConvertRegularFile,
-    /// <summary>Replaces an explicitly expected previous placeholder identity after complete verification.</summary>
+    /// <summary>Replaces an explicitly expected nonempty previous placeholder identity after complete verification.</summary>
+    /// <remarks>Placeholders with an empty native identity are outside this mode's current scope; empty is never a wildcard.</remarks>
     ReplacePlaceholderIdentity,
 }
 
@@ -30,7 +31,7 @@ public sealed class CloudContentConfirmationRequest
     /// <param name="expectedLength">Accepted full content length, including zero.</param>
     /// <param name="expectedSha256">Exactly 32 bytes of accepted full-content SHA-256.</param>
     /// <param name="preparation">Explicit identity preparation, or none.</param>
-    /// <param name="expectedPlaceholderIdentity">Complete previous opaque identity, required only for replacement.</param>
+    /// <param name="expectedPlaceholderIdentity">Complete nonempty previous opaque identity, required only for replacement.</param>
     /// <param name="segmentSize">Bytes per reference, from 1 through 16 MiB; defaults to 1 MiB.</param>
     /// <param name="referenceBudget">Positive read/reference budget up to one minute; defaults to 250 ms.</param>
     /// <param name="deadline">Positive total budget including item-lease waiting, up to one day; defaults to ten minutes.</param>
@@ -40,6 +41,8 @@ public sealed class CloudContentConfirmationRequest
     /// Kernel cancellation must drain before memory or protection can be released, so cancellation
     /// drain and synchronous native calls can exceed these budgets. Budgets prevent further work
     /// and marking after expiration; they are not promises that a stalled driver returns on time.
+    /// Replacement accepts any exact nonempty opaque previous identity. Although Windows permits
+    /// empty-identity placeholders, adopting one is outside this operation's current scope.
     /// </remarks>
     public CloudContentConfirmationRequest(CloudLocalFileBinding expectedBinding,
         CloudPlaceholderIdentity acceptedIdentity, long expectedLength, ReadOnlySpan<byte> expectedSha256,

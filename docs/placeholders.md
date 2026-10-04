@@ -137,6 +137,11 @@ The default preparation is `None`: the complete opaque placeholder identity must
 `ConvertRegularFile` explicitly permits conversion of the verified ordinary file. For revision
 replacement, select `ReplacePlaceholderIdentity` and provide the complete previously observed
 identity bytes. Both modes also permit replay when the accepted identity is already present.
+Replacement currently requires a nonempty previous identity, including when replacement is
+explicitly selected. Empty native identities are legal in Windows, but those placeholders are
+outside this operation's protected replacement scope. Empty is never interpreted as a wildcard.
+The previous nonempty identity can be opaque data from another provider; it need not decode as
+a CfSharp identity. The accepted replacement must use `CloudPlaceholderIdentity`.
 Preparation checks binding, full length, and SHA-256 before changing identity, then verifies the
 whole content again before marking. It never writes file content or changes pin intent.
 

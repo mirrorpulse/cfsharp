@@ -155,6 +155,31 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Fact]
+    public async Task EmptyNativeIdentityIsLegalButOutsideProtectedReplacementScope()
+    {
+        await using Fixture fixture = await Fixture.StartAsync();
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        ConvertWithoutIdentity(fixture.File.FullPath);
+        CloudItemSnapshot snapshot = await fixture.File.InspectAsync();
+        Assert.True(snapshot.IsPlaceholder);
+        Assert.Empty(snapshot.PlaceholderIdentity.ToArray());
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(snapshot.LocalBinding);
+        Assert.Throws<ArgumentException>(() => new CloudContentConfirmationRequest(binding,
+            new(Guid.NewGuid(), "accepted", "revision-1"), content.Length, SHA256.HashData(content),
+            CloudContentPreparation.ReplacePlaceholderIdentity, snapshot.PlaceholderIdentity.Span));
+        Assert.Empty((await fixture.File.InspectAsync()).PlaceholderIdentity.ToArray());
+        Assert.Equal(content, await File.ReadAllBytesAsync(fixture.File.FullPath));
+        Assert.Equal(0, fixture.Provider.Fetches);
+    }
+
+    private static unsafe void ConvertWithoutIdentity(string path)
+    {
+        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        Assert.Equal(0, CfApi.CfConvertToPlaceholder(handle.DangerousGetHandle(), null, 0, CfConvertFlags.None, null, null));
+    }
+
+    [Fact]
     public async Task AValidReferenceWhoseParentBecomesALinkReturnsAnUncommittedRejection()
     {
         await using Fixture fixture = await Fixture.StartAsync();
