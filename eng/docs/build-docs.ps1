@@ -52,7 +52,6 @@ try {
 
     $readmeText = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
     $readmeText = $readmeText.Replace('](docs/','](articles/')
-<<<<<<< HEAD
     $readmeText = $readmeText.Replace('](samples/CfSharp.SampleProvider)','](https://github.com/mirrorpulse/cfsharp/tree/main/samples/CfSharp.SampleProvider)')
     $readmeText = $readmeText.Replace('](global.json)','](https://github.com/mirrorpulse/cfsharp/blob/main/global.json)')
     $readmeText = $readmeText.Replace('](CONTRIBUTING.md)','](https://github.com/mirrorpulse/cfsharp/blob/main/CONTRIBUTING.md)')
