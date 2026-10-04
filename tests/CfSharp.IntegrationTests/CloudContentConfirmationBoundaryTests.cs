@@ -155,6 +155,43 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Fact]
+    public async Task AValidReferenceWhoseParentBecomesALinkReturnsAnUncommittedRejection()
+    {
+        await using Fixture fixture = await Fixture.StartAsync();
+        string parent = Path.Combine(fixture.Root, "folder");
+        string moved = Path.Combine(Path.GetDirectoryName(fixture.Root)!, "moved-folder");
+        Directory.CreateDirectory(parent);
+        CloudFile file = fixture.System.GetFile(Path.Combine("folder", "content.bin"));
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(file.FullPath, content);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await file.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(binding, content, CloudContentPreparation.ConvertRegularFile);
+        Directory.Move(parent, moved);
+        Directory.CreateSymbolicLink(parent, moved);
+        try
+        {
+            CloudContentConfirmationResult result = await file.ConfirmUploadedContentAsync(proof);
+            Assert.Equal(CloudContentConfirmationOutcome.NotApplicable, result.Outcome);
+            Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
+            Assert.False(result.NativeIdentityPrepared);
+            Assert.False(result.NativeApplied);
+            Assert.False(result.NativeConfirmationVerified);
+            Assert.False(result.DurableProjectionCommitted);
+            Assert.Null(result.PreparationHResult);
+            Assert.Null(result.NativeMarkHResult);
+            Assert.Equal(0, result.BytesVerified);
+            Assert.False(File.GetAttributes(Path.Combine(moved, "content.bin")).HasFlag(FileAttributes.ReparsePoint));
+            Assert.Equal(content, await File.ReadAllBytesAsync(Path.Combine(moved, "content.bin")));
+            Assert.Equal(0, fixture.Provider.Fetches);
+        }
+        finally
+        {
+            // Remove only the link, before the fixture recursively cleans its owned directory.
+            Directory.Delete(parent);
+        }
+    }
+
+    [Fact]
     public async Task PartialContentAndReparseTargetsDoNotTriggerHydration()
     {
         await using Fixture fixture = await Fixture.StartAsync();

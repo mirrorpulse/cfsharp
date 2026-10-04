@@ -339,6 +339,8 @@ internal static class CloudProtectedContentConfirmation
             NativeFileException native => CloudFilesException.FromHResult(native.Operation, path, native.HResult),
             Win32Exception win32 => CloudFilesException.FromHResult($"CloudFile.ConfirmUploadedContent.{stage}",
                 path, unchecked((int)(0x80070000u | ((uint)win32.NativeErrorCode & 0xffff)))),
+            IOException { InnerException: Win32Exception win32 } => Translate(win32, path, stage),
+            UnauthorizedAccessException => CloudFilesException.FromException($"CloudFile.ConfirmUploadedContent.{stage}", path, exception),
             _ => exception,
         };
 }

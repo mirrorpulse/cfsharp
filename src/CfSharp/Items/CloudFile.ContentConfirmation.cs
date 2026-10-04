@@ -12,6 +12,9 @@ public sealed partial class CloudFile
     /// coordinated with existing item operations and shutdown. Fully local files are read through
     /// exclusive CFAPI protection in bounded segments; partial content is rejected without hydration.
     /// No remote calls, user callbacks, native handles, or proof hashes enter the official store.
+    /// A parent path that becomes an unsupported reparse point returns NotApplicable at the Open
+    /// stage; admission I/O failures return Failed or Busy with native details. Invalid requests and
+    /// an owner that has not started or is already disposed retain their exception semantics.
     /// </para>
     /// <para>
     /// The final native mark uses a null USN pointer and is therefore native-unconditional. Safety

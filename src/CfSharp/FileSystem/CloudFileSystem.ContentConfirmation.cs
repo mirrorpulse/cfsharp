@@ -1,7 +1,6 @@
+using System.ComponentModel;
 using System.Diagnostics;
-
 using CfSharp.Native;
-
 using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp;
@@ -14,6 +13,7 @@ public sealed partial class CloudFileSystem
         CloudFile file, CloudContentConfirmationRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        EnsureStarted();
         long started = Stopwatch.GetTimestamp();
         using CancellationTokenSource deadline = new(request.Deadline);
         using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(
@@ -26,10 +26,20 @@ public sealed partial class CloudFileSystem
         }
         catch (OperationCanceledException exception) when (stop.IsCancellationRequested)
         {
-            return new(request, TimedOut() ? CloudContentConfirmationOutcome.DeadlineExceeded : CloudContentConfirmationOutcome.Canceled,
-                CloudContentConfirmationStage.Open, false, false, false, false, 0, 0,
-                Stopwatch.GetElapsedTime(started), TimeSpan.Zero, null,
+            return AdmissionFailure(TimedOut() ? CloudContentConfirmationOutcome.DeadlineExceeded : CloudContentConfirmationOutcome.Canceled,
                 TimedOut() ? new TimeoutException("The confirmation deadline expired while waiting for the item lease.", exception) : exception);
+        }
+        catch (CloudPathReparsePointException exception)
+        {
+            return AdmissionFailure(CloudContentConfirmationOutcome.NotApplicable, exception);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+            Win32Exception or NativeFileException or CloudFilesException)
+        {
+            Exception error = CloudProtectedContentConfirmation.Translate(exception, file.FullPath,
+                CloudContentConfirmationStage.Open);
+            return AdmissionFailure(error is CloudFilesException { Win32ErrorCode: 32 or 33 }
+                ? CloudContentConfirmationOutcome.Busy : CloudContentConfirmationOutcome.Failed, error);
         }
 
         using CloudFileSystemOperationLease operation = acquired;
@@ -96,6 +106,10 @@ public sealed partial class CloudFileSystem
         CloudContentConfirmationResult Projected(CloudContentConfirmationOutcome outcome, Exception? error = null) =>
             native.WithProjection(outcome, committed, Stopwatch.GetElapsedTime(projectionStarted),
                 observed, observedIdentity is null ? null : new ReadOnlyMemory<byte>(observedIdentity), error);
+
+        CloudContentConfirmationResult AdmissionFailure(CloudContentConfirmationOutcome outcome, Exception error) =>
+            new(request, outcome, CloudContentConfirmationStage.Open, false, false, false, false, 0, 0,
+                Stopwatch.GetElapsedTime(started), TimeSpan.Zero, null, error);
 
         bool TimedOut() => deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested &&
             !_contentConfirmationStopping.IsCancellationRequested;

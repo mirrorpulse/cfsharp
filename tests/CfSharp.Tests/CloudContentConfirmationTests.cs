@@ -252,6 +252,26 @@ public sealed class CloudContentConfirmationTests
     }
 
     [Fact]
+    public async Task WrappedPathIoErrorsRetainTheirNativeCodeAndUncommittedReceipt()
+    {
+        foreach (int code in new[] { 5, 32 })
+        {
+            IOException error = new("Injected path component open failure.", new System.ComponentModel.Win32Exception(code));
+            CloudContentConfirmationResult result = await CloudProtectedContentConfirmation.RunAsync(
+                () => throw error, Proof(Content), "owned-test.bin", default);
+            Assert.Equal(code == 32 ? CloudContentConfirmationOutcome.Busy : CloudContentConfirmationOutcome.Failed, result.Outcome);
+            Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
+            CloudFilesException native = Assert.IsType<CloudFilesException>(result.Error);
+            Assert.Equal(code, native.Win32ErrorCode);
+            Assert.Equal(unchecked((int)(0x80070000u | (uint)code)), native.HResult);
+            Assert.Same(native, result.NativeError);
+            Assert.False(result.NativeIdentityPrepared);
+            Assert.False(result.NativeApplied);
+            Assert.False(result.DurableProjectionCommitted);
+        }
+    }
+
+    [Fact]
     public async Task AnExpiredEarlierReferenceStopsBeforeTheTotalDeadline()
     {
         int reads = 0;

@@ -254,9 +254,7 @@ internal sealed class CloudPathHandleLease : IDisposable
 
         if ((info.FileAttributes & FileAttributeReparsePoint) != 0 || info.ReparseTag != 0)
         {
-            throw new ArgumentException(
-                $"The path component '{path}' cannot be a reparse point.",
-                nameof(path));
+            throw new CloudPathReparsePointException(path);
         }
     }
 
@@ -293,3 +291,8 @@ internal sealed class CloudPathHandleLease : IDisposable
         internal uint ReparseTag;
     }
 }
+
+// Distinguish a path that changed after a valid item reference was created from invalid
+// caller arguments. Other path APIs retain their ArgumentException compatibility.
+internal sealed class CloudPathReparsePointException(string path) : ArgumentException(
+    $"The path component '{path}' cannot be a reparse point.", nameof(path));

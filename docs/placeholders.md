@@ -156,6 +156,10 @@ use a 1 MiB buffer, a 250 ms reference budget, and a ten-minute total deadline; 
 options can adjust finite budgets.
 The total deadline includes waiting for the library's item lease. Cancellation or expiry while
 waiting returns an uncommitted receipt at the `Open` stage.
+If a valid reference's parent later becomes an unsupported reparse point, admission returns
+`NotApplicable` at `Open` without preparation, marking, or projection. Expected admission I/O
+failures return `Failed` or `Busy` with native error details. Invalid request arguments and calls
+on an owner that has not started or is already disposed still throw their documented exceptions.
 Pending cancellation is requested with `CancelIoEx` and drained before buffers, events, or
 references are freed. Driver cancellation drain and synchronous native
 calls may exceed a budget; expired budgets stop subsequent work and marking.

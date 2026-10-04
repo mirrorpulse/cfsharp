@@ -78,10 +78,25 @@ public sealed class CloudFileSystemTests
                 $"The test host cannot create a symbolic link: {exception.Message}");
         }
 
-        Assert.Throws<ArgumentException>(() =>
+        Assert.Throws<CloudPathReparsePointException>(() =>
             CloudPathHandleLease.OpenParentChains(
                 root.Path,
                 [Path.Combine(link, "item.txt")]));
+    }
+
+    [Fact]
+    public async Task ConfirmationRetainsLifecycleAndRequestArgumentExceptions()
+    {
+        using TestDirectory root = new();
+        await using CloudFileSystem system = CloudFileSystem.CreateBuilder(root.Path)
+            .WithStateStore(new RecordingStoreFactory()).Build();
+        CloudFile file = new(system, Path.Combine(root.Path, "content.bin"), "content.bin");
+        CloudContentConfirmationRequest request = new(new(1, Guid.NewGuid(), Guid.NewGuid()),
+            new(Guid.NewGuid(), "accepted", "revision-1"), 0, new byte[32]);
+        await Assert.ThrowsAsync<ArgumentNullException>(() => file.ConfirmUploadedContentAsync(null!).AsTask());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => file.ConfirmUploadedContentAsync(request).AsTask());
+        await system.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => file.ConfirmUploadedContentAsync(request).AsTask());
     }
 
     [Fact]
