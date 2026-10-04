@@ -18,6 +18,9 @@ public enum CloudContentPreparation
 /// are retained. The caller supplies the upload-time binding and authenticates remote acceptance.
 /// Neither a newly captured replacement binding nor a digest computed only after uploading proves
 /// which object the remote service accepted. This contract requires Windows 10 version 1709 or later.
+/// The proof covers content and identity, not remotely accepted timestamps or attributes.
+/// Confirmation requires the actual registered <see cref="CloudInSyncPolicy.None"/> policy;
+/// other policies return NotApplicable even when the content and identity match.
 /// </remarks>
 public sealed class CloudContentConfirmationRequest
 {
@@ -129,7 +132,8 @@ public enum CloudContentConfirmationOutcome
     LocalObjectMismatch,
     /// <summary>Content was not fully local; no hydration or mark occurred.</summary>
     NotFullyLocal,
-    /// <summary>A directory, ordinary file without conversion permission, hard link, or reparse target is unsupported.</summary>
+    /// <summary>The object is unsupported, or the actual registered in-sync policy is not exactly None.</summary>
+    /// <remarks>Unsupported objects include directories, ordinary files without conversion permission, hard links, and reparse targets.</remarks>
     NotApplicable,
     /// <summary>A competing handle or mapping prevented protection; retry the entire proof later.</summary>
     Busy,

@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
+using CfSharp.Native;
+
 namespace CfSharp.Tests;
 
 public sealed class CloudContentConfirmationTests
@@ -88,6 +90,76 @@ public sealed class CloudContentConfirmationTests
         Assert.Equal(0, session.Marks);
         Assert.False(result.NativeApplied);
         Assert.True(session.Disposed);
+    }
+
+    [Theory]
+    [InlineData(CfInSyncPolicy.TrackAll)]
+    [InlineData(CfInSyncPolicy.TrackFileAll)]
+    [InlineData(CfInSyncPolicy.TrackFileCreationTime)]
+    [InlineData(CfInSyncPolicy.TrackFileLastWriteTime)]
+    [InlineData(CfInSyncPolicy.TrackFileReadOnlyAttribute)]
+    [InlineData(CfInSyncPolicy.TrackFileHiddenAttribute)]
+    [InlineData(CfInSyncPolicy.TrackFileSystemAttribute)]
+    [InlineData(CfInSyncPolicy.TrackDirectoryAll)]
+    [InlineData(CfInSyncPolicy.PreserveInSyncForSyncEngine)]
+    public async Task AnyNonNonePolicyRejectsBeforeReadingPreparingOrMarking(CfInSyncPolicy policy)
+    {
+        FakeSession session = new(Content);
+        session.Facts = session.Facts with { InSyncPolicy = policy, IsPlaceholder = false, Identity = [] };
+        CloudContentConfirmationRequest request = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            CloudContentPreparation.ConvertRegularFile);
+        CloudContentConfirmationResult result = await RunAsync(session, request);
+        Assert.Equal(CloudContentConfirmationOutcome.NotApplicable, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Verify, result.Stage);
+        Assert.Equal(0, session.Reads);
+        Assert.Equal(0, session.Preparations);
+        Assert.Equal(0, session.Marks);
+        Assert.False(result.NativeIdentityPrepared);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+        Assert.False(result.DurableProjectionCommitted);
+        Assert.Equal(0, session.ActiveReferences);
+        Assert.True(session.Disposed);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PolicyIsRecheckedBeforePreparationAndMark(bool convert)
+    {
+        FakeSession session = null!;
+        session = new([]) { OnRead = () => session.Facts = session.Facts with { InSyncPolicy = CfInSyncPolicy.TrackAll } };
+        session.Facts = session.Facts with { IsPlaceholder = !convert, Identity = convert ? [] : Identity.Encode() };
+        CloudContentConfirmationRequest proof = new(Binding, Identity, 0, SHA256.HashData([]),
+            convert ? CloudContentPreparation.ConvertRegularFile : CloudContentPreparation.None);
+        CloudContentConfirmationResult result = await RunAsync(session, proof);
+        Assert.Equal(CloudContentConfirmationOutcome.NotApplicable, result.Outcome);
+        Assert.Equal(1, session.Reads);
+        Assert.Equal(0, session.Preparations);
+        Assert.Equal(0, session.Marks);
+        Assert.False(result.NativeIdentityPrepared);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+    }
+
+    [Fact]
+    public async Task PolicyChangeAfterPreparationRetainsItsReceiptWithoutMarking()
+    {
+        FakeSession session = null!;
+        session = new(Content) { OnPrepare = () => session.Facts = session.Facts with { InSyncPolicy = CfInSyncPolicy.TrackAll } };
+        session.Facts = session.Facts with { IsPlaceholder = false, Identity = [] };
+        CloudContentConfirmationRequest proof = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            CloudContentPreparation.ConvertRegularFile, segmentSize: 4);
+        CloudContentConfirmationResult result = await RunAsync(session, proof);
+        Assert.Equal(CloudContentConfirmationOutcome.NotApplicable, result.Outcome);
+        Assert.True(result.NativeIdentityPrepared);
+        Assert.Equal(0, result.PreparationHResult);
+        Assert.Equal(1, session.Preparations);
+        Assert.Equal(0, session.Marks);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+        Assert.True(session.Disposed);
+        Assert.Equal(0, session.ActiveReferences);
     }
 
     [Theory]
@@ -390,7 +462,7 @@ public sealed class CloudContentConfirmationTests
     private sealed class FakeSession(byte[] content) : ICloudProtectedContentSession
     {
         internal CloudProtectedFileFacts Facts { get; set; } = new(Binding, content.Length, false,
-            true, true, true, false, Identity.Encode());
+            true, true, true, false, Identity.Encode(), CfInSyncPolicy.None);
         internal bool InSync { get => Facts.InSync; init => Facts = Facts with { InSync = value }; }
         internal bool ShortReads { get; init; }
         internal int BreakAtReference { get; init; }

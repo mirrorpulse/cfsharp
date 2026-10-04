@@ -108,10 +108,29 @@ tests; the read API alone does not establish that capability.
 ## Protected uploaded-content confirmation
 
 Use `CloudFile.ConfirmUploadedContentAsync` when a remote service has accepted a complete content
-proof and the installed platform does not provide usable conditional in-sync tokens. Capture
+proof, the root's actual registered `InSyncPolicy` is exactly `None`, and the installed platform
+does not provide usable conditional in-sync tokens. Capture
 `LocalBinding` before uploading, compute the digest of the uploaded bytes, authenticate the remote
 acceptance, and durably retain that proof in the application. Close upload streams and mappings
 before requesting protection.
+
+This API proves content and identity, not remotely accepted timestamps or attributes. CFAPI
+exclusive protection does not exclude every metadata writer. A root using `TrackAll`, any
+individual tracking flag, or `PreserveForSyncEngine` returns `NotApplicable` at `Verify` before
+reading, preparation, marking, or durable projection. Each verification queries the current
+registration through the same protected file handle; configured or previously observed policy
+values cannot authorize confirmation. Failed registration queries retain their native errors.
+The registration builder still defaults to `TrackAll`; this operation never changes a root's policy.
+
+A provider whose product contract permits content-only native sync state can explicitly choose
+`.WithInSyncPolicy(CloudInSyncPolicy.None)` when registering, then verify
+`CloudSyncRoot.Open(rootPath).GetInfo().InSyncPolicy`. It must align any Shell registration and
+handle existing roots through its own coordinated migration. Do not silently downgrade a root
+whose product contract includes tracked metadata. With `None`, data writes still clear native
+in-sync; detecting and synchronizing metadata changes remains the application's responsibility.
+Quiesce confirmations before registering, updating, or unregistering the root. Alternatively,
+hold an application-owned root gate through each confirmation and every registration change;
+policy observations alone cannot make concurrent re-registration atomic with a native mark.
 
 ```csharp
 CloudLocalFileBinding uploadedObject = uploadSnapshot.LocalBinding
@@ -150,8 +169,10 @@ holds a reference until native I/O has completed or cancellation has drained. Re
 released between segments and reacquired on the same opaque handle. A break discards the attempt;
 the library never reopens by path to continue its digest. The final identity, length, object
 checks and native mark share one reference. The mark passes a **null USN pointer**, which is
-native-unconditional. Its safety relies on exclusive object protection and the complete proof,
-not USN CAS. Existing positive-USN conditional APIs keep their contract.
+native-unconditional. Its safety relies on the actual `None` policy, exclusive content protection,
+and the complete proof. Existing positive-USN conditional APIs keep their contract. This bounded
+content-only capability does not resolve platforms rejecting conditional marks; provider acceptance
+and recovery tests must still establish the application's complete behavior on the target platform.
 CFAPI metadata and mutation calls retain the opaque protected owner; general Win32 metadata
 queries and content reads use its borrowed Win32 handle while that reference is held.
 

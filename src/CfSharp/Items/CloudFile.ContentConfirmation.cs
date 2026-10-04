@@ -11,6 +11,13 @@ public sealed partial class CloudFile
     /// Requires a started owner on Windows 10 version 1709 or later. Operations on this path are
     /// coordinated with existing item operations and shutdown. Fully local files are read through
     /// exclusive CFAPI protection in bounded segments; partial content is rejected without hydration.
+    /// The actual registered in-sync policy must be exactly <see cref="CloudInSyncPolicy.None"/>.
+    /// Other policies, including the default TrackAll, return NotApplicable at the Verify stage
+    /// before reading, preparation, marking, or projection. Each verification queries the actual
+    /// registration through the same protected handle rather than trusting builder options.
+    /// Content proof does not accept timestamps or attributes; CFAPI protection does not prevent
+    /// every metadata writer. Callers must quiesce confirmations before updating or unregistering
+    /// the root, or hold an application-owned root gate through this call and registration changes.
     /// No remote calls, user callbacks, native handles, or proof hashes enter the official store.
     /// A parent path that becomes an unsupported reparse point returns NotApplicable at the Open
     /// stage; admission I/O failures return Failed or Busy with native details. Invalid requests and
@@ -21,8 +28,10 @@ public sealed partial class CloudFile
     /// </para>
     /// <para>
     /// The final native mark uses a null USN pointer and is therefore native-unconditional. Safety
-    /// comes from complete verification and exclusive protection of the same file object through
-    /// marking, not USN CAS. Existing conditional APIs and their positive-token checks are unchanged.
+    /// comes from the None policy, complete verification, and exclusive content protection of the
+    /// same file object through marking. Native tracking of data writes remains active with None;
+    /// metadata synchronization is the application's responsibility. This operation does not
+    /// establish usable conditional USN tokens for platforms that reject them.
     /// Identity preparation is opt-in and guarded before mutation; its success is retained even if
     /// later confirmation fails. Native confirmation and durable projection are separate commits.
     /// </para>

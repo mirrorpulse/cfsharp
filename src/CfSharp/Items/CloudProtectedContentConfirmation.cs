@@ -11,7 +11,7 @@ namespace CfSharp;
 
 internal sealed record CloudProtectedFileFacts(CloudLocalFileBinding Binding, long Length,
     bool IsDirectory, bool IsPlaceholder, bool IsFullyLocal, bool IsSupported,
-    bool InSync, byte[] Identity);
+    bool InSync, byte[] Identity, CfInSyncPolicy InSyncPolicy);
 
 internal interface ICloudProtectedContentSession : IDisposable
 {
@@ -61,6 +61,20 @@ internal sealed class CloudProtectedContentSession : ICloudProtectedContentSessi
     {
         public CloudProtectedFileFacts Inspect()
         {
+            // Query the current registration through this same referenced CFAPI owner.
+            // Builder options and a policy cached at open cannot authorize an unconditional
+            // whole-placeholder mark from a proof that covers only file content.
+            int result = NativeSyncRoot.Query(reference.ProtectedHandle, out NativeSyncRootInfo? registration);
+            if (result < 0)
+            {
+                throw new NativeFileException("CfGetSyncRootInfoByHandle", result);
+            }
+
+            if (registration is null)
+            {
+                throw new InvalidDataException("Windows returned no sync-root information.");
+            }
+
             NativeFileMetadata facts = WindowsFileMetadata.Read(reference.Win32Handle, reference.ProtectedHandle);
             bool placeholder = facts.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder);
             bool full = !placeholder || facts.Length == 0 ||
@@ -74,7 +88,7 @@ internal sealed class CloudProtectedContentSession : ICloudProtectedContentSessi
                 facts.Identity.VolumeSerialNumber == openedIdentity.VolumeSerialNumber &&
                 facts.Identity.FileId == openedIdentity.FileId && facts.Links == 1 && !facts.DeletePending &&
                 ((facts.Attributes & (uint)FileAttributes.ReparsePoint) == 0 || placeholder),
-                facts.InSync, facts.PlaceholderIdentity);
+                facts.InSync, facts.PlaceholderIdentity, registration.InSyncPolicy);
         }
 
         public int Read(byte[] buffer, int count, long offset, TimeSpan budget, CancellationToken cancellationToken) =>
@@ -305,7 +319,7 @@ internal static class CloudProtectedContentConfirmation
             return CloudContentConfirmationOutcome.LocalObjectMismatch;
         }
 
-        if (facts.IsDirectory || !facts.IsSupported)
+        if (facts.IsDirectory || !facts.IsSupported || facts.InSyncPolicy != CfInSyncPolicy.None)
         {
             return CloudContentConfirmationOutcome.NotApplicable;
         }

@@ -167,22 +167,26 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
     private sealed class Fixture : IAsyncDisposable
     {
         private readonly string _directory;
-        private Fixture(string directory, string root, CloudFileSystem system, UnexpectedProvider provider)
+        private Fixture(string directory, string root, CloudFileSystem system, UnexpectedProvider provider,
+            SyncRootRegistrationOptions registration)
         {
             _directory = directory;
             Root = root;
             System = system;
             File = system.GetFile("content.bin");
             Provider = provider;
+            Registration = registration;
         }
 
         internal string Root { get; }
         internal CloudFileSystem System { get; private set; }
         internal CloudFile File { get; private set; }
         internal UnexpectedProvider Provider { get; }
+        internal SyncRootRegistrationOptions Registration { get; }
         private ICloudStateStoreFactory? _restartFactory;
 
-        internal static async Task<Fixture> StartAsync(Func<string, ICloudStateStoreFactory>? createStore = null)
+        internal static async Task<Fixture> StartAsync(Func<string, ICloudStateStoreFactory>? createStore = null,
+            CloudInSyncPolicy inSyncPolicy = CloudInSyncPolicy.None)
         {
             // This acceptance fixture fails on unavailable Windows capabilities; it never
             // silently returns success when native confirmation has not actually executed.
@@ -193,16 +197,17 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             UnexpectedProvider provider = new();
             string databasePath = Path.Combine(directory, "state.db");
             ICloudStateStoreFactory factory = createStore?.Invoke(databasePath) ?? new SqliteCloudStateStoreFactory(databasePath);
+            SyncRootRegistrationOptions registration = SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
+                .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
+                .WithInSyncPolicy(inSyncPolicy).Build();
             CloudFileSystem system = CloudFileSystem.CreateBuilder(root)
                 .WithStateStore(factory)
-                .WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
-                    .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
-                    .WithInSyncPolicy(CloudInSyncPolicy.TrackAll).Build())
+                .WithRegistration(registration)
                 .WithContentProvider(provider).Build();
             try
             {
                 await system.StartAsync();
-                return new Fixture(directory, root, system, provider) { _restartFactory = factory };
+                return new Fixture(directory, root, system, provider, registration) { _restartFactory = factory };
             }
             catch
             {
@@ -219,9 +224,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
                 .WithContentProvider(Provider);
             if (register)
             {
-                builder.WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
-                    .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
-                    .WithInSyncPolicy(CloudInSyncPolicy.TrackAll).Build());
+                builder.WithRegistration(Registration);
             }
 
             System = builder.Build();
