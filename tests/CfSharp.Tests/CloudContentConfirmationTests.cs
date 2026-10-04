@@ -193,6 +193,65 @@ public sealed class CloudContentConfirmationTests
         new(Binding, Identity, content.Length, SHA256.HashData(content), segmentSize: 4);
 
     [Fact]
+    public void ProjectionObservationsOwnTheirCompleteIdentityBytes()
+    {
+        byte[] identity = Identity.Encode();
+        CloudContentConfirmationResult native = new(Proof(Content), CloudContentConfirmationOutcome.Confirmed,
+            CloudContentConfirmationStage.Mark, false, true, true, false, Content.Length, 1,
+            TimeSpan.Zero, TimeSpan.Zero, null, null);
+        CloudContentConfirmationResult projected = native.WithProjection(CloudContentConfirmationOutcome.Confirmed,
+            true, TimeSpan.Zero, CloudSynchronizationState.InSync, identity);
+        identity[0] ^= 0xff;
+        Assert.Equal(Identity.Encode(), projected.ObservedPlaceholderIdentity!.Value.ToArray());
+        Assert.True(MemoryMarshal.TryGetArray(projected.ObservedPlaceholderIdentity.Value, out ArraySegment<byte> returned));
+        returned.Array![0] ^= 0xff;
+        Assert.Equal(Identity.Encode(), projected.ObservedPlaceholderIdentity.Value.ToArray());
+        Assert.Null(native.ObservedPlaceholderIdentity);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailedProjectionPreservesAnEarlierNativeFailureAndPreparation(bool failDuringRead)
+    {
+        System.ComponentModel.Win32Exception nativeFault = new(5);
+        FakeSession session = null!;
+        session = new(Content)
+        {
+            MarkFault = failDuringRead ? null : nativeFault,
+            OnRead = () =>
+            {
+                if (failDuringRead && session.Preparations > 0)
+                {
+                    throw nativeFault;
+                }
+            },
+        };
+        session.Facts = session.Facts with { IsPlaceholder = false, Identity = [] };
+        CloudContentConfirmationRequest request = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            CloudContentPreparation.ConvertRegularFile, segmentSize: 4);
+        CloudContentConfirmationResult native = await RunAsync(session, request);
+        CloudFilesException original = Assert.IsType<CloudFilesException>(native.Error);
+        IOException projectionFault = new("Injected transaction failure.");
+        CloudContentConfirmationResult projected = native.WithProjection(native.Outcome, false,
+            TimeSpan.Zero, CloudSynchronizationState.NotInSync, Identity.Encode(), projectionFault);
+        Assert.Equal(CloudContentConfirmationOutcome.Failed, projected.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Projection, projected.Stage);
+        Assert.Equal(failDuringRead ? CloudContentConfirmationStage.Read : CloudContentConfirmationStage.Mark, projected.NativeStage);
+        Assert.Same(original, projected.NativeError);
+        Assert.Equal(unchecked((int)0x80070005), projected.NativeError!.HResult);
+        Assert.Same(projectionFault, projected.ProjectionError);
+        Assert.Equal(new Exception[] { original, projectionFault }, Assert.IsType<AggregateException>(projected.Error).InnerExceptions);
+        Assert.True(projected.NativeIdentityPrepared);
+        Assert.Equal(0, projected.PreparationHResult);
+        Assert.False(projected.NativeApplied);
+        Assert.False(projected.NativeConfirmationVerified);
+        Assert.False(projected.DurableProjectionCommitted);
+        Assert.Equal(0, session.ActiveReferences);
+        Assert.True(session.Disposed);
+    }
+
+    [Fact]
     public async Task AnExpiredEarlierReferenceStopsBeforeTheTotalDeadline()
     {
         int reads = 0;

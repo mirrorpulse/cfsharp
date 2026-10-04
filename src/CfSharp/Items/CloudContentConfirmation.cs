@@ -138,6 +138,9 @@ public enum CloudContentConfirmationOutcome
     Failed,
     /// <summary>A verified native confirmation exists but its durable identity projection needs recovery.</summary>
     NativeAppliedProjectionPending,
+    /// <summary>The object or complete native identity changed during projection; reconcile native and durable state.</summary>
+    /// <remarks>Historical confirmation and any successful database commit remain recorded in the receipt.</remarks>
+    ProjectionConflict,
 }
 
 /// <summary>Identifies the stage at which the reported observation or failure occurred.</summary>
@@ -166,16 +169,21 @@ public enum CloudContentConfirmationStage
 /// Immutable and safe for concurrent reads. No handle ownership escapes the operation.
 /// A receipt describes one past verification, not the current file state. Subsequent local writes
 /// can clear in-sync. Native and database commits are not an atomic transaction. Retry the same
-/// request after a pending projection or preparation, verifying the entire proof again.
+/// request after a pending projection or preparation, verifying the entire proof again. A projection
+/// conflict requires reconciliation of the observed identity before deciding which proof to retry.
 /// </remarks>
 public sealed class CloudContentConfirmationResult
 {
+    private readonly byte[]? _observedIdentity;
+
     internal CloudContentConfirmationResult(CloudContentConfirmationRequest request,
         CloudContentConfirmationOutcome outcome, CloudContentConfirmationStage stage,
         bool prepared, bool applied, bool verified, bool projected, long bytes, int segments,
         TimeSpan elapsed, TimeSpan longestReference, long? preparationUsn, Exception? error,
         CloudSynchronizationState? observedSynchronizationState = null,
-        int? preparationHResult = null, int? nativeMarkHResult = null)
+        int? preparationHResult = null, int? nativeMarkHResult = null,
+        ReadOnlyMemory<byte>? observedPlaceholderIdentity = null,
+        CloudContentConfirmationResult? nativeResult = null, Exception? projectionError = null)
     {
         Request = request;
         Outcome = outcome;
@@ -193,6 +201,24 @@ public sealed class CloudContentConfirmationResult
         ObservedSynchronizationState = observedSynchronizationState;
         PreparationHResult = preparationHResult;
         NativeMarkHResult = nativeMarkHResult;
+        _observedIdentity = observedPlaceholderIdentity?.ToArray();
+        NativeStage = nativeResult?.NativeStage ?? stage;
+        NativeError = nativeResult is null ? error : nativeResult.NativeError;
+        ProjectionError = projectionError;
+    }
+
+    internal CloudContentConfirmationResult WithProjection(CloudContentConfirmationOutcome outcome,
+        bool committed, TimeSpan projectionElapsed, CloudSynchronizationState? observedState,
+        ReadOnlyMemory<byte>? observedIdentity, Exception? projectionError = null)
+    {
+        Exception? error = projectionError is null ? Error : Error is null ? projectionError :
+            new AggregateException("Native confirmation and durable projection both failed.", Error, projectionError);
+        CloudContentConfirmationStage stage = projectionError is not null ? CloudContentConfirmationStage.Projection :
+            NativeConfirmationVerified && committed ? CloudContentConfirmationStage.Complete : Stage;
+        return new(Request, outcome, stage, NativeIdentityPrepared, NativeApplied, NativeConfirmationVerified,
+            committed, BytesVerified, SegmentsRead, Elapsed + projectionElapsed, LongestReference,
+            PreparationUsn, error, observedState, PreparationHResult, NativeMarkHResult, observedIdentity,
+            nativeResult: this, projectionError);
     }
 
     /// <summary>Gets the copied proof to retain for recovery.</summary>
@@ -201,13 +227,16 @@ public sealed class CloudContentConfirmationResult
     public CloudContentConfirmationOutcome Outcome { get; }
     /// <summary>Gets the completion or failure stage.</summary>
     public CloudContentConfirmationStage Stage { get; }
+    /// <summary>Gets the native phase's final stage, preserved even if projection subsequently fails.</summary>
+    public CloudContentConfirmationStage NativeStage { get; }
     /// <summary>Gets whether this invocation successfully converted or changed the native identity.</summary>
     public bool NativeIdentityPrepared { get; }
     /// <summary>Gets whether this invocation successfully issued the native in-sync mark.</summary>
     public bool NativeApplied { get; }
     /// <summary>Gets whether a native in-sync state was established or fully reverified against the proof.</summary>
     public bool NativeConfirmationVerified { get; }
-    /// <summary>Gets whether the verified accepted identity was committed to the official store.</summary>
+    /// <summary>Gets whether the accepted identity was committed to the official store.</summary>
+    /// <remarks>A true value is a commit fact; a projection conflict can still leave that row stale.</remarks>
     public bool DurableProjectionCommitted { get; }
     /// <summary>Gets full-proof bytes read, including a separate verification after identity preparation.</summary>
     public long BytesVerified { get; }
@@ -225,8 +254,18 @@ public sealed class CloudContentConfirmationResult
     /// <summary>Gets the actual successful mark HRESULT, or null when this invocation did not mark.</summary>
     public int? NativeMarkHResult { get; }
     /// <summary>Gets the preserved failure, including a structured native exception where applicable.</summary>
+    /// <remarks>Contains an AggregateException when native confirmation and projection both fail.</remarks>
     public Exception? Error { get; }
+    /// <summary>Gets the native phase's failure with its original stage and HRESULT, or null.</summary>
+    /// <remarks>Inspect NativeStage independently of any later projection failure.</remarks>
+    public Exception? NativeError { get; }
+    /// <summary>Gets the projection failure independently of the native phase, or null.</summary>
+    public Exception? ProjectionError { get; }
     /// <summary>Gets the later native state observed during projection, when available.</summary>
     /// <remarks>A subsequent local write can make this NotInSync despite a successful past mark.</remarks>
     public CloudSynchronizationState? ObservedSynchronizationState { get; }
+    /// <summary>Gets a defensive copy of the complete native identity last observed during projection, or null.</summary>
+    /// <remarks>An empty identity means the observed object was no longer a placeholder. This is a past observation, not a lock.</remarks>
+    public ReadOnlyMemory<byte>? ObservedPlaceholderIdentity => _observedIdentity is null
+        ? (ReadOnlyMemory<byte>?)null : new ReadOnlyMemory<byte>(_observedIdentity.ToArray());
 }

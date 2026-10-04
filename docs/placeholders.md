@@ -177,16 +177,26 @@ protected owner closes. Neither path continues an old digest after a break.
 | `Busy`, `ProtectionLost` | Retry the entire proof after the competing operation finishes. |
 | `Canceled`, `DeadlineExceeded`, `Failed` | Inspect stage, error, and preparation facts; do not assume identity preparation was rolled back. |
 | `NativeAppliedProjectionPending` | Retain the same proof and replay to repair durable identity projection. |
+| `ProjectionConflict` | Reconcile the observed complete native identity and durable row; preserve the historical receipt and inspect whether the database committed. |
 
 The receipt owns its proof and distinguishes `NativeIdentityPrepared`, `NativeApplied`,
 `NativeConfirmationVerified`, and `DurableProjectionCommitted`. Actual preparation and mark
-HRESULTs are retained when those calls succeed; errors preserve operation and HRESULT. A zero
+HRESULTs are retained when those calls succeed; errors preserve operation and HRESULT.
+`NativeStage` and `NativeError` preserve the native phase when `ProjectionError` reports another
+failure. `Error` contains both in an `AggregateException` if both phases fail. The copied
+`ObservedPlaceholderIdentity` records the complete last projection observation, independently of
+the accepted proof and the durable row. A zero
 `PreparationUsn` remains an observation. Already-in-sync files still undergo complete proof
 verification, and an idempotent replay need not issue another mark.
 
 Native mutation and SQLite are separate commits. Protection is released before opening the
 projection transaction. A metadata-only no-delete guard verifies that the durable identity is
-projected onto the same object. If preparation succeeds but later verification or marking fails,
+projected onto the same object. It allows native identity updates through other writable handles.
+The complete identity and object binding are checked before the transaction, immediately before
+commit, and after commit. A detected change returns `ProjectionConflict` with an error, including
+when the row already committed. These checks do not eliminate every race between native and SQLite
+operations, including an uncoordinated update after the final observation.
+If preparation succeeds but later verification or marking fails,
 its receipt remains explicit and projection is attempted; do not acknowledge content merely
 because identity preparation or its projection succeeded. After native confirmation, caller
 cancellation cannot erase the commit fact or automatically mark the object not-in-sync.
@@ -198,6 +208,41 @@ business data. Confirmation does not acknowledge journal operations, local-chang
 generations, or unrelated echo entries. Later writes remain native not-in-sync; the receipt's
 `ObservedSynchronizationState` is a later observation and never forces the old state back onto
 the file. Same-path library operations serialize through existing leases; other paths can progress.
+
+Use `file.UpdatePlaceholderAsync` for identity updates through the same `CloudFileSystem` owner;
+its existing item coordinator serializes with confirmation through the projection transaction.
+Identity writers using raw CFAPI or another owner must join an application-owned per-item gate.
+Hold that gate from before confirmation until it returns, and acquire the same gate for each
+external identity mutation and its durable reconciliation. Content-only writers do not need this
+identity gate. For example, with a shared `SemaphoreSlim identityGate` for this file:
+
+```csharp
+await identityGate.WaitAsync(cancellationToken);
+try
+{
+    confirmation = await file.ConfirmUploadedContentAsync(proof, cancellationToken);
+}
+finally
+{
+    identityGate.Release();
+}
+
+// Every identity writer must use that same gate. Prefer the coordinated public patch:
+await identityGate.WaitAsync(cancellationToken);
+try
+{
+    await file.UpdatePlaceholderAsync(CloudPlaceholderPatch.CreateBuilder()
+        .WithIdentity(nextIdentity).WithInSyncState(false).Build(), cancellationToken);
+}
+finally
+{
+    identityGate.Release();
+}
+```
+
+The gate belongs to the application and must cover all of its identity-writing paths; it is not
+an operating-system identity lock. Do not hold a `CloudItemLease` while invoking confirmation or
+another item operation on the same path, because those operations acquire the same item lease.
 
 ## Provider responsibility
 

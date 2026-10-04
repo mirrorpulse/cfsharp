@@ -21,6 +21,15 @@ public sealed partial class CloudFile
     /// later confirmation fails. Native confirmation and durable projection are separate commits.
     /// </para>
     /// <para>
+    /// Same-path operations through this owner serialize through projection. The metadata no-delete
+    /// guard prevents replacement but permits raw CFAPI identity writes. The caller must coordinate
+    /// identity writers outside this owner with an application-owned per-item gate held through this
+    /// operation's return. Prefer UpdatePlaceholderAsync for library-coordinated identity changes.
+    /// Full identity checks before and after projection report observed races as ProjectionConflict;
+    /// they cannot make arbitrary native identity writes atomic with the database. Content-only writes
+    /// may continue after protection ends and remain new local changes.
+    /// </para>
+    /// <para>
     /// After a successful native mark, cancellation cannot report that nothing happened. Projection
     /// completes without caller cancellation or returns a recoverable receipt. Replay the same proof
     /// to repair a pending projection; each replay verifies the entire content, including already

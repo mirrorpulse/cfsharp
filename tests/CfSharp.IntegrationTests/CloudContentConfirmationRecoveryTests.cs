@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 
+using CfSharp.Native;
 using CfSharp.Storage.Sqlite;
 
 namespace CfSharp.IntegrationTests;
@@ -175,6 +176,91 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal("change"u8.ToArray(), await File.ReadAllBytesAsync(fixture.File.FullPath));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NativeIdentityReplacementDuringProjectionReportsAConflict(bool duringCommit)
+    {
+        FaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new FaultFactory(path));
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(binding, content, CloudContentPreparation.ConvertRegularFile);
+        CloudPlaceholderIdentity subsequent = new(proof.AcceptedIdentity.ItemId, proof.AcceptedIdentity.RemoteId, "revision-3");
+        Func<ValueTask> replace = () =>
+        {
+            Assert.Equal(0, ReplaceNativeIdentity(fixture.File.FullPath, subsequent));
+            return ValueTask.CompletedTask;
+        };
+        if (duringCommit)
+        {
+            factory!.BeforeCommit = replace;
+        }
+        else
+        {
+            factory!.BeforeTransaction = replace;
+        }
+
+        CloudContentConfirmationResult result = await fixture.File.ConfirmUploadedContentAsync(proof);
+        Assert.Equal(CloudContentConfirmationOutcome.ProjectionConflict, result.Outcome);
+        Assert.True(result.NativeIdentityPrepared);
+        Assert.True(result.NativeApplied);
+        Assert.True(result.NativeConfirmationVerified);
+        Assert.Equal(duringCommit, result.DurableProjectionCommitted);
+        Assert.Equal(CloudContentConfirmationStage.Projection, result.Stage);
+        Assert.IsType<IOException>(result.Error);
+        Assert.Same(result.Error, result.ProjectionError);
+        Assert.Null(result.NativeError);
+        Assert.Equal(CloudContentConfirmationStage.Mark, result.NativeStage);
+        Assert.Equal(CloudSynchronizationState.NotInSync, result.ObservedSynchronizationState);
+        Assert.Equal(subsequent.Encode(), result.ObservedPlaceholderIdentity!.Value.ToArray());
+        CloudItemSnapshot snapshot = await fixture.File.InspectAsync();
+        Assert.Equal(subsequent.Encode(), snapshot.PlaceholderIdentity.ToArray());
+        Assert.Equal(duringCommit ? proof.AcceptedIdentity.RemoteRevision : null, snapshot.RemoteRevision);
+        Assert.Equal(binding, snapshot.LocalBinding);
+    }
+
+    private static unsafe int ReplaceNativeIdentity(string path, CloudPlaceholderIdentity identity)
+    {
+        // Use an ordinary writable Win32 handle on the same file, without another store owner
+        // or path replacement. A no-delete metadata guard does not prevent this CFAPI update.
+        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        byte[] bytes = identity.Encode();
+        fixed (byte* pointer = bytes)
+        {
+            return CfApi.CfUpdatePlaceholder(handle.DangerousGetHandle(), null, pointer, (uint)bytes.Length,
+                null, 0, CfUpdateFlags.ClearInSync, null, null);
+        }
+    }
+
+    [Fact]
+    public async Task DisposalFailureAfterCommitRetainsTheActualDatabaseCommit()
+    {
+        FaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new FaultFactory(path));
+        byte[] content = "upload"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, content);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        CloudContentConfirmationRequest proof = Proof(binding, content, CloudContentPreparation.ConvertRegularFile);
+        ProjectionFault fault = new();
+        factory!.BeforeCommit = () =>
+        {
+            factory.NextDisposeFault = fault;
+            return ValueTask.CompletedTask;
+        };
+        CloudContentConfirmationResult result = await fixture.File.ConfirmUploadedContentAsync(proof);
+        Assert.Equal(CloudContentConfirmationOutcome.NativeAppliedProjectionPending, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Projection, result.Stage);
+        Assert.True(result.NativeApplied);
+        Assert.True(result.NativeConfirmationVerified);
+        Assert.True(result.DurableProjectionCommitted);
+        Assert.Same(fault, result.ProjectionError);
+        Assert.Same(fault, result.Error);
+        Assert.Null(result.NativeError);
+        Assert.Equal(proof.AcceptedIdentity.RemoteRevision, (await fixture.File.InspectAsync()).RemoteRevision);
+    }
+
     [Fact]
     public async Task OtherFilesProgressWhileSameFileOperationsAndShutdownDrain()
     {
@@ -218,6 +304,8 @@ public sealed partial class CloudContentConfirmationTests
     {
         private readonly SqliteCloudStateStoreFactory _inner = new(path);
         internal Exception? NextCommitFault { get; set; }
+        internal Exception? NextDisposeFault { get; set; }
+        internal Func<ValueTask>? BeforeTransaction { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
 
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context,
@@ -226,8 +314,16 @@ public sealed partial class CloudContentConfirmationTests
 
         private sealed class FaultStore(ICloudStateStore inner, FaultFactory faults) : ICloudStateStore
         {
-            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
-                new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), faults);
+            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+            {
+                if (faults.BeforeTransaction is { } before)
+                {
+                    faults.BeforeTransaction = null;
+                    await before();
+                }
+
+                return new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), faults);
+            }
             public ValueTask DisposeAsync() => inner.DisposeAsync();
         }
 
@@ -258,7 +354,15 @@ public sealed partial class CloudContentConfirmationTests
             }
 
             public ValueTask RollbackAsync(CancellationToken cancellationToken = default) => inner.RollbackAsync(cancellationToken);
-            public ValueTask DisposeAsync() => inner.DisposeAsync();
+            public async ValueTask DisposeAsync()
+            {
+                await inner.DisposeAsync();
+                if (faults.NextDisposeFault is { } exception)
+                {
+                    faults.NextDisposeFault = null;
+                    throw exception;
+                }
+            }
         }
     }
 }

@@ -52,44 +52,50 @@ public sealed partial class CloudFileSystem
         // No protected reference or opaque owner survives RunAsync. Hold only a metadata
         // no-delete guard through projection so path replacement cannot redirect the row.
         // It permits later data writes: native in-sync remains the authority for those changes.
+        // Raw CFAPI identity writers must also join the caller's coordination boundary: this
+        // guard permits identity updates, and native mutation cannot be atomic with SQLite.
         long projectionStarted = Stopwatch.GetTimestamp();
         CloudSynchronizationState? observed = null;
+        byte[]? observedIdentity = null;
         bool committed = false;
+        bool identityConflict = false;
         try
         {
             using SafeFileHandle guard = WindowsFileMetadata.Open(file.FullPath, preventDelete: true);
-            NativeFileMetadata facts = WindowsFileMetadata.Read(guard.DangerousGetHandle());
-            if (CloudLocalFileBindingPlatform.Read(guard.DangerousGetHandle(), SyncRootPath) != request.ExpectedBinding ||
-                !facts.PlaceholderIdentity.AsSpan().SequenceEqual(request.EncodedIdentity))
+            void CheckProjectionIdentity()
             {
-                throw new IOException("The verified object or identity changed before durable projection.");
+                NativeFileMetadata facts = WindowsFileMetadata.Read(guard.DangerousGetHandle());
+                observed = facts.InSync ? CloudSynchronizationState.InSync : CloudSynchronizationState.NotInSync;
+                observedIdentity = facts.PlaceholderIdentity;
+                if (CloudLocalFileBindingPlatform.Read(guard.DangerousGetHandle(), SyncRootPath) != request.ExpectedBinding ||
+                    !observedIdentity.AsSpan().SequenceEqual(request.EncodedIdentity))
+                {
+                    identityConflict = true;
+                    throw new IOException("The verified object or complete identity changed during durable projection; reconcile native and durable state.");
+                }
             }
 
-            observed = facts.InSync ? CloudSynchronizationState.InSync : CloudSynchronizationState.NotInSync;
+            CheckProjectionIdentity();
             await PersistIdentityAsync(operation.StateStore, file, request.AcceptedIdentity,
-                CancellationToken.None).ConfigureAwait(false);
-            committed = true;
-            // Observe later writes; never force the old receipt's in-sync bit back onto the file.
-            facts = WindowsFileMetadata.Read(guard.DangerousGetHandle());
-            observed = facts.InSync ? CloudSynchronizationState.InSync : CloudSynchronizationState.NotInSync;
-            return Projected(native.Outcome, projected: true, native.Stage, native.Error);
+                CancellationToken.None, validateBeforeCommit: CheckProjectionIdentity,
+                onCommitted: () => committed = true).ConfigureAwait(false);
+            // Detect identity changes across the commit as well as later content writes.
+            // Never force either the old identity or its in-sync bit back onto the file.
+            CheckProjectionIdentity();
+            return Projected(native.Outcome);
         }
         catch (Exception exception)
         {
             Exception error = CloudProtectedContentConfirmation.Translate(exception, file.FullPath,
                 CloudContentConfirmationStage.Projection);
-            return Projected(!committed && native.NativeConfirmationVerified
-                ? CloudContentConfirmationOutcome.NativeAppliedProjectionPending : native.Outcome,
-                committed, CloudContentConfirmationStage.Projection, error);
+            return Projected(identityConflict ? CloudContentConfirmationOutcome.ProjectionConflict :
+                native.NativeConfirmationVerified
+                    ? CloudContentConfirmationOutcome.NativeAppliedProjectionPending : native.Outcome, error);
         }
 
-        CloudContentConfirmationResult Projected(CloudContentConfirmationOutcome outcome, bool projected,
-            CloudContentConfirmationStage stage, Exception? error) => new(request, outcome,
-                projected && native.NativeConfirmationVerified && error is null ? CloudContentConfirmationStage.Complete : stage,
-                native.NativeIdentityPrepared, native.NativeApplied, native.NativeConfirmationVerified,
-                projected, native.BytesVerified, native.SegmentsRead,
-                native.Elapsed + Stopwatch.GetElapsedTime(projectionStarted), native.LongestReference,
-                native.PreparationUsn, error, observed, native.PreparationHResult, native.NativeMarkHResult);
+        CloudContentConfirmationResult Projected(CloudContentConfirmationOutcome outcome, Exception? error = null) =>
+            native.WithProjection(outcome, committed, Stopwatch.GetElapsedTime(projectionStarted),
+                observed, observedIdentity is null ? null : new ReadOnlyMemory<byte>(observedIdentity), error);
 
         bool TimedOut() => deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested &&
             !_contentConfirmationStopping.IsCancellationRequested;
