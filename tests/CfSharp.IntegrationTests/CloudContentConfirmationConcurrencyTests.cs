@@ -7,6 +7,24 @@ namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    private static string GetHarnessPath()
+    {
+        DirectoryInfo? repository = new(AppContext.BaseDirectory);
+        while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "CfSharp.sln")))
+        {
+            repository = repository.Parent;
+        }
+
+        Assert.NotNull(repository);
+        string configuration = typeof(CloudContentConfirmationTests).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
+            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
+        string harness = Path.Combine(repository!.FullName, "tests", "CfSharp.Storage.Sqlite.CrashHarness",
+            "bin", configuration, "net10.0-windows", "CfSharp.Storage.Sqlite.CrashHarness.dll");
+        Assert.True(File.Exists(harness), $"The {configuration} harness build output is missing: {harness}");
+        return harness;
+    }
+
     private static Competitor StartCompetitor(string path, string target, string action)
     {
         static string Quote(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
@@ -16,17 +34,7 @@ public sealed partial class CloudContentConfirmationTests
         ProcessStartInfo start = new("dotnet") { UseShellExecute = false, CreateNoWindow = true };
         if (action == "write")
         {
-            DirectoryInfo? repository = new(AppContext.BaseDirectory);
-            while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "CfSharp.sln")))
-            {
-                repository = repository.Parent;
-            }
-
-            Assert.NotNull(repository);
-            string harness = Path.Combine(repository!.FullName, "tests", "CfSharp.Storage.Sqlite.CrashHarness",
-                "bin", "Release", "net10.0-windows", "CfSharp.Storage.Sqlite.CrashHarness.dll");
-            Assert.True(File.Exists(harness));
-            start.ArgumentList.Add(harness);
+            start.ArgumentList.Add(GetHarnessPath());
             start.ArgumentList.Add(path);
             start.ArgumentList.Add(name);
             start.ArgumentList.Add("protected-write");

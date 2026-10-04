@@ -99,6 +99,17 @@ Native or Windows-state changes also require the relevant ABI probe, integration
 or sample-provider tests. The 30-minute x64/ARM64 `LongSoak` is a manual workflow gate, not a
 substitute for the normal test suite.
 
+The integration test project can also be built and tested independently in either configuration:
+
+```powershell
+dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release
+dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Debug
+```
+
+Its project reference builds the crash harness without referencing its executable assembly.
+Confirmation subprocess tests select the harness configuration recorded in the test assembly;
+no prior solution build or Release output is required for a Debug run.
+
 ## Scope And Generated Content
 
 - Do not commit local research, downloaded documentation, credentials, build output, or IDE state.

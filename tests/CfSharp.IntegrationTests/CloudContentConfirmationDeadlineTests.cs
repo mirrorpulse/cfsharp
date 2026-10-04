@@ -14,16 +14,8 @@ public sealed partial class CloudContentConfirmationTests
         await fixture.File.SetInSyncAsync(false);
         CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
         await fixture.System.DisposeAsync();
-        DirectoryInfo? repository = new(AppContext.BaseDirectory);
-        while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "CfSharp.sln")))
-        {
-            repository = repository.Parent;
-        }
-
-        Assert.NotNull(repository);
         ProcessStartInfo start = new("dotnet") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
-        start.ArgumentList.Add(Path.Combine(repository!.FullName, "tests", "CfSharp.Storage.Sqlite.CrashHarness",
-            "bin", "Release", "net10.0-windows", "CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        start.ArgumentList.Add(GetHarnessPath());
         start.ArgumentList.Add(Path.Combine(Path.GetDirectoryName(fixture.Root)!, "state.db"));
         start.ArgumentList.Add(fixture.Root);
         start.ArgumentList.Add("protected-deadline");

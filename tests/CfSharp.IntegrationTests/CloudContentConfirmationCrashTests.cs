@@ -27,16 +27,8 @@ public sealed partial class CloudContentConfirmationTests
             Hash = request.ExpectedSha256.ToArray(),
         }));
         await fixture.System.DisposeAsync();
-        DirectoryInfo? repository = new(AppContext.BaseDirectory);
-        while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "CfSharp.sln")))
-        {
-            repository = repository.Parent;
-        }
-
-        Assert.NotNull(repository);
         ProcessStartInfo start = new("dotnet") { UseShellExecute = false, CreateNoWindow = true };
-        start.ArgumentList.Add(Path.Combine(repository!.FullName, "tests", "CfSharp.Storage.Sqlite.CrashHarness",
-            "bin", "Release", "net10.0-windows", "CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        start.ArgumentList.Add(GetHarnessPath());
         start.ArgumentList.Add(database);
         start.ArgumentList.Add(fixture.Root);
         start.ArgumentList.Add("protected-confirmation");
