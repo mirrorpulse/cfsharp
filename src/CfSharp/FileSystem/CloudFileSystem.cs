@@ -339,6 +339,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
             }
 
             Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Stopping);
+            _contentConfirmationStopping.Cancel();
         }
         finally
         {
@@ -362,6 +363,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             if (failures.Count == 0)
             {
+                _contentConfirmationStopping.Dispose();
                 Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Disposed);
                 GC.SuppressFinalize(this);
             }

@@ -105,6 +105,86 @@ accept it. Some Windows builds reject even an unchanged, verified token with `0x
 conditional confirmation on the target platform before relying on it in a provider's acceptance
 tests; the read API alone does not establish that capability.
 
+## Protected uploaded-content confirmation
+
+Use `CloudFile.ConfirmUploadedContentAsync` when a remote service has accepted a complete content
+proof and the installed platform does not provide usable conditional in-sync tokens. Capture
+`LocalBinding` before uploading, compute the digest of the uploaded bytes, authenticate the remote
+acceptance, and durably retain that proof in the application. Close upload streams and mappings
+before requesting protection.
+
+```csharp
+CloudLocalFileBinding uploadedObject = uploadSnapshot.LocalBinding
+    ?? throw new InvalidOperationException("A complete upload-time object binding is required.");
+CloudPlaceholderIdentity acceptedIdentity = new(itemId, acceptedRemoteId, acceptedRevision);
+CloudContentConfirmationRequest proof = new(
+    uploadedObject,
+    acceptedIdentity,
+    uploadedLength,
+    uploadedSha256,
+    preparation: CloudContentPreparation.ConvertRegularFile);
+
+CloudContentConfirmationResult confirmation =
+    await file.ConfirmUploadedContentAsync(proof, cancellationToken);
+if (confirmation.Outcome is CloudContentConfirmationOutcome.Confirmed or
+    CloudContentConfirmationOutcome.AlreadyConfirmed)
+{
+    // Advance only the application intent covered by this retained upload proof.
+}
+```
+
+The default preparation is `None`: the complete opaque placeholder identity must already match.
+`ConvertRegularFile` explicitly permits conversion of the verified ordinary file. For revision
+replacement, select `ReplacePlaceholderIdentity` and provide the complete previously observed
+identity bytes. Both modes also permit replay when the accepted identity is already present.
+Preparation checks binding, full length, and SHA-256 before changing identity, then verifies the
+whole content again before marking. It never writes file content or changes pin intent.
+
+The implementation uses one exclusive protected owner, without `Foreground`. Every bounded read
+holds a reference until native I/O has completed or cancellation has drained. References are
+released between segments and reacquired on the same opaque handle. A break discards the attempt;
+the library never reopens by path to continue its digest. The final identity, length, object
+checks and native mark share one reference. The mark passes a **null USN pointer**, which is
+native-unconditional. Its safety relies on exclusive object protection and the complete proof,
+not USN CAS. Existing positive-USN conditional APIs keep their contract.
+
+Ordinary files and fully local placeholders are supported. Directories, hard links, arbitrary
+reparse targets, and partial or online-only content are rejected without hydration. Default reads
+use a 1 MiB buffer, a 250 ms reference budget, and a ten-minute total deadline; immutable request
+options can adjust finite budgets. Pending cancellation is requested with `CancelIoEx` and drained
+before buffers, events, or references are freed. Driver cancellation drain and synchronous native
+calls may exceed a budget; expired budgets stop subsequent work and marking.
+
+| Outcome | Caller action |
+| --- | --- |
+| `Confirmed`, `AlreadyConfirmed` | Complete only the retained accepted-content intent. |
+| `ContentMismatch`, `IdentityMismatch`, `LocalObjectMismatch` | Retain intent and reconcile; replacements do not inherit it. |
+| `NotFullyLocal`, `NotApplicable` | Choose an explicit application workflow; confirmation does not download content. |
+| `Busy`, `ProtectionLost` | Retry the entire proof after the competing operation finishes. |
+| `Canceled`, `DeadlineExceeded`, `Failed` | Inspect stage, error, and preparation facts; do not assume identity preparation was rolled back. |
+| `NativeAppliedProjectionPending` | Retain the same proof and replay to repair durable identity projection. |
+
+The receipt owns its proof and distinguishes `NativeIdentityPrepared`, `NativeApplied`,
+`NativeConfirmationVerified`, and `DurableProjectionCommitted`. Actual preparation and mark
+HRESULTs are retained when those calls succeed; errors preserve operation and HRESULT. A zero
+`PreparationUsn` remains an observation. Already-in-sync files still undergo complete proof
+verification, and an idempotent replay need not issue another mark.
+
+Native mutation and SQLite are separate commits. Protection is released before opening the
+projection transaction. A metadata-only no-delete guard verifies that the durable identity is
+projected onto the same object. If preparation succeeds but later verification or marking fails,
+its receipt remains explicit and projection is attempted; do not acknowledge content merely
+because identity preparation or its projection succeeded. After native confirmation, caller
+cancellation cannot erase the commit fact or automatically mark the object not-in-sync.
+
+Retain the proof across process crashes and replay it after reopening the file system. Replays
+recheck object, identity, and complete content before repairing the accepted revision. The store
+contains existing identity coordination metadata, not content hashes, upload receipts, or remote
+business data. Confirmation does not acknowledge journal operations, local-change events, rescan
+generations, or unrelated echo entries. Later writes remain native not-in-sync; the receipt's
+`ObservedSynchronizationState` is a later observation and never forces the old state back onto
+the file. Same-path library operations serialize through existing leases; other paths can progress.
+
 ## Provider responsibility
 
 CfSharp coordinates the Windows demand callback and durable state; the application supplies content
