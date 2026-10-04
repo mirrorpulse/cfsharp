@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.Versioning;
 using Xunit.Sdk;
 
@@ -78,10 +79,93 @@ public sealed class CloudFileSystemTests
                 $"The test host cannot create a symbolic link: {exception.Message}");
         }
 
-        Assert.Throws<ArgumentException>(() =>
+        Assert.Throws<CloudPathReparsePointException>(() =>
             CloudPathHandleLease.OpenParentChains(
                 root.Path,
                 [Path.Combine(link, "item.txt")]));
+    }
+
+    [Fact]
+    public async Task ConfirmationRetainsLifecycleAndRequestArgumentExceptions()
+    {
+        using TestDirectory root = new();
+        await using CloudFileSystem system = CloudFileSystem.CreateBuilder(root.Path)
+            .WithStateStore(new RecordingStoreFactory()).Build();
+        CloudFile file = new(system, Path.Combine(root.Path, "content.bin"), "content.bin");
+        CloudContentConfirmationRequest request = new(new(1, Guid.NewGuid(), Guid.NewGuid()),
+            new(Guid.NewGuid(), "accepted", "revision-1"), 0, new byte[32]);
+        await Assert.ThrowsAsync<ArgumentNullException>(() => file.ConfirmUploadedContentAsync(null!).AsTask());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => file.ConfirmUploadedContentAsync(request).AsTask());
+        await system.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => file.ConfirmUploadedContentAsync(request).AsTask());
+    }
+
+    [Fact]
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "xUnit1031:Do not use blocking task operations in test method",
+        Justification = "A dedicated background UI probe must synchronously dispose; the test awaits it with a bounded rescue.")]
+    public async Task SynchronousDisposeDrainsConfirmationWithoutPumpingTheCallingContext()
+    {
+        using TestDirectory root = new();
+        await using CloudFileSystem system = CloudFileSystem.CreateBuilder(root.Path, new RecordingRuntime())
+            .WithStateStore(new RecordingStoreFactory()).Build();
+        await system.StartAsync();
+        // A missing file keeps this lifecycle probe independent of CFAPI or a registered root.
+        CloudFile file = system.GetFile("missing.bin");
+        CloudContentConfirmationRequest request = new(new(1, Guid.NewGuid(), Guid.NewGuid()),
+            new(Guid.NewGuid(), "accepted", "revision-1"), 0, new byte[32]);
+        PausedContext context = new();
+        TaskCompletionSource<CloudContentConfirmationResult> closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Thread ui = new(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            try
+            {
+                Task<CloudContentConfirmationResult> confirmation = file.ConfirmUploadedContentAsync(request).AsTask();
+                system.Dispose();
+                closed.SetResult(confirmation.GetAwaiter().GetResult());
+            }
+            catch (Exception exception) { closed.SetException(exception); }
+            finally { SynchronizationContext.SetSynchronizationContext(null); }
+        })
+        { IsBackground = true };
+        ui.Start();
+        bool completedWithoutPumping = await Task.WhenAny(closed.Task, Task.Delay(TimeSpan.FromSeconds(2))) == closed.Task;
+        // Rescue a regressed implementation before asserting, rather than leave a blocked thread.
+        if (!completedWithoutPumping)
+        {
+            context.Drain();
+        }
+
+        CloudContentConfirmationResult result = await closed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(ui.Join(TimeSpan.FromSeconds(5)));
+        Assert.True(completedWithoutPumping, "Synchronous Dispose depended on a queued caller-context continuation.");
+        Assert.Equal(0, context.Posts);
+        Assert.Equal(CloudFileSystemLifecycleState.Disposed, system.LifecycleState);
+        Assert.False(result.NativeIdentityPrepared);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+        Assert.False(result.DurableProjectionCommitted);
+        Assert.Contains(result.Outcome, new[] { CloudContentConfirmationOutcome.Canceled, CloudContentConfirmationOutcome.Failed });
+    }
+
+    private sealed class PausedContext : SynchronizationContext
+    {
+        private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> _pending = new();
+        private int _posts;
+        internal int Posts => Volatile.Read(ref _posts);
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref _posts);
+            _pending.Enqueue((d, state));
+        }
+
+        internal void Drain()
+        {
+            while (_pending.TryDequeue(out var continuation))
+            {
+                continuation.Callback(continuation.State);
+            }
+        }
     }
 
     [Fact]

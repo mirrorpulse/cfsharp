@@ -59,6 +59,8 @@ public abstract partial class CloudItem
 
     internal bool IsOwnedBy(CloudFileSystem owner) => ReferenceEquals(_owner, owner);
 
+    internal string SyncRootPath => _owner.SyncRootPath;
+
     /// <summary>Reads fresh local and durable state without retaining a native handle.</summary>
     /// <param name="cancellationToken">Token that cancels state-store access.</param>
     /// <returns>A new immutable snapshot. Missing items are represented explicitly.</returns>

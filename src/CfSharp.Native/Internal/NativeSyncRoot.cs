@@ -40,7 +40,11 @@ internal static unsafe class NativeSyncRoot
         }
     }
 
-    internal static int Query(string path, out NativeSyncRootInfo? info)
+    internal static int Query(string path, out NativeSyncRootInfo? info) => Query(path, 0, out info);
+
+    internal static int Query(nint fileHandle, out NativeSyncRootInfo? info) => Query(null, fileHandle, out info);
+
+    private static int Query(string? path, nint fileHandle, out NativeSyncRootInfo? info)
     {
         CfSyncRootStandardInfo layout = default;
         int identityOffset = checked((int)(layout.SyncRootIdentity - (byte*)&layout));
@@ -52,12 +56,11 @@ internal static unsafe class NativeSyncRoot
             fixed (byte* bufferPointer = buffer)
             {
                 uint returnedLength = 0;
-                int result = CfApi.CfGetSyncRootInfoByPath(
-                    pathPointer,
-                    CfSyncRootInfoClass.Standard,
-                    bufferPointer,
-                    (uint)buffer.Length,
-                    &returnedLength);
+                int result = path is null
+                    ? CfApi.CfGetSyncRootInfoByHandle(fileHandle, CfSyncRootInfoClass.Standard,
+                        bufferPointer, (uint)buffer.Length, &returnedLength)
+                    : CfApi.CfGetSyncRootInfoByPath(pathPointer, CfSyncRootInfoClass.Standard,
+                        bufferPointer, (uint)buffer.Length, &returnedLength);
                 if (result == MoreDataHResult)
                 {
                     if (returnedLength <= buffer.Length || returnedLength > identityOffset + MaxSyncRootIdentityLength)

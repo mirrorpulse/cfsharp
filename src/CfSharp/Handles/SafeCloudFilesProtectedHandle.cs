@@ -89,6 +89,11 @@ internal sealed class SafeCloudFilesProtectedHandle : SafeHandleZeroOrMinusOneIs
 
         internal nint Win32Handle { get; }
 
+        // CFAPI understands the opaque owner, whereas general Win32 operations require
+        // Win32Handle. Both identify the same file and remain alive for this reference.
+        internal nint ProtectedHandle => (_owner ?? throw new ObjectDisposedException(nameof(CloudFilesHandleReference)))
+            .DangerousGetHandle();
+
         public void Dispose()
         {
             SafeCloudFilesProtectedHandle? owner = Interlocked.Exchange(ref _owner, null);

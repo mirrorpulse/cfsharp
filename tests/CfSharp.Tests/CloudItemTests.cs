@@ -24,6 +24,9 @@ public sealed class CloudItemTests
         Assert.Equal(Path.GetFullPath(filePath), file.FullPath);
         Assert.Same(fileSystem.Root.GetType(), file.Parent?.GetType());
         Assert.Equal(3, first.Length);
+        Assert.NotNull(first.LocalBinding);
+        Assert.Equal(first.LocalBinding, second.LocalBinding);
+        Assert.Null(rootSnapshot.LocalBinding);
         Assert.Equal(12, second.Length);
         Assert.Equal(3, first.Length);
         Assert.True(first.Exists);

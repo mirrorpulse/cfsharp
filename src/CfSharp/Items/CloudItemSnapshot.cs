@@ -37,7 +37,8 @@ public sealed class CloudItemSnapshot
         long? propertyDataSize,
         ReadOnlySpan<byte> placeholderIdentity,
         CloudItemState? durableState,
-        DateTimeOffset inspectedAt)
+        DateTimeOffset inspectedAt,
+        CloudLocalFileBinding? localBinding = null)
     {
         Kind = kind;
         Exists = exists;
@@ -52,6 +53,7 @@ public sealed class CloudItemSnapshot
         SynchronizationState = synchronizationState;
         LocalFileId = localFileId ?? durableState?.LocalFileId;
         SyncRootFileId = syncRootFileId;
+        LocalBinding = localBinding;
         OnDiskDataSize = onDiskDataSize;
         ValidatedDataSize = validatedDataSize;
         ModifiedDataSize = modifiedDataSize;
@@ -103,6 +105,15 @@ public sealed class CloudItemSnapshot
 
     /// <summary>Gets the volume-local identifier of the containing sync root, when available.</summary>
     public long? SyncRootFileId { get; }
+
+    /// <summary>Gets the complete native volume, root, and file binding when available.</summary>
+    /// <remarks>
+    /// Available for ordinary files as well as Cloud Files placeholders. No content is read or
+    /// hydrated. This observation holds no lock and is not a USN or content proof. Null denotes
+    /// absence, directories, or unsupported reparse targets. Retain the upload-time value rather
+    /// than replacing it with a later observation when confirming accepted content.
+    /// </remarks>
+    public CloudLocalFileBinding? LocalBinding { get; }
 
     /// <summary>Gets the number of placeholder content bytes physically present, when applicable.</summary>
     public long? OnDiskDataSize { get; }

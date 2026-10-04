@@ -35,6 +35,8 @@ internal sealed class LocalCloudItemInspection
 
     internal long? SyncRootFileId { get; init; }
 
+    internal CloudLocalFileBinding? LocalBinding { get; init; }
+
     internal long? OnDiskDataSize { get; init; }
 
     internal long? ValidatedDataSize { get; init; }
@@ -57,7 +59,8 @@ internal static partial class CloudItemInspector
 
     internal static unsafe LocalCloudItemInspection Inspect(
         string path,
-        CloudItemKind expectedKind)
+        CloudItemKind expectedKind,
+        string? syncRootPath = null)
     {
         if (!File.Exists(path) && !Directory.Exists(path))
         {
@@ -167,6 +170,10 @@ internal static partial class CloudItemInspector
                     : CloudSynchronizationState.NotApplicable),
             LocalFileId = placeholder?.FileId,
             SyncRootFileId = placeholder?.SyncRootFileId,
+            LocalBinding = actualKind == CloudItemKind.File && syncRootPath is not null &&
+                (!attributes.HasFlag(FileAttributes.ReparsePoint) || placeholder is not null)
+                ? CloudLocalFileBindingPlatform.TryRead(handle.DangerousGetHandle(), syncRootPath)
+                : null,
             OnDiskDataSize = placeholder?.OnDiskDataSize,
             ValidatedDataSize = placeholder?.ValidatedDataSize,
             ModifiedDataSize = placeholder?.ModifiedDataSize,

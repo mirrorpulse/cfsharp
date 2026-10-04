@@ -221,7 +221,9 @@ public sealed partial class CloudFileSystem
         ICloudStateStore stateStore,
         CloudItem item,
         CloudPlaceholderIdentity identity,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? validateBeforeCommit = null,
+        Action? onCommitted = null)
     {
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
@@ -246,7 +248,10 @@ public sealed partial class CloudFileSystem
                 isTombstone: false,
                 DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
+        validateBeforeCommit?.Invoke();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // Record success before transaction disposal, which can fail after a real commit.
+        onCommitted?.Invoke();
     }
 
     private static async ValueTask PersistIdentityPatchAsync(
