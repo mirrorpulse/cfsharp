@@ -89,6 +89,12 @@ a successful start. Disposing the facade stops process-scoped work and closes du
 does not unregister the persistent Windows sync-root registration. Call
 `CloudSyncRoot.Unregister()` only for explicit account removal or uninstall.
 
+To confirm content already accepted by a remote service, use
+[`CloudFile.ConfirmUploadedContentAsync`](docs/placeholders.md#protected-uploaded-content-confirmation).
+It verifies the retained file/root/volume binding, complete identity, length, and SHA-256 under
+exclusive native protection, with optional guarded conversion and recoverable SQLite projection.
+Callers retain the upload proof and handle the typed outcome; the library performs no remote upload.
+
 ## Documentation
 
 - [Documentation home](docs/index.md)
