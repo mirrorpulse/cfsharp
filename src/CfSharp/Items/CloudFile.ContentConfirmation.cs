@@ -15,6 +15,9 @@ public sealed partial class CloudFile
     /// A parent path that becomes an unsupported reparse point returns NotApplicable at the Open
     /// stage; admission I/O failures return Failed or Busy with native details. Invalid requests and
     /// an owner that has not started or is already disposed retain their exception semantics.
+    /// Protected work yields between segments without capturing the caller's synchronization
+    /// context or task scheduler, so draining confirmation during synchronous owner disposal
+    /// does not require pumping the caller's UI queue.
     /// </para>
     /// <para>
     /// The final native mark uses a null USN pointer and is therefore native-unconditional. Safety

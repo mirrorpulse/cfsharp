@@ -99,7 +99,9 @@ internal static class CloudProtectedContentConfirmation
     {
         // Use the public call's monotonic origin, including lease admission and this yield.
         // Cancellation timers can be delayed by a busy pool and cannot define elapsed time.
-        await Task.Yield();
+        // Force an asynchronous continuation without capturing a caller's UI context or task
+        // scheduler: synchronous owner disposal must be able to drain this admitted operation.
+        await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
         CloudContentConfirmationStage stage = CloudContentConfirmationStage.Open;
         bool prepared = false;
         bool applied = false;
@@ -258,7 +260,7 @@ internal static class CloudProtectedContentConfirmation
 
                 // Give queued writers a chance to break the oplock. Never reopen by path or
                 // carry an accumulated digest onto a replacement owner after a failed reference.
-                await Task.Yield();
+                await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
             }
         }
         catch (RejectedException exception)

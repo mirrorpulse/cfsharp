@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 
@@ -51,9 +50,7 @@ internal static class ProtectedConfirmationDeadline
         using ManualResetEventSlim occupied = new();
         using ManualResetEventSlim release = new();
         using ManualResetEventSlim drained = new();
-        PausedContext context = new();
         bool queued = false;
-        SynchronizationContext? previous = SynchronizationContext.Current;
         try
         {
             if (!ThreadPool.SetMinThreads(1, minimumIo) || !ThreadPool.SetMaxThreads(1, maximumIo))
@@ -73,48 +70,32 @@ internal static class ProtectedConfirmationDeadline
             }
 
             using CancellationTokenSource timerProbe = new(proof.Deadline);
-            SynchronizationContext.SetSynchronizationContext(context);
             Task<CloudContentConfirmationResult> pending = file.ConfirmUploadedContentAsync(proof).AsTask();
-            if (!context.HasPending || pending.IsCompleted)
+            if (pending.IsCompleted)
             {
-                throw new InvalidOperationException("The initial confirmation continuation was not paused.");
+                throw new InvalidOperationException("The initial confirmation continuation bypassed the occupied pool.");
             }
 
             Thread.Sleep(1000);
             if (timerProbe.IsCancellationRequested)
             {
-                throw new InvalidOperationException("The timer callback ran before the controlled continuation.");
+                throw new InvalidOperationException("The timer callback ran while the pool was occupied.");
             }
 
-            context.Drain();
-            SynchronizationContext.SetSynchronizationContext(previous);
+            // Both the context-free confirmation continuation and timer callbacks are delayed.
+            // After release either cancellation or the shared monotonic clock must prevent work.
             release.Set();
             ThreadPool.SetMaxThreads(maximum, maximumIo);
             return pending.GetAwaiter().GetResult();
         }
         finally
         {
-            SynchronizationContext.SetSynchronizationContext(previous);
             release.Set();
             ThreadPool.SetMaxThreads(maximum, maximumIo);
             ThreadPool.SetMinThreads(minimum, minimumIo);
             if (queued)
             {
                 drained.Wait();
-            }
-        }
-    }
-
-    private sealed class PausedContext : SynchronizationContext
-    {
-        private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> _pending = new();
-        internal bool HasPending => !_pending.IsEmpty;
-        public override void Post(SendOrPostCallback d, object? state) => _pending.Enqueue((d, state));
-        internal void Drain()
-        {
-            while (_pending.TryDequeue(out var continuation))
-            {
-                continuation.Callback(continuation.State);
             }
         }
     }

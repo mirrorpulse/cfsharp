@@ -203,6 +203,10 @@ opening, reads, preparation, and the final pre-mark check. Delayed cancellation 
 do not extend it. A synchronous native call may return late; an already successful preparation
 or mark retains its historical receipt, while expired budgets prevent starting further work.
 
+Protected work starts asynchronously and yields between segments without capturing the caller's
+synchronization context or task scheduler. Synchronous owner disposal can cancel and drain a
+confirmation without pumping the UI queue. Prefer asynchronous disposal to keep the UI responsive.
+
 Native mutation and SQLite are separate commits. Protection is released before opening the
 projection transaction. A metadata-only no-delete guard verifies that the durable identity is
 projected onto the same object. It allows native identity updates through other writable handles.

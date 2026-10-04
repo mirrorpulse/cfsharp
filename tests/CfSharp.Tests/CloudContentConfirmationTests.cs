@@ -193,38 +193,26 @@ public sealed class CloudContentConfirmationTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task InitialSchedulingDelayCannotRestartTheDeadlineWithoutTimerCancellation(bool convert)
+    public async Task ExpiredEntryDeadlinePreventsOpeningPreparingAndMarkingWithoutTimerCancellation(bool convert)
     {
         FakeSession session = new([]);
         session.Facts = session.Facts with { IsPlaceholder = !convert, Identity = convert ? [] : Identity.Encode() };
         CloudContentConfirmationRequest request = new(Binding, Identity, 0, SHA256.HashData([]),
             convert ? CloudContentPreparation.ConvertRegularFile : CloudContentPreparation.None,
             referenceBudget: TimeSpan.FromMilliseconds(500), deadline: TimeSpan.FromMilliseconds(500));
-        SingleStepContext context = new();
-        SynchronizationContext? previous = SynchronizationContext.Current;
-        Task<CloudContentConfirmationResult> pending;
-        try
+        int opens = 0;
+        // Seed the public entry before the deadline without relying on any timer or captured
+        // continuation. The isolated native subprocess separately delays actual pool scheduling.
+        long entry = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
+        CloudContentConfirmationResult result = await CloudProtectedContentConfirmation.RunAsync(() =>
         {
-            SynchronizationContext.SetSynchronizationContext(context);
-            pending = RunAsync(session, request, CancellationToken.None);
-            Assert.False(pending.IsCompleted);
-            // Deliberately keep cancellation unsignaled while the first continuation is
-            // withheld beyond the total budget. A timer callback cannot enforce this test.
-            Thread.Sleep(1000);
-            while (!pending.IsCompleted)
-            {
-                context.RunNext();
-            }
-        }
-        finally
-        {
-            SynchronizationContext.SetSynchronizationContext(previous);
-        }
-
-        CloudContentConfirmationResult result = await pending;
+            opens++;
+            return session;
+        }, request, "owned-test.bin", entry, CancellationToken.None);
         Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
         Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
         Assert.True(result.Elapsed >= request.Deadline);
+        Assert.Equal(0, opens);
         Assert.Equal(0, session.Reads);
         Assert.Equal(0, session.Preparations);
         Assert.Equal(0, session.Marks);
@@ -238,25 +226,27 @@ public sealed class CloudContentConfirmationTests
         new(Binding, Identity, content.Length, SHA256.HashData(content), segmentSize: 4);
 
     [Fact]
-    public async Task TimeSpentBeforeNativeAdmissionRemainsPartOfTheDeadline()
+    public async Task EverySegmentRunsOutsideTheCallingTaskScheduler()
     {
-        int opens = 0;
-        CloudContentConfirmationRequest request = new(Binding, Identity, 0, SHA256.HashData([]),
-            deadline: TimeSpan.FromMilliseconds(500));
-        long entry = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
-        CloudContentConfirmationResult result = await CloudProtectedContentConfirmation.RunAsync(() =>
+        bool detached = true;
+        FakeSession session = new(Content)
         {
-            opens++;
-            return new FakeSession([]);
-        }, request, "owned-test.bin", entry, CancellationToken.None);
-        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
-        Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
-        Assert.True(result.Elapsed >= request.Deadline);
-        Assert.Equal(0, opens);
-        Assert.False(result.NativeIdentityPrepared);
-        Assert.False(result.NativeApplied);
-        Assert.False(result.NativeConfirmationVerified);
-        Assert.False(result.DurableProjectionCommitted);
+            OnRead = () => detached &= TaskScheduler.Current == TaskScheduler.Default && SynchronizationContext.Current is null,
+        };
+        ConcurrentExclusiveSchedulerPair scheduler = new(TaskScheduler.Default, maxConcurrencyLevel: 1);
+        try
+        {
+            CloudContentConfirmationResult result = await Task.Factory.StartNew(() => RunAsync(session, Proof(Content)),
+                CancellationToken.None, TaskCreationOptions.None, scheduler.ExclusiveScheduler).Unwrap().WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(CloudContentConfirmationOutcome.Confirmed, result.Outcome);
+            Assert.True(session.Reads > 1);
+            Assert.True(detached, "A protected segment inherited the caller's task scheduler or synchronization context.");
+        }
+        finally
+        {
+            scheduler.Complete();
+            await scheduler.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [Fact]
@@ -396,17 +386,6 @@ public sealed class CloudContentConfirmationTests
         CloudProtectedContentConfirmation.RunAsync(() => session, proof, "owned-test.bin", Stopwatch.GetTimestamp(), token);
 
     private sealed class VerificationFault : Exception;
-
-    private sealed class SingleStepContext : SynchronizationContext
-    {
-        private readonly Queue<(SendOrPostCallback Callback, object? State)> _pending = new();
-        public override void Post(SendOrPostCallback d, object? state) => _pending.Enqueue((d, state));
-        internal void RunNext()
-        {
-            (SendOrPostCallback callback, object? state) = _pending.Dequeue();
-            callback(state);
-        }
-    }
 
     private sealed class FakeSession(byte[] content) : ICloudProtectedContentSession
     {
