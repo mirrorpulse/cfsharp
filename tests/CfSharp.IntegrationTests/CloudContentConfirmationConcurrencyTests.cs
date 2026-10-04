@@ -101,7 +101,8 @@ public sealed partial class CloudContentConfirmationTests
             await WaitForReadyAsync(competitor);
             competitor.Go.Set();
             await Task.Delay(100);
-            Assert.False(competitor.HasExited);
+            Assert.True(!competitor.HasExited,
+                $"Competitor completed while the reference was held: action={action}; exit={(competitor.HasExited ? competitor.ExitCode : null)}");
             long released = Stopwatch.GetTimestamp();
             await reference.DisposeAsync();
             await competitor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
