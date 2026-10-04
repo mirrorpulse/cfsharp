@@ -307,10 +307,11 @@ public sealed partial class CloudContentConfirmationTests
         internal Exception? NextDisposeFault { get; set; }
         internal Func<ValueTask>? BeforeTransaction { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
+        internal ICloudStateStore Store { get; private set; } = null!;
 
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context,
             CancellationToken cancellationToken = default) =>
-            new FaultStore(await _inner.OpenAsync(context, cancellationToken), this);
+            Store = new FaultStore(await _inner.OpenAsync(context, cancellationToken), this);
 
         private sealed class FaultStore(ICloudStateStore inner, FaultFactory faults) : ICloudStateStore
         {
