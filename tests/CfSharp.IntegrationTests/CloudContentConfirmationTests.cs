@@ -172,12 +172,13 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             _directory = directory;
             Root = root;
             System = system;
+            File = system.GetFile("content.bin");
             Provider = provider;
         }
 
         internal string Root { get; }
         internal CloudFileSystem System { get; private set; }
-        internal CloudFile File => System.GetFile("content.bin");
+        internal CloudFile File { get; private set; }
         internal UnexpectedProvider Provider { get; }
         private ICloudStateStoreFactory? _restartFactory;
 
@@ -217,6 +218,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             System = CloudFileSystem.CreateBuilder(Root).WithStateStore(_restartFactory!)
                 .WithContentProvider(Provider).Build();
             await System.StartAsync();
+            File = System.GetFile("content.bin");
         }
 
         public async ValueTask DisposeAsync()
@@ -227,7 +229,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
         }
     }
 
-    private sealed class UnexpectedProvider : ICloudFileContentProvider
+    private sealed class UnexpectedProvider : ICloudDemandProvider
     {
         internal int Fetches { get; private set; }
         public ValueTask<Stream> OpenReadAsync(CloudFileFetchRequest request, CancellationToken cancellationToken)
@@ -235,5 +237,12 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             Fetches++;
             throw new InvalidOperationException("Confirmation must not hydrate missing content.");
         }
+
+        // This provider is connected only to its isolated owned fixture root. Permit its
+        // external rename/delete tests so a provider policy denial cannot mimic an oplock failure.
+        public ValueTask<CloudProviderPolicyDecision> ApproveRenameAsync(CloudProviderRenameRequest request,
+            CancellationToken cancellationToken) => ValueTask.FromResult(CloudProviderPolicyDecision.Allow);
+        public ValueTask<CloudProviderPolicyDecision> ApproveDeleteAsync(CloudProviderDeleteRequest request,
+            CancellationToken cancellationToken) => ValueTask.FromResult(CloudProviderPolicyDecision.Allow);
     }
 }

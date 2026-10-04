@@ -158,6 +158,12 @@ Pending cancellation is requested with `CancelIoEx` and drained before buffers, 
 references are freed. Driver cancellation drain and synchronous native
 calls may exceed a budget; expired budgets stop subsequent work and marking.
 
+Competing native opens can wait for a reference to be released or fail with a sharing violation,
+depending on Windows and the file's current state. A reference budget is not a promise that every
+external open will queue successfully. Integration coverage includes fully written files whose
+queued writers break the attempt, and zero-extended files whose rejected writers retry after the
+protected owner closes. Neither path continues an old digest after a break.
+
 | Outcome | Caller action |
 | --- | --- |
 | `Confirmed`, `AlreadyConfirmed` | Complete only the retained accepted-content intent. |
