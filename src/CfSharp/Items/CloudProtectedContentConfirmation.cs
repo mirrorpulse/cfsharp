@@ -61,7 +61,7 @@ internal sealed class CloudProtectedContentSession : ICloudProtectedContentSessi
     {
         public CloudProtectedFileFacts Inspect()
         {
-            NativeFileMetadata facts = WindowsFileMetadata.Read(reference.Win32Handle);
+            NativeFileMetadata facts = WindowsFileMetadata.Read(reference.Win32Handle, reference.ProtectedHandle);
             bool placeholder = facts.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder);
             bool full = !placeholder || facts.Length == 0 ||
                 !facts.PlaceholderState.HasFlag(CfPlaceholderState.Partial) &&
@@ -81,9 +81,9 @@ internal sealed class CloudProtectedContentSession : ICloudProtectedContentSessi
             ProtectedFileReader.Read(reference.Win32Handle, buffer, count, offset, budget, cancellationToken);
 
         public (int HResult, long Usn) Prepare(CloudContentConfirmationRequest request, bool convert) =>
-            ProtectedFileMutations.Prepare(reference.Win32Handle, request.EncodedIdentity, convert);
+            ProtectedFileMutations.Prepare(reference.ProtectedHandle, request.EncodedIdentity, convert);
 
-        public int Mark() => ProtectedFileMutations.Mark(reference.Win32Handle);
+        public int Mark() => ProtectedFileMutations.Mark(reference.ProtectedHandle);
 
         public void Dispose() => reference.Dispose();
     }

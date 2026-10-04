@@ -153,7 +153,7 @@ public enum CloudContentConfirmationStage
     Verify,
     /// <summary>Preparing identity on the verified file object.</summary>
     Prepare,
-    /// <summary>Marking the verified object through the protected borrowed handle.</summary>
+    /// <summary>Marking the verified object through the referenced protected owner.</summary>
     Mark,
     /// <summary>Repairing the official durable identity projection after releasing protection.</summary>
     Projection,

@@ -33,7 +33,7 @@ internal static unsafe partial class WindowsFileMetadata
     }
 
     [SupportedOSPlatform("windows10.0.16299")]
-    internal static NativeFileMetadata Read(nint handle)
+    internal static NativeFileMetadata Read(nint handle, nint protectedHandle = 0)
     {
         FileAttributeTagInfo attributes;
         FileStandardInfo standard;
@@ -50,7 +50,9 @@ internal static unsafe partial class WindowsFileMetadata
             fixed (byte* pointer = buffer)
             {
                 uint returned = 0;
-                int result = CfApi.CfGetPlaceholderInfo(handle, CfPlaceholderInfoClass.Standard,
+                // Preserve an available opaque owner for CFAPI calls. Its borrowed Win32
+                // handle is used by the general file-information queries above/below.
+                int result = CfApi.CfGetPlaceholderInfo(protectedHandle == 0 ? handle : protectedHandle, CfPlaceholderInfoClass.Standard,
                     pointer, (uint)buffer.Length, &returned);
                 if (result < 0)
                 {

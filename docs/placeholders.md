@@ -147,6 +147,8 @@ the library never reopens by path to continue its digest. The final identity, le
 checks and native mark share one reference. The mark passes a **null USN pointer**, which is
 native-unconditional. Its safety relies on exclusive object protection and the complete proof,
 not USN CAS. Existing positive-USN conditional APIs keep their contract.
+CFAPI metadata and mutation calls retain the opaque protected owner; general Win32 metadata
+queries and content reads use its borrowed Win32 handle while that reference is held.
 
 Ordinary files and fully local placeholders are supported. Directories, hard links, arbitrary
 reparse targets, and partial or online-only content are rejected without hydration. Default reads
