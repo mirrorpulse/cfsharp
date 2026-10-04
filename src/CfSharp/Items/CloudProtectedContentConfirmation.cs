@@ -95,10 +95,11 @@ internal static class CloudProtectedContentConfirmation
     // retains one opaque owner for both verification passes and every short reference.
     internal static async Task<CloudContentConfirmationResult> RunAsync(
         Func<ICloudProtectedContentSession> open, CloudContentConfirmationRequest request,
-        string path, CancellationToken cancellationToken)
+        string path, long started, CancellationToken cancellationToken)
     {
+        // Use the public call's monotonic origin, including lease admission and this yield.
+        // Cancellation timers can be delayed by a busy pool and cannot define elapsed time.
         await Task.Yield();
-        long started = Stopwatch.GetTimestamp();
         CloudContentConfirmationStage stage = CloudContentConfirmationStage.Open;
         bool prepared = false;
         bool applied = false;

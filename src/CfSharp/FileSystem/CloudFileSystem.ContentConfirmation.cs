@@ -13,8 +13,8 @@ public sealed partial class CloudFileSystem
         CloudFile file, CloudContentConfirmationRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
-        EnsureStarted();
         long started = Stopwatch.GetTimestamp();
+        EnsureStarted();
         using CancellationTokenSource deadline = new(request.Deadline);
         using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _contentConfirmationStopping.Token, deadline.Token);
@@ -45,7 +45,7 @@ public sealed partial class CloudFileSystem
         using CloudFileSystemOperationLease operation = acquired;
         CloudContentConfirmationResult receipt = await CloudProtectedContentConfirmation.RunAsync(
             () => new CloudProtectedContentSession(file.FullPath, SyncRootPath), request, file.FullPath,
-            stop.Token).ConfigureAwait(false);
+            started, stop.Token).ConfigureAwait(false);
         bool expired = receipt.Outcome == CloudContentConfirmationOutcome.Canceled && TimedOut();
         CloudContentConfirmationResult native = new(request,
             expired ? CloudContentConfirmationOutcome.DeadlineExceeded : receipt.Outcome, receipt.Stage,

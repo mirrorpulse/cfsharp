@@ -34,13 +34,15 @@ public sealed class CloudContentConfirmationRequest
     /// <param name="expectedPlaceholderIdentity">Complete nonempty previous opaque identity, required only for replacement.</param>
     /// <param name="segmentSize">Bytes per reference, from 1 through 16 MiB; defaults to 1 MiB.</param>
     /// <param name="referenceBudget">Positive read/reference budget up to one minute; defaults to 250 ms.</param>
-    /// <param name="deadline">Positive total budget including item-lease waiting, up to one day; defaults to ten minutes.</param>
+    /// <param name="deadline">Positive total budget from API entry including lease admission and scheduling, up to one day; defaults to ten minutes.</param>
     /// <exception cref="ArgumentNullException">A required object is null.</exception>
     /// <exception cref="ArgumentException">A hash, preparation, identity, or budget is invalid.</exception>
     /// <remarks>
     /// Kernel cancellation must drain before memory or protection can be released, so cancellation
     /// drain and synchronous native calls can exceed these budgets. Budgets prevent further work
     /// and marking after expiration; they are not promises that a stalled driver returns on time.
+    /// Every native phase shares the entry's monotonic time origin; delayed cancellation timer
+    /// callbacks do not restart or extend the elapsed deadline.
     /// Replacement accepts any exact nonempty opaque previous identity. Although Windows permits
     /// empty-identity placeholders, adopting one is outside this operation's current scope.
     /// </remarks>

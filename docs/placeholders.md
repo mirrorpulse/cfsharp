@@ -198,6 +198,11 @@ the accepted proof and the durable row. A zero
 `PreparationUsn` remains an observation. Already-in-sync files still undergo complete proof
 verification, and an idempotent replay need not issue another mark.
 
+The total deadline uses one monotonic origin from API entry through lease admission, scheduling,
+opening, reads, preparation, and the final pre-mark check. Delayed cancellation timer callbacks
+do not extend it. A synchronous native call may return late; an already successful preparation
+or mark retains its historical receipt, while expired budgets prevent starting further work.
+
 Native mutation and SQLite are separate commits. Protection is released before opening the
 projection transaction. A metadata-only no-delete guard verifies that the durable identity is
 projected onto the same object. It allows native identity updates through other writable handles.

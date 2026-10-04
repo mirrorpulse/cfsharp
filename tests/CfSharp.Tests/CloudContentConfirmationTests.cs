@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
@@ -189,8 +190,74 @@ public sealed class CloudContentConfirmationTests
         Assert.Equal(0, session.ActiveReferences);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InitialSchedulingDelayCannotRestartTheDeadlineWithoutTimerCancellation(bool convert)
+    {
+        FakeSession session = new([]);
+        session.Facts = session.Facts with { IsPlaceholder = !convert, Identity = convert ? [] : Identity.Encode() };
+        CloudContentConfirmationRequest request = new(Binding, Identity, 0, SHA256.HashData([]),
+            convert ? CloudContentPreparation.ConvertRegularFile : CloudContentPreparation.None,
+            referenceBudget: TimeSpan.FromMilliseconds(500), deadline: TimeSpan.FromMilliseconds(500));
+        SingleStepContext context = new();
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        Task<CloudContentConfirmationResult> pending;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            pending = RunAsync(session, request, CancellationToken.None);
+            Assert.False(pending.IsCompleted);
+            // Deliberately keep cancellation unsignaled while the first continuation is
+            // withheld beyond the total budget. A timer callback cannot enforce this test.
+            Thread.Sleep(1000);
+            while (!pending.IsCompleted)
+            {
+                context.RunNext();
+            }
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+
+        CloudContentConfirmationResult result = await pending;
+        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
+        Assert.True(result.Elapsed >= request.Deadline);
+        Assert.Equal(0, session.Reads);
+        Assert.Equal(0, session.Preparations);
+        Assert.Equal(0, session.Marks);
+        Assert.False(result.NativeIdentityPrepared);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+        Assert.False(result.DurableProjectionCommitted);
+    }
+
     private static CloudContentConfirmationRequest Proof(byte[] content) =>
         new(Binding, Identity, content.Length, SHA256.HashData(content), segmentSize: 4);
+
+    [Fact]
+    public async Task TimeSpentBeforeNativeAdmissionRemainsPartOfTheDeadline()
+    {
+        int opens = 0;
+        CloudContentConfirmationRequest request = new(Binding, Identity, 0, SHA256.HashData([]),
+            deadline: TimeSpan.FromMilliseconds(500));
+        long entry = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
+        CloudContentConfirmationResult result = await CloudProtectedContentConfirmation.RunAsync(() =>
+        {
+            opens++;
+            return new FakeSession([]);
+        }, request, "owned-test.bin", entry, CancellationToken.None);
+        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
+        Assert.True(result.Elapsed >= request.Deadline);
+        Assert.Equal(0, opens);
+        Assert.False(result.NativeIdentityPrepared);
+        Assert.False(result.NativeApplied);
+        Assert.False(result.NativeConfirmationVerified);
+        Assert.False(result.DurableProjectionCommitted);
+    }
 
     [Fact]
     public void ProjectionObservationsOwnTheirCompleteIdentityBytes()
@@ -258,7 +325,7 @@ public sealed class CloudContentConfirmationTests
         {
             IOException error = new("Injected path component open failure.", new System.ComponentModel.Win32Exception(code));
             CloudContentConfirmationResult result = await CloudProtectedContentConfirmation.RunAsync(
-                () => throw error, Proof(Content), "owned-test.bin", default);
+                () => throw error, Proof(Content), "owned-test.bin", Stopwatch.GetTimestamp(), default);
             Assert.Equal(code == 32 ? CloudContentConfirmationOutcome.Busy : CloudContentConfirmationOutcome.Failed, result.Outcome);
             Assert.Equal(CloudContentConfirmationStage.Open, result.Stage);
             CloudFilesException native = Assert.IsType<CloudFilesException>(result.Error);
@@ -326,9 +393,20 @@ public sealed class CloudContentConfirmationTests
 
     private static Task<CloudContentConfirmationResult> RunAsync(FakeSession session,
         CloudContentConfirmationRequest proof, CancellationToken token = default) =>
-        CloudProtectedContentConfirmation.RunAsync(() => session, proof, "owned-test.bin", token);
+        CloudProtectedContentConfirmation.RunAsync(() => session, proof, "owned-test.bin", Stopwatch.GetTimestamp(), token);
 
     private sealed class VerificationFault : Exception;
+
+    private sealed class SingleStepContext : SynchronizationContext
+    {
+        private readonly Queue<(SendOrPostCallback Callback, object? State)> _pending = new();
+        public override void Post(SendOrPostCallback d, object? state) => _pending.Enqueue((d, state));
+        internal void RunNext()
+        {
+            (SendOrPostCallback callback, object? state) = _pending.Dequeue();
+            callback(state);
+        }
+    }
 
     private sealed class FakeSession(byte[] content) : ICloudProtectedContentSession
     {
