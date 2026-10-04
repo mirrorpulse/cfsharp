@@ -192,6 +192,59 @@ public sealed class CloudContentConfirmationTests
     private static CloudContentConfirmationRequest Proof(byte[] content) =>
         new(Binding, Identity, content.Length, SHA256.HashData(content), segmentSize: 4);
 
+    [Fact]
+    public async Task AnExpiredEarlierReferenceStopsBeforeTheTotalDeadline()
+    {
+        int reads = 0;
+        FakeSession session = new(Content) { OnRead = () => { if (++reads == 1) { Thread.Sleep(50); } } };
+        CloudContentConfirmationRequest request = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            segmentSize: 4, referenceBudget: TimeSpan.FromMilliseconds(10), deadline: TimeSpan.FromSeconds(5));
+        CloudContentConfirmationResult result = await RunAsync(session, request);
+        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Read, result.Stage);
+        Assert.IsType<TimeoutException>(result.Error);
+        Assert.Equal(1, session.Reads);
+        Assert.Equal(0, session.Marks);
+        Assert.True(result.LongestReference >= request.ReferenceBudget);
+        Assert.True(session.Disposed);
+        Assert.Equal(0, session.ActiveReferences);
+    }
+
+    [Fact]
+    public async Task PreparationThatReturnsAfterItsBudgetRetainsTheMutationAndStops()
+    {
+        FakeSession session = new(Content) { OnPrepare = () => Thread.Sleep(50) };
+        session.Facts = session.Facts with { IsPlaceholder = false, Identity = [] };
+        CloudContentConfirmationRequest request = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            CloudContentPreparation.ConvertRegularFile, segmentSize: 4,
+            referenceBudget: TimeSpan.FromMilliseconds(10), deadline: TimeSpan.FromSeconds(5));
+        CloudContentConfirmationResult result = await RunAsync(session, request);
+        Assert.Equal(CloudContentConfirmationOutcome.DeadlineExceeded, result.Outcome);
+        Assert.Equal(CloudContentConfirmationStage.Prepare, result.Stage);
+        Assert.True(result.NativeIdentityPrepared);
+        Assert.Equal(0, result.PreparationHResult);
+        Assert.Equal(0, result.PreparationUsn);
+        Assert.False(result.NativeApplied);
+        Assert.Equal(1, session.Preparations);
+        Assert.Equal(0, session.Marks);
+        Assert.Equal(0, session.ActiveReferences);
+    }
+
+    [Fact]
+    public async Task MarkThatSucceedsAfterItsBudgetStillRetainsTheCommit()
+    {
+        FakeSession session = new(Content) { OnMark = () => Thread.Sleep(50) };
+        CloudContentConfirmationRequest request = new(Binding, Identity, Content.Length, SHA256.HashData(Content),
+            segmentSize: 4, referenceBudget: TimeSpan.FromMilliseconds(10), deadline: TimeSpan.FromSeconds(5));
+        CloudContentConfirmationResult result = await RunAsync(session, request);
+        Assert.Equal(CloudContentConfirmationOutcome.Confirmed, result.Outcome);
+        Assert.True(result.NativeApplied);
+        Assert.True(result.NativeConfirmationVerified);
+        Assert.Equal(0, result.NativeMarkHResult);
+        Assert.True(result.LongestReference >= request.ReferenceBudget);
+        Assert.Null(result.Error);
+    }
+
     private static Task<CloudContentConfirmationResult> RunAsync(FakeSession session,
         CloudContentConfirmationRequest proof, CancellationToken token = default) =>
         CloudProtectedContentConfirmation.RunAsync(() => session, proof, "owned-test.bin", token);

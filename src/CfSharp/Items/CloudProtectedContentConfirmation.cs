@@ -166,6 +166,8 @@ internal static class CloudProtectedContentConfirmation
                         throw new InvalidDataException("The reader returned an invalid transfer count.");
                     }
 
+                    CheckReferenceBudget();
+
                     if (offset < request.ExpectedLength)
                     {
                         if (read == 0)
@@ -204,6 +206,9 @@ internal static class CloudProtectedContentConfirmation
                             // Preparation has its own object/content guard. Reverify the whole
                             // accepted content with the prepared identity before final marking.
                             offset = 0;
+                            // Preserve the successful mutation before enforcing its elapsed
+                            // budget. An expired preparation must not start another hash pass.
+                            CheckReferenceBudget();
                         }
                         else
                         {
@@ -241,6 +246,13 @@ internal static class CloudProtectedContentConfirmation
                 if (verified)
                 {
                     return Result(already ? CloudContentConfirmationOutcome.AlreadyConfirmed : CloudContentConfirmationOutcome.Confirmed);
+                }
+
+                // Include reference disposal in the observed lifetime. A successful mark
+                // above is already committed and must not be rewritten as an unapplied timeout.
+                if (Stopwatch.GetElapsedTime(referenceStarted) >= request.ReferenceBudget)
+                {
+                    throw new TimeoutException("The protected reference budget expired before the next segment.");
                 }
 
                 // Give queued writers a chance to break the oplock. Never reopen by path or

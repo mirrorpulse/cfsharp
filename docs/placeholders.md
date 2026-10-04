@@ -159,6 +159,9 @@ waiting returns an uncommitted receipt at the `Open` stage.
 Pending cancellation is requested with `CancelIoEx` and drained before buffers, events, or
 references are freed. Driver cancellation drain and synchronous native
 calls may exceed a budget; expired budgets stop subsequent work and marking.
+Budgets are checked after synchronous read completion and after each reference. A preparation
+that succeeds after its budget retains its mutation receipt and stops further verification;
+a final mark that has already succeeded retains its commit fact even if that call ran late.
 
 Competing native opens can wait for a reference to be released or fail with a sharing violation,
 depending on Windows and the file's current state. A reference budget is not a promise that every

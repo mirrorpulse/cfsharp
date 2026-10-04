@@ -77,6 +77,16 @@ public sealed class ProtectedFileReaderTests
     }
 
     [Fact]
+    public void SynchronousCompletionStillHonorsTheReadBudget()
+    {
+        FakeRead operation = new(0, 17) { OnStart = () => Thread.Sleep(50) };
+        Assert.Throws<TimeoutException>(() =>
+            ProtectedFileReader.Read(() => operation, TimeSpan.FromMilliseconds(10), default));
+        Assert.True(operation.DrainedAtDispose);
+        Assert.False(operation.Canceled);
+    }
+
+    [Fact]
     public void CancellationDrainsEvenWhenTheRequestCompletesNormally()
     {
         using CancellationTokenSource source = new();
@@ -121,13 +131,15 @@ public sealed class ProtectedFileReaderTests
 
         internal Action? OnWait { get; init; }
 
+        internal Action? OnStart { get; init; }
+
         internal int Error { get; init; }
 
         internal bool Canceled { get; private set; }
 
         internal bool DrainedAtDispose { get; private set; }
 
-        public void Start() { }
+        public void Start() => OnStart?.Invoke();
 
         public bool TryComplete(out int transferred, out int error)
         {

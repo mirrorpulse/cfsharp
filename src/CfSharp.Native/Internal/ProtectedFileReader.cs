@@ -50,7 +50,9 @@ internal static class ProtectedFileReader
             throw new OperationCanceledException(cancellationToken);
         }
 
-        if (timedOut)
+        // Start and the terminal completion query can return synchronously after a stall.
+        // A drained request is safe to release, but late completion cannot renew its budget.
+        if (timedOut || Stopwatch.GetElapsedTime(started) >= timeout)
         {
             throw new TimeoutException("The protected file read exceeded its time budget.");
         }
