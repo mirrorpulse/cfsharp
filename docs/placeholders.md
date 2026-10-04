@@ -253,6 +253,14 @@ The gate belongs to the application and must cover all of its identity-writing p
 an operating-system identity lock. Do not hold a `CloudItemLease` while invoking confirmation or
 another item operation on the same path, because those operations acquire the same item lease.
 
+The manual `eng/run-soak.ps1 -DurationMinutes 30` gate runs the existing feed/dispatcher soak
+alongside a separate native confirmation soak for the same duration. Confirmation cycles include
+success, cancellation during segmented reads, an independent writer causing real protection
+loss, SQLite projection failure, and complete-proof retry. Its `confirmation-soak.json` samples
+process handles, GC-reported pinned objects, private bytes, and retained managed bytes after
+draining work and collecting garbage. Normal CI and the 24-round regression are separate from
+this sustained resource evidence; use the manual x64/ARM64 jobs before claiming a soak passed.
+
 ## Provider responsibility
 
 CfSharp coordinates the Windows demand callback and durable state; the application supplies content
