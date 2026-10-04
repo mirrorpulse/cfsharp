@@ -14,6 +14,9 @@ int main()
     // Windows SDK. Managed tests will compare these values with the bindings.
     std::cout << "{\n"
               << "  \"pointerSize\": " << sizeof(void*) << ",\n"
+              << "  \"overlappedSize\": " << sizeof(OVERLAPPED) << ",\n"
+              << "  \"overlappedOffsetOffset\": " << offsetof(OVERLAPPED, Offset) << ",\n"
+              << "  \"overlappedEventOffset\": " << offsetof(OVERLAPPED, hEvent) << ",\n"
               << "  \"readFileUsnDataControlCode\": " << FSCTL_READ_FILE_USN_DATA << ",\n"
               << "  \"readFileUsnDataSize\": " << sizeof(READ_FILE_USN_DATA) << ",\n"
               << "  \"readFileUsnDataMaxMajorVersionOffset\": " << offsetof(READ_FILE_USN_DATA, MaxMajorVersion) << ",\n"

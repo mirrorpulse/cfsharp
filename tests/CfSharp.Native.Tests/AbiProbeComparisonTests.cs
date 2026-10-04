@@ -33,6 +33,9 @@ public sealed class AbiProbeComparisonTests
 
         AssertProbe(probe, "pointerSize", IntPtr.Size);
         AssertProbe(probe, "readFileUsnDataControlCode", WindowsFileUsn.ReadFileUsnDataControlCode);
+        AssertProbe(probe, "overlappedSize", Marshal.SizeOf<OverlappedRead.Overlapped>());
+        AssertOffset<OverlappedRead.Overlapped>(probe, "overlappedOffsetOffset", "Offset");
+        AssertOffset<OverlappedRead.Overlapped>(probe, "overlappedEventOffset", "Event");
         AssertProbe(probe, "readFileUsnDataSize", Marshal.SizeOf<WindowsFileUsn.ReadFileUsnData>());
         AssertOffset<WindowsFileUsn.ReadFileUsnData>(probe, "readFileUsnDataMaxMajorVersionOffset", "MaxMajorVersion");
         AssertProbe(probe, "usnRecordV2UsnOffset", WindowsFileUsn.Version2UsnOffset);
