@@ -1,10 +1,70 @@
 using System.ComponentModel;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
 
 namespace CfSharp.Native.Tests;
 
 public sealed class ProtectedFileReaderTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PendingKernelReadIsCanceledAndDrainedWithoutClosingTheBorrowedHandle(bool timeout)
+    {
+        string name = $"CfSharp-reader-{Guid.NewGuid():N}";
+        using NamedPipeServerStream server = new(name, PipeDirection.Out, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        using NamedPipeClientStream client = new(".", name, PipeDirection.In, PipeOptions.Asynchronous);
+        Task connection = server.WaitForConnectionAsync();
+        await client.ConnectAsync();
+        await connection;
+        using CancellationTokenSource cancellation = new();
+        TaskCompletionSource pending = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // A connected pipe with no writer data deterministically enters IO_PENDING. This
+        // tests the real CancelIoEx/completion race; CFAPI-file reads are covered separately
+        // by public confirmation acceptance. Neither managed completion port is rebound.
+        Task<int> read = Task.Run(() => ProtectedFileReader.Read(() => new ObservedPendingRead(
+            new OverlappedRead(client.SafePipeHandle.DangerousGetHandle(), new byte[4], 4, 0), pending),
+            timeout ? TimeSpan.FromMilliseconds(100) : TimeSpan.FromSeconds(5), cancellation.Token));
+        await pending.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        if (!timeout)
+        {
+            cancellation.Cancel();
+        }
+        if (timeout)
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => read);
+        }
+        else
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read);
+        }
+
+        Assert.False(client.SafePipeHandle.IsClosed);
+        Task write = server.WriteAsync(new byte[] { 1, 2, 3, 4 }).AsTask();
+        byte[] next = new byte[4];
+        using CancellationTokenSource retryDeadline = new(TimeSpan.FromSeconds(5));
+        await client.ReadExactlyAsync(next, retryDeadline.Token);
+        await write.WaitAsync(retryDeadline.Token);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, next);
+    }
+
+    private sealed class ObservedPendingRead(IProtectedReadOperation inner, TaskCompletionSource pending) : IProtectedReadOperation
+    {
+        public void Start()
+        {
+            inner.Start();
+            Assert.False(inner.TryComplete(out _, out _));
+            pending.SetResult();
+        }
+
+        public bool TryComplete(out int bytes, out int error) => inner.TryComplete(out bytes, out error);
+        public void Cancel() => inner.Cancel();
+        public void Wait() => inner.Wait();
+        public void Dispose() => inner.Dispose();
+    }
+
     [Theory]
     [InlineData(0, 0)]
     [InlineData(2, 17)]
