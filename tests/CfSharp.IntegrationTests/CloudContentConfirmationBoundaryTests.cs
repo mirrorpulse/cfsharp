@@ -136,9 +136,12 @@ public sealed partial class CloudContentConfirmationTests
         }
 
         CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        // This case verifies full offsets and bounded memory. A synchronous conversion of
+        // the 4 GiB fixture exceeded two seconds on an ARM64 CI runner; budget expiration
+        // is tested independently with injected timing rather than large-file I/O latency.
         CloudContentConfirmationRequest proof = new(binding, new CloudPlaceholderIdentity(Guid.NewGuid(), "large-object", "revision-1"),
             length, digest.GetHashAndReset(), CloudContentPreparation.ConvertRegularFile, segmentSize: segment,
-            referenceBudget: TimeSpan.FromSeconds(2));
+            referenceBudget: TimeSpan.FromSeconds(10));
         using Process process = Process.GetCurrentProcess();
         process.Refresh();
         long peakBefore = process.PeakWorkingSet64;
