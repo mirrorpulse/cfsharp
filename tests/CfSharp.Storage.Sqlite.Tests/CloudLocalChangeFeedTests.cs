@@ -89,7 +89,7 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
         CloudLocalChangeBatch rescan = await feed.ReadBatchAsync();
         Assert.True(rescan.RequiresFullRescan);
         Assert.Empty(rescan.Changes);
-        await feed.AcknowledgeFullRescanAsync();
+        await AcknowledgePersistedRescanAsync(feed);
 
         await source.EmitAsync(new(LocalChangeSourceAction.Created, "after-rescan.txt"));
         CloudLocalChangeBatch afterRescan = await feed.ReadBatchAsync();
@@ -214,7 +214,7 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
         await source.EmitAsync(new(LocalChangeSourceAction.Created, "..\\outside.txt"));
         CloudLocalChangeBatch invalidPath = await feed.ReadBatchAsync();
         Assert.True(invalidPath.RequiresFullRescan);
-        await feed.AcknowledgeFullRescanAsync();
+        await AcknowledgePersistedRescanAsync(feed);
 
         await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
         CloudLocalChangeBatch overflow = await feed.ReadBatchAsync();

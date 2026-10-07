@@ -76,6 +76,17 @@ A buffer overflow, watcher error, or ambiguous rename is reported as `RequiresFu
 assuming that notifications are complete, enumerate the materialized local tree, reconcile it, and
 acknowledge the rescan explicitly. Recursive operations never follow links or remote children.
 
+Scans and legacy batches both withhold dispatchable changes while recovery is required, including
+when a pending backlog already exists. Pending remote creation intents and their uncertain watcher
+observations are checked in the same transaction as each page. Replay creation recovery before
+acknowledging reconciliation. A loss received while the watcher worker waits for the store also
+blocks pages immediately. Reading a page never clears recovery markers.
+
+An overflow/error or a full-rescan acknowledgement invalidates previously captured scans even
+after the durable marker is cleared. Begin a new scan after recovery. If a new loss races
+`AcknowledgeFullRescanAsync`, it either rejects acknowledgement with `InvalidOperationException`
+or remains observable as a new rescan condition; finish reconciliation before retrying.
+
 ## Provider echoes
 
 Provider-originated writes can be wrapped by `SuppressProviderEchoAsync` so they do not become

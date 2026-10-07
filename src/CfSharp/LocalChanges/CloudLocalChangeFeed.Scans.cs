@@ -3,6 +3,9 @@ namespace CfSharp;
 public sealed partial class CloudLocalChangeFeed
 {
     private readonly Guid _scanScope = Guid.NewGuid();
+    private long _lossGeneration;
+    private long _persistedLossGeneration;
+    private long _rescanAcknowledgementGeneration;
 
     /// <summary>Captures a finite boundary for non-waiting, bounded reads of pending local changes.</summary>
     /// <param name="cancellationToken">Token that cancels the read without changing durable state.</param>
@@ -21,13 +24,18 @@ public sealed partial class CloudLocalChangeFeed
     {
         EnsureStarted();
         ThrowIfFailed();
+        long generation = Volatile.Read(ref _lossGeneration);
+        long acknowledgementGeneration = Volatile.Read(ref _rescanAcknowledgementGeneration);
         await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
         ICloudOperationJournalPaging paging = RequirePaging(transaction);
         long through = await paging.GetHighWaterSequenceAsync(cancellationToken).ConfigureAwait(false);
         bool rescan = await RequiresScanReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
         await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-        return new CloudLocalChangeScan(_scanScope, through, rescan);
+        ThrowIfFailed();
+        rescan |= HasUnpersistedLoss || generation != Volatile.Read(ref _lossGeneration) ||
+            acknowledgementGeneration != Volatile.Read(ref _rescanAcknowledgementGeneration);
+        return new CloudLocalChangeScan(_scanScope, through, rescan, generation, acknowledgementGeneration);
     }
 
     /// <summary>Reads one typed page inside a previously captured scan, without waiting or acknowledging.</summary>
@@ -68,10 +76,18 @@ public sealed partial class CloudLocalChangeFeed
             .ConfigureAwait(false);
         CloudOperationJournalPage journalPage = await RequirePaging(transaction)
             .ReadPageAsync(afterSequence, scan.ThroughSequence, limit, cancellationToken).ConfigureAwait(false);
-        bool rescan = scan.RequiresFullRescan ||
+        bool rescan = scan.RequiresFullRescan || HasUnpersistedLoss ||
+            ScanIsInvalidated(scan) ||
             await RequiresScanReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
         CloudLocalChange[] changes = rescan ? [] : journalPage.Operations.Select(DecodeScannedChange).ToArray();
         await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        ThrowIfFailed();
+        rescan |= HasUnpersistedLoss || ScanIsInvalidated(scan);
+        if (rescan)
+        {
+            changes = [];
+        }
+
         return new CloudLocalChangePage(changes, rescan ? afterSequence : journalPage.LastScannedSequence,
             rescan ? journalPage.Operations.Count != 0 : journalPage.HasMore, rescan);
     }
@@ -104,9 +120,29 @@ public sealed partial class CloudLocalChangeFeed
         transaction.Operations as ICloudOperationJournalPaging ??
         throw new NotSupportedException("This state store does not implement ICloudOperationJournalPaging. Legacy batch reads remain available.");
 
+    private bool HasUnpersistedLoss =>
+        Volatile.Read(ref _lossGeneration) != Volatile.Read(ref _persistedLossGeneration);
+
+    private bool ScanIsInvalidated(CloudLocalChangeScan scan) =>
+        scan.LossGeneration != Volatile.Read(ref _lossGeneration) ||
+        scan.AcknowledgementGeneration != Volatile.Read(ref _rescanAcknowledgementGeneration);
+
+    private long SignalLoss()
+    {
+        // Record loss before waiting for the store gate. A page may otherwise dispatch a backlog
+        // while the worker is still blocked from persisting the corresponding marker. Generations
+        // also invalidate older scans after explicit rescan acknowledgement clears the marker.
+        Volatile.Write(ref _rescanNoticeDelivered, 0);
+        return Interlocked.Increment(ref _lossGeneration);
+    }
+
     private static async ValueTask<bool> RequiresScanReconciliationAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken) =>
         (await ReadCheckpointAsync(transaction, cancellationToken).ConfigureAwait(false)).RequiresFullRescan ||
+        await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
+
+    private static async ValueTask<bool> RequiresCreationReconciliationAsync(ICloudStateTransaction transaction,
+        CancellationToken cancellationToken) =>
         (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken)
             .ConfigureAwait(false)).Count != 0 ||
         (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.Prefix, cancellationToken)

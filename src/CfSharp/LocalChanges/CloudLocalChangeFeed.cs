@@ -126,26 +126,25 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         while (true)
         {
             ThrowIfFailed();
-            if (await RequiresCreationReconciliationAsync(cancellationToken).ConfigureAwait(false))
-            {
-                return new CloudLocalChangeBatch([], requiresFullRescan: true);
-            }
-
-            IReadOnlyList<CloudOperationJournalEntry> operations = await ListOperationsAsync(
-                cancellationToken).ConfigureAwait(false);
-            if (operations.Count != 0)
-            {
-                return new CloudLocalChangeBatch(
-                    operations.Select(ToChange).ToArray(),
-                    requiresFullRescan: false);
-            }
-
-            LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(cancellationToken)
+            await using ICloudStateTransaction transaction = await _stateStore
+                .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
                 .ConfigureAwait(false);
-            if (checkpoint.RequiresFullRescan &&
-                Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0)
+            bool creation = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
+                .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            ThrowIfFailed();
+            bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss;
+            if (rescan && (creation || operations.Count != 0 ||
+                Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0))
             {
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
+            }
+
+            if (!rescan && operations.Count != 0)
+            {
+                return new CloudLocalChangeBatch(operations.Select(ToChange).ToArray(), requiresFullRescan: false);
             }
 
             await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
@@ -239,9 +238,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// reconciliation of the sync root.
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
+    /// <exception cref="InvalidOperationException">
+    /// A creation remains pending, a loss signal is not yet durable, or new loss raced this acknowledgement.
+    /// Finish recovery and retry after the worker has persisted its signal.
+    /// </exception>
     public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
     {
         EnsureStarted();
+        long generation = Volatile.Read(ref _lossGeneration);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
@@ -260,6 +264,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(
             transaction,
             cancellationToken).ConfigureAwait(false);
+        if (HasUnpersistedLoss || generation != Volatile.Read(ref _lossGeneration))
+        {
+            throw new InvalidOperationException("A new loss signal must be persisted and reconciled before acknowledging the rescan.");
+        }
+
         await transaction.Checkpoints.UpsertAsync(
             new CloudStateCheckpoint(
                 CheckpointName,
@@ -267,6 +276,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        // Full reconciliation establishes a new consumer boundary even when pending creation
+        // recovery cleared its records before this feed read them. Pre-reconciliation scans must
+        // not resume after an acknowledgement makes the durable marker disappear.
+        Interlocked.Increment(ref _rescanAcknowledgementGeneration);
         Volatile.Write(ref _rescanNoticeDelivered, 0);
     }
 
@@ -628,6 +641,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 string.Equals(intent.RelativePath, previousPath?.RelativePath, StringComparison.OrdinalIgnoreCase)));
         if (pendingCreation)
         {
+            long generation = SignalLoss();
             // Do not assign a local identity while native creation is uncommitted. Retain
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
@@ -638,6 +652,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            Volatile.Write(ref _persistedLossGeneration, generation);
             SignalAvailable();
             return;
         }
@@ -759,20 +774,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         SignalAvailable();
     }
 
-    private async ValueTask<bool> RequiresCreationReconciliationAsync(CancellationToken cancellationToken)
-    {
-        await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if ((await transaction.Checkpoints.ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken)
-            .ConfigureAwait(false)).Count != 0)
-        {
-            return true;
-        }
-
-        return (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.Prefix, cancellationToken)
-            .ConfigureAwait(false)).Any(value => !RemoteCreationIntent.Decode(value.Value).Committed);
-    }
-
     private static bool MatchesRemoteCreationEcho(CloudEchoSuppressionState suppression,
         CloudStateOperationKind kind, CloudItemPath path, CloudItemState? state)
     {
@@ -796,6 +797,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask MarkRescanRequiredAsync(CancellationToken cancellationToken)
     {
+        long generation = SignalLoss();
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -809,17 +811,24 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             DateTimeOffset.UtcNow,
             cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref _persistedLossGeneration, generation);
         SignalAvailable();
     }
 
     private async ValueTask PublishAsync(LocalChangeSourceEvent sourceEvent)
     {
+        if (sourceEvent.Action is LocalChangeSourceAction.Overflow or LocalChangeSourceAction.Error)
+        {
+            SignalLoss();
+        }
+
         if (_sourceEvents.Writer.TryWrite(sourceEvent))
         {
             return;
         }
 
         Interlocked.Exchange(ref _overflowSignaled, 1);
+        SignalLoss();
         await ValueTask.CompletedTask;
     }
 
@@ -832,28 +841,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
         _nextObservation = checkpoint.Observation;
         Volatile.Write(ref _rescanNoticeDelivered, 0);
-    }
-
-    private async ValueTask<IReadOnlyList<CloudOperationJournalEntry>> ListOperationsAsync(
-        CancellationToken cancellationToken)
-    {
-        await using ICloudStateTransaction transaction = await _stateStore
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
-            .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
-        await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-        return operations;
-    }
-
-    private async ValueTask<LocalChangeCheckpoint> ReadCheckpointAsync(
-        CancellationToken cancellationToken)
-    {
-        await using ICloudStateTransaction transaction = await _stateStore
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
-            .ConfigureAwait(false);
-        await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-        return checkpoint;
     }
 
     private static async ValueTask<LocalChangeCheckpoint> ReadCheckpointAsync(

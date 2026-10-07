@@ -11,12 +11,18 @@ namespace CfSharp;
 /// </remarks>
 public sealed class CloudLocalChangeScan
 {
-    internal CloudLocalChangeScan(Guid storeScope, long throughSequence, bool requiresFullRescan)
+    internal CloudLocalChangeScan(Guid storeScope, long throughSequence, bool requiresFullRescan,
+        long lossGeneration, long acknowledgementGeneration)
     {
         StoreScope = storeScope;
         ThroughSequence = throughSequence;
         RequiresFullRescan = requiresFullRescan;
+        LossGeneration = lossGeneration;
+        AcknowledgementGeneration = acknowledgementGeneration;
     }
+
+    internal long LossGeneration { get; }
+    internal long AcknowledgementGeneration { get; }
 
     /// <summary>Gets the opaque identity of this feed's running store-consumer lifetime.</summary>
     /// <remarks>This value is not a durable database identity or native object binding.</remarks>
