@@ -95,6 +95,14 @@ internal sealed class DirectoryMoveTestRoot(CloudFileSystem fileSystem, Director
     internal DirectoryMoveFaultStore Faults => factory.Store!;
     internal CloudPlaceholderIdentity DirectoryIdentity => directoryIdentity;
 
+    internal async Task RestartAsync()
+    {
+        string root = RootPath;
+        await fileSystem.DisposeAsync();
+        fileSystem = CloudFileSystem.CreateBuilder(root).WithStateStore(factory).WithContentProvider(new EmptyContentProvider()).Build();
+        await fileSystem.StartAsync();
+    }
+
     internal static async Task<DirectoryMoveTestRoot> OpenAsync(ICloudFileContentProvider? provider = null)
     {
         string area = Path.Combine(Path.GetTempPath(), "CfSharp-directory-move-tests", Guid.NewGuid().ToString("N"));
