@@ -49,6 +49,16 @@ Pages own no reader or transaction and do not acknowledge operations or update i
 The legacy `ICloudOperationJournal` contract is unchanged: custom stores may opt into paging on
 their repository, preserving monotonic enqueue sequences and transactional read semantics.
 
-### Schema 5 recovery fence
+### Schema 6 recovery fence
 
-Schema 5 preserves the existing table layout and data while fencing the remote placeholder creation and observation-reconciliation protocol. Versions 0 through 4 upgrade in place. Older libraries reject the newer version rather than ignore pending creation records. Do not downgrade the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
+Schema 6 preserves the existing table layout and data while fencing directory object provenance,
+move preparation, and completion-receipt recovery. It includes schema 5's remote placeholder
+creation and observation-reconciliation fence. Versions 0 through 5 upgrade in place, retaining
+item IDs, revisions, tombstones, journal sequences and payloads, suppressions, and checkpoints.
+Older SQLite packages reject version 6 before accessing its recovery metadata. Do not downgrade
+the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
+
+Custom stores must enforce the same protocol boundary when opening persistent state with older
+runtimes. Preserve CfSharp-owned checkpoint names and values transactionally, including immutable
+preparations and receipts; never treat them as disposable caches or infer native ownership from an
+item path. The schema fence changes protocol compatibility, not the replaceable core interfaces.
