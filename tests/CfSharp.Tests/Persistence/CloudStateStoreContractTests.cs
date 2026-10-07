@@ -5,6 +5,110 @@ public abstract class CloudStateStoreContractTests
     protected abstract ICloudStateStoreFactory CreateFactory();
 
     [Fact]
+    public async Task JournalPagingTraversesBacklogWithoutAcknowledgingOrIncludingLaterWrites()
+    {
+        await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
+        List<CloudOperationJournalEntry> expected = [];
+        CloudStateOperationKind[] kinds = Enum.GetValues<CloudStateOperationKind>();
+        await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
+        {
+            for (int index = 0; index < 4105; index++)
+            {
+                expected.Add(await write.Operations.EnqueueAsync(new CloudOperationJournalEntry(
+                    Guid.NewGuid(), kinds[index % kinds.Length], null, BitConverter.GetBytes(index),
+                    DateTimeOffset.UtcNow, attemptCount: index % 3)));
+            }
+
+            await write.CommitAsync();
+        }
+
+        long through;
+        await using (ICloudStateTransaction capture = await store.BeginTransactionAsync())
+        {
+            through = await Assert.IsAssignableFrom<ICloudOperationJournalPaging>(capture.Operations)
+                .GetHighWaterSequenceAsync();
+            await capture.RollbackAsync();
+        }
+
+        // Leave holes both before and inside later pages; the cursor must use assigned sequences,
+        // not an offset or the count of remaining rows. New rows must stay outside this scan.
+        await using (ICloudStateTransaction update = await store.BeginTransactionAsync())
+        {
+            foreach (CloudOperationJournalEntry removed in expected.Where(row => row.Sequence % 17 == 0))
+            {
+                await update.Operations.RemoveAsync(removed.OperationId);
+            }
+
+            await update.Operations.EnqueueAsync(new CloudOperationJournalEntry(
+                Guid.NewGuid(), kinds[0], null, [99], DateTimeOffset.UtcNow));
+            await update.CommitAsync();
+        }
+
+        expected.RemoveAll(row => row.Sequence % 17 == 0);
+        List<CloudOperationJournalEntry> delivered = [];
+        long cursor = 0;
+        bool more;
+        do
+        {
+            await using ICloudStateTransaction read = await store.BeginTransactionAsync();
+            CloudOperationJournalPage page = await Assert.IsAssignableFrom<ICloudOperationJournalPaging>(read.Operations)
+                .ReadPageAsync(cursor, through, 7);
+            Assert.InRange(page.Operations.Count, 1, 7);
+            Assert.All(page.Operations, row => Assert.InRange(row.Sequence, cursor + 1, through));
+            Assert.Equal(page.Operations[^1].Sequence, page.LastScannedSequence);
+            delivered.AddRange(page.Operations);
+            cursor = page.LastScannedSequence;
+            more = page.HasMore;
+            await read.RollbackAsync();
+        }
+        while (more);
+
+        Assert.Equal(expected.Select(row => row.OperationId), delivered.Select(row => row.OperationId));
+        for (int index = 0; index < expected.Count; index++)
+        {
+            Assert.Equal(expected[index].Sequence, delivered[index].Sequence);
+            Assert.Equal(expected[index].Kind, delivered[index].Kind);
+            Assert.Equal(expected[index].AttemptCount, delivered[index].AttemptCount);
+            Assert.Equal(expected[index].Payload.ToArray(), delivered[index].Payload.ToArray());
+        }
+
+        await using ICloudStateTransaction verify = await store.BeginTransactionAsync();
+        ICloudOperationJournalPaging paging = Assert.IsAssignableFrom<ICloudOperationJournalPaging>(verify.Operations);
+        CloudOperationJournalPage terminal = await paging.ReadPageAsync(through, through, 4096);
+        Assert.Empty(terminal.Operations);
+        Assert.Equal(through, terminal.LastScannedSequence);
+        Assert.False(terminal.HasMore);
+        Assert.Equal(expected.Count + 1, (await verify.Operations.ListAsync(int.MaxValue)).Count);
+        Assert.True(await paging.GetHighWaterSequenceAsync() > through);
+        await verify.RollbackAsync();
+    }
+
+    [Fact]
+    public async Task JournalPagingEnforcesBoundsCancellationAndTransactionLifetime()
+    {
+        await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
+        await using ICloudStateTransaction transaction = await store.BeginTransactionAsync();
+        ICloudOperationJournalPaging paging = Assert.IsAssignableFrom<ICloudOperationJournalPaging>(transaction.Operations);
+        Assert.Equal(0, await paging.GetHighWaterSequenceAsync());
+        Assert.Empty((await paging.ReadPageAsync(0, 0, 1)).Operations);
+        foreach ((long after, long through, int limit) in new[] { (-1L, 0L, 1), (2L, 1L, 1), (0L, 0L, 0), (0L, 0L, 4097) })
+        {
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+                await paging.ReadPageAsync(after, through, limit));
+        }
+
+        using CancellationTokenSource cancellation = new();
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await paging.ReadPageAsync(0, 0, 1, cancellation.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await paging.GetHighWaterSequenceAsync(cancellation.Token));
+        await transaction.RollbackAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await paging.ReadPageAsync(0, 0, 1));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await paging.GetHighWaterSequenceAsync());
+    }
+
+    [Fact]
     public async Task CommittedItemSurvivesStoreReopen()
     {
         ICloudStateStoreFactory factory = CreateFactory();

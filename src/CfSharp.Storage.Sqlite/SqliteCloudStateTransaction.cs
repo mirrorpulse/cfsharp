@@ -532,7 +532,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         }
     }
 
-    private sealed class OperationRepository : ICloudOperationJournal
+    private sealed class OperationRepository : ICloudOperationJournal, ICloudOperationJournalPaging
     {
         private const string SelectColumns = """
             SELECT operation_id, kind, item_id, payload, created_at_ticks,
@@ -633,6 +633,56 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
                     return (IReadOnlyList<CloudOperationJournalEntry>)operations;
                 },
                 "The SQLite operation journal could not be listed.",
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        public async ValueTask<long> GetHighWaterSequenceAsync(CancellationToken cancellationToken = default) =>
+            await _owner.ExecuteAsync(
+                async token =>
+                {
+                    await using SqliteCommand command = _owner.CreateCommand(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM operations;", token);
+                    return Convert.ToInt64(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture);
+                },
+                "The SQLite journal boundary could not be read.",
+                cancellationToken).ConfigureAwait(false);
+
+        public async ValueTask<CloudOperationJournalPage> ReadPageAsync(
+            long afterSequence,
+            long throughSequence,
+            int limit,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(afterSequence);
+            ArgumentOutOfRangeException.ThrowIfLessThan(throughSequence, afterSequence);
+            ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 4096);
+            return await _owner.ExecuteAsync(
+                async token =>
+                {
+                    // The extra row is only a continuation probe. Do not deliver it or advance
+                    // the cursor past it: callers must be able to reach it after an ACK hole.
+                    await using SqliteCommand command = _owner.CreateCommand(
+                        SelectColumns + " WHERE sequence > $after AND sequence <= $through ORDER BY sequence LIMIT $count;", token);
+                    command.Parameters.AddWithValue("$after", afterSequence);
+                    command.Parameters.AddWithValue("$through", throughSequence);
+                    command.Parameters.AddWithValue("$count", limit + 1);
+                    await using SqliteDataReader reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+                    List<CloudOperationJournalEntry> rows = [];
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    {
+                        rows.Add(ReadOperation(reader));
+                    }
+
+                    bool hasMore = rows.Count > limit;
+                    if (hasMore)
+                    {
+                        rows.RemoveAt(rows.Count - 1);
+                    }
+
+                    return new CloudOperationJournalPage(rows, rows.Count == 0 ? throughSequence : rows[^1].Sequence, hasMore);
+                },
+                "The SQLite journal page could not be read.",
                 cancellationToken).ConfigureAwait(false);
         }
 

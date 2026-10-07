@@ -55,6 +55,29 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     protected override CloudStateStoreContext CreateContext() => new(_syncRootPath);
 
     [Fact]
+    public async Task JournalPagingUsesSequenceIndexWithoutTemporarySort()
+    {
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        {
+        }
+
+        await using SqliteConnection connection = new($"Data Source={_databasePath};Pooling=False");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN SELECT sequence, operation_id FROM operations " +
+            "WHERE sequence > 1 AND sequence <= 100000 ORDER BY sequence LIMIT 8;";
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        List<string> plan = [];
+        while (await reader.ReadAsync())
+        {
+            plan.Add(reader.GetString(3));
+        }
+
+        Assert.Contains(plan, detail => detail.Contains("SEARCH operations USING INTEGER PRIMARY KEY", StringComparison.Ordinal));
+        Assert.DoesNotContain(plan, detail => detail.Contains("TEMP B-TREE", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task CommitDoesNotReportCleanupCallbackFailureAsCommitFailure()
     {
         await using SqliteConnection connection = new("Data Source=:memory:");

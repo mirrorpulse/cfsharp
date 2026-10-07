@@ -35,6 +35,20 @@ Applications that need another database can implement `ICloudStateStoreFactory`,
 `ICloudStateStore`, and `ICloudStateTransaction`. Preserve the same commit, rollback, ownership,
 checkpoint, and retry semantics; the high-level API does not require SQLite.
 
+### Optional bounded journal paging
+
+SQLite implements `ICloudOperationJournalPaging` on each transaction's `Operations` repository.
+Capture `GetHighWaterSequenceAsync()` once, then call `ReadPageAsync(after, through, limit)` with
+an exclusive lower bound, the captured inclusive upper bound, and a limit from 1 through 4096.
+Use `LastScannedSequence` directly as the next lower bound. The sequence index bounds both the
+query and its memory use; one extra row determines `HasMore` without advancing past that row.
+Later enqueues stay outside the scan, and concurrent acknowledgements may leave sequence gaps or
+an empty next page. A terminal empty page returns the upper bound and never waits.
+
+Pages own no reader or transaction and do not acknowledge operations or update item revisions.
+The legacy `ICloudOperationJournal` contract is unchanged: custom stores may opt into paging on
+their repository, preserving monotonic enqueue sequences and transactional read semantics.
+
 ### Schema 5 recovery fence
 
 Schema 5 preserves the existing table layout and data while fencing the remote placeholder creation and observation-reconciliation protocol. Versions 0 through 4 upgrade in place. Older libraries reject the newer version rather than ignore pending creation records. Do not downgrade the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
