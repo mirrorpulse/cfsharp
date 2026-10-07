@@ -131,6 +131,45 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
         }
     }
 
+    internal static async ValueTask ProjectPathsAsync(ICloudStateTransaction transaction, CloudDirectoryMoveProof proof,
+        IReadOnlyList<CloudDirectoryMember> members, IReadOnlyList<CloudItemState> current, CancellationToken cancellationToken)
+    {
+        Dictionary<Guid, CloudDirectoryMember> known = members.ToDictionary(member => member.ItemId);
+        foreach (CloudItemState item in current.Where(item => item.Kind == CloudItemKind.Directory && !item.IsTombstone))
+        {
+            CloudDirectoryProvenance? provenance;
+            if (item.ItemId == proof.RootItemId)
+            {
+                provenance = new(Guid.NewGuid(), proof.StoreScope, item.ItemId, proof.DestinationRelativePath,
+                    proof.ExpectedBinding, proof.ExpectedPlaceholderIdentity.ToArray());
+            }
+            else
+            {
+                CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(BindingName(item.ItemId), cancellationToken).ConfigureAwait(false);
+                if (checkpoint is null)
+                {
+                    continue;
+                }
+
+                provenance = Decode(checkpoint.Value);
+                string sourcePath = CloudDirectoryStateProjection.MemberPath(proof.SourceRelativePath, known[item.ItemId].Suffix);
+                string targetPath = CloudDirectoryStateProjection.MemberPath(proof.DestinationRelativePath, known[item.ItemId].Suffix);
+                if (provenance.RootItemId != item.ItemId || provenance.StoreScope != proof.StoreScope ||
+                    (!CloudDirectoryStateProjection.SamePath(provenance.RelativePath, sourcePath) &&
+                     !CloudDirectoryStateProjection.SamePath(provenance.RelativePath, targetPath)))
+                {
+                    throw new CloudDirectoryProjectionConflictException("Historical directory provenance belongs to another namespace location.");
+                }
+
+                provenance = provenance with { EvidenceId = Guid.NewGuid(), RelativePath = targetPath };
+            }
+
+            await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(BindingName(item.ItemId), provenance.Encode(), DateTimeOffset.UtcNow),
+                cancellationToken).ConfigureAwait(false);
+            await RefreshMembersAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private static async ValueTask RefreshMembersAsync(ICloudStateTransaction transaction, CloudDirectoryProvenance provenance,
         CancellationToken cancellationToken)
     {

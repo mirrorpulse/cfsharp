@@ -11,6 +11,90 @@ internal static class CloudDirectoryMoveEvidence
     internal const string ScopeName = "cfsharp/namespace/scope";
     internal static string ProofName(Guid id) => $"cfsharp/namespace/preparations/{id:N}/proof";
     internal static string MembersName(Guid id) => $"cfsharp/namespace/preparations/{id:N}/members";
+    internal static string ReceiptName(Guid id) => $"cfsharp/namespace/preparations/{id:N}/receipt";
+
+    internal static async ValueTask<IReadOnlyList<CloudDirectoryMember>?> AuthenticateAsync(ICloudStateTransaction transaction,
+        CloudDirectoryMoveProof proof, CancellationToken cancellationToken)
+    {
+        if (await GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false) != proof.StoreScope)
+        {
+            return null;
+        }
+
+        CloudStateCheckpoint? original = await transaction.Checkpoints.GetAsync(ProofName(proof.ProofId), cancellationToken).ConfigureAwait(false);
+        if (original is null || !original.Value.Span.SequenceEqual(proof.Encode()))
+        {
+            return null;
+        }
+
+        CloudStateCheckpoint? members = await transaction.Checkpoints.GetAsync(MembersName(proof.ProofId), cancellationToken).ConfigureAwait(false);
+        return members is not null ? DecodeMembers(members.Value, proof.ProofId, proof.RootItemId) :
+            throw new InvalidDataException("The immutable directory preparation has no membership record.");
+    }
+
+    internal static IReadOnlyList<CloudDirectoryMember> DecodeMembers(ReadOnlyMemory<byte> value, Guid evidenceId, Guid rootItemId)
+    {
+        if (value.Length is < 48 or > 64 * 1024 * 1024)
+        {
+            throw new InvalidDataException("The directory membership length is invalid.");
+        }
+
+        try
+        {
+            using MemoryStream stream = new(value.ToArray(), writable: false);
+            using BinaryReader reader = new(stream);
+            if (reader.ReadInt32() != 1)
+            {
+                throw new NotSupportedException("The directory membership version is unsupported.");
+            }
+
+            if (CloudDirectoryEvidenceCodec.ReadGuid(reader) != evidenceId)
+            {
+                throw new InvalidDataException("The directory membership belongs to another preparation.");
+            }
+
+            int count = reader.ReadInt32();
+            if (count <= 0 || count > (value.Length - 24) / 24)
+            {
+                throw new InvalidDataException("The directory membership count is invalid.");
+            }
+
+            List<CloudDirectoryMember> members = new(count);
+            HashSet<Guid> ids = [];
+            HashSet<string> suffixes = new(StringComparer.OrdinalIgnoreCase);
+            bool hasRoot = false;
+            for (int index = 0; index < count; index++)
+            {
+                Guid id = CloudDirectoryEvidenceCodec.ReadGuid(reader);
+                CloudItemKind kind = (CloudItemKind)reader.ReadInt32();
+                string suffix = CloudDirectoryEvidenceCodec.ReadText(reader);
+                if (suffix.Length != 0 && CloudDirectoryEvidenceCodec.CanonicalPath(suffix) != suffix)
+                {
+                    throw new InvalidDataException("The directory membership suffix is not canonical.");
+                }
+
+                if (id == Guid.Empty || !Enum.IsDefined(kind) || !ids.Add(id) || !suffixes.Add(suffix) ||
+                    (suffix.Length == 0 && (id != rootItemId || kind != CloudItemKind.Directory)))
+                {
+                    throw new InvalidDataException("The directory membership is ambiguous.");
+                }
+
+                hasRoot |= suffix.Length == 0;
+                members.Add(new(id, kind, suffix));
+            }
+
+            if (!hasRoot || stream.Position != stream.Length)
+            {
+                throw new InvalidDataException("The directory membership is incomplete.");
+            }
+
+            return members.AsReadOnly();
+        }
+        catch (Exception exception) when (exception is ArgumentException or EndOfStreamException)
+        {
+            throw new InvalidDataException("The directory membership is malformed.", exception);
+        }
+    }
 
     internal static async ValueTask<Guid> GetScopeAsync(ICloudStateTransaction transaction,
         bool create, CancellationToken cancellationToken)
@@ -120,6 +204,8 @@ internal static class CloudDirectoryMoveEvidence
         return stream.ToArray();
     }
 }
+
+internal sealed record CloudDirectoryMember(Guid ItemId, CloudItemKind Kind, string Suffix);
 
 internal sealed record DirectoryNativeObservation(CloudLocalFileBinding Binding, byte[] Identity, string ActualPath)
 {

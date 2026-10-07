@@ -21,6 +21,22 @@ prepared proofs remain unchanged. Removing an identity or reverting a directory 
 provenance. Storage without complete IDs retains existing creation behavior but cannot establish
 this recovery evidence; legacy directories can explicitly prepare while still at their source.
 
+After the external move, call `await originalDirectory.ReconcileMoveAsync(proof)` on the original
+source reference. Recovery never issues another native move. It validates the original stored
+preparation, complete native root/directory binding and opaque identity, actual namespace spelling,
+and known current membership. Source and destination paths and an immutable completion receipt
+commit together. Current revisions, local IDs, tombstones, and pending journal IDs/sequences/payloads
+are retained; a root already at the target is still a proven member. Unrelated target rows remain
+untouched and cause a conflict. A historical receipt cannot regress later state.
+
+Inspect `Outcome`, `Stage`, `NativeMoveObserved`, `DurableProjectionCommitted`, and
+`RequiresFullRescan`. A store failure can leave a verified native move pending; retry its original
+proof. `Error` preserves the underlying failure and `NativeHResult` is populated only for actual
+native observation failures. Metadata guards stabilize the root object but do not freeze descendant
+changes or identity writes. Validation around commit detects changed known descendants; local
+ordinary children without native placeholder identity require a rescan before dispatch. A detected
+post-commit race reports the committed fact and rescan requirement rather than claiming rollback.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 
