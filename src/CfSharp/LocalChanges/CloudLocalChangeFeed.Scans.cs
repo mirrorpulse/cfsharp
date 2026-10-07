@@ -145,6 +145,8 @@ public sealed partial class CloudLocalChangeFeed
         CancellationToken cancellationToken) =>
         (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken)
             .ConfigureAwait(false)).Count != 0 ||
+        (await transaction.Checkpoints.ListAsync(NamespaceObservationsPrefix, cancellationToken)
+            .ConfigureAwait(false)).Count != 0 ||
         (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.Prefix, cancellationToken)
             .ConfigureAwait(false)).Any(value => !RemoteCreationIntent.Decode(value.Value).Committed);
 }

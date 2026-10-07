@@ -89,6 +89,24 @@ or remains observable as a new rescan condition; finish reconciliation before re
 
 ## Provider echoes
 
+Directory renames use retained library-captured native bindings and historical membership to
+validate the target. Paths of the complete known subtree, its immutable move receipt, the new
+formal Move operation, and the feed checkpoint commit together. Current revisions, tombstones,
+and pending operations keep their original values. An old operation's paths and observation time
+describe its historical event; projecting today's paths does not rewrite or acknowledge it.
+
+Missing evidence, an unrelated target, unknown membership, or a delayed rename whose object has
+already moved again retains an unresolved formal Move with a nullable item association and requires
+full reconciliation. The feed never deletes an unrelated destination row to make a rename fit.
+Explicit full-rescan acknowledgement clears the reconciliation fence while leaving those original
+operations pending. Dispatch and acknowledge them only after their meaning has been accepted.
+Native changes racing the transaction can require reconciliation even after its projection committed;
+the committed operation retains its original ID and sequence. Native notifications remain advisory.
+
+For an existing partial projection, use the original source directory's `MoveToAsync` or the
+prepared-proof recovery described in [placeholders](placeholders.md). A matching path or remote ID
+alone cannot establish historical native ownership.
+
 Provider-originated writes can be wrapped by `SuppressProviderEchoAsync` so they do not become
 uploads. Hydration, pinning, and availability transitions are not local upload operations by
 themselves.

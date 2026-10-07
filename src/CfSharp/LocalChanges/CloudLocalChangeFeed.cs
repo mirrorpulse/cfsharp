@@ -28,6 +28,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private readonly CloudLocalChangeFeedOptions _options;
     private readonly ILocalChangeSource _source;
     private readonly Action<CloudLocalChangeFeed>? _onDisposed;
+    private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireOperation;
     private readonly Channel<LocalChangeSourceEvent> _sourceEvents;
     private readonly Channel<bool> _availability = Channel.CreateUnbounded<bool>(
         new UnboundedChannelOptions
@@ -55,7 +56,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         ICloudStateStore stateStore,
         CloudLocalChangeFeedOptions options,
         ILocalChangeSource source,
-        Action<CloudLocalChangeFeed>? onDisposed = null)
+        Action<CloudLocalChangeFeed>? onDisposed = null,
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null)
     {
         _syncRootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(syncRootPath));
         _stateStore = stateStore;
@@ -63,6 +65,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         _options.Validate();
         _source = source;
         _onDisposed = onDisposed;
+        _acquireOperation = acquireOperation;
         _sourceEvents = Channel.CreateBounded<LocalChangeSourceEvent>(
             new BoundedChannelOptions(options.BufferCapacity)
             {
@@ -258,6 +261,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken).ConfigureAwait(false))
         {
+            await transaction.Checkpoints.RemoveAsync(observation.Name, cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
+            .ListAsync(NamespaceObservationsPrefix, cancellationToken).ConfigureAwait(false))
+        {
+            // Reconciliation clears the fence, not the original pending journal operation.
             await transaction.Checkpoints.RemoveAsync(observation.Name, cancellationToken).ConfigureAwait(false);
         }
 
@@ -490,6 +500,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
         catch (Exception exception)
         {
+            SignalLoss();
+            try
+            {
+                await MarkRescanRequiredAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Preserve the worker's original failure when the store also cannot record loss.
+            }
             Volatile.Write(ref _failure, exception);
             _availability.Writer.TryWrite(true);
         }
@@ -628,6 +647,47 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
 
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
+        Guid operationId = Guid.NewGuid();
+        // Acquire facade scopes before the store gate, preserving the facade's lock order.
+        // Standalone deterministic feeds still use the native guards inside the projector.
+        using IDisposable? operation = kind == CloudLocalChangeKind.Move && previousPath is not null && _acquireOperation is not null
+            ? await _acquireOperation([CloudItemOperationScope.Subtree(previousPath.Value.FullPath),
+                CloudItemOperationScope.Subtree(path.FullPath)], cancellationToken).ConfigureAwait(false)
+            : null;
+        try
+        {
+            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, null, cancellationToken).ConfigureAwait(false);
+        }
+        catch (CloudNamespaceObservationUncertainException exception)
+        {
+            // The original transaction has rolled back (or committed before a late native
+            // check failed). Reuse its acknowledgement identity when retaining uncertainty.
+            SignalLoss();
+            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (IOException) when (kind == CloudLocalChangeKind.Move)
+        {
+            SignalLoss();
+            try
+            {
+                await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt,
+                    Directory.Exists(path.FullPath), cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A persistent store failure may prevent durable capture. The original error
+                // still terminates the worker and requires recovery rather than reporting success.
+            }
+
+            throw;
+        }
+    }
+
+    private async ValueTask PersistChangeCoreAsync(CloudLocalChangeKind kind, CloudItemPath path,
+        CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
+        CancellationToken cancellationToken)
+    {
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -676,13 +736,28 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemState? observedState = kind == CloudLocalChangeKind.Delete
             ? current
             : previous ?? current;
+        bool directory = observedState?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath);
+        using DirectoryFeedProjection? directoryProjection = uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previousPath is not null
+            ? await TryProjectDirectoryAsync().ConfigureAwait(false) : null;
+        if (uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previous is not null && current is not null &&
+            previous.ItemId != current.ItemId)
+        {
+            throw new CloudNamespaceObservationUncertainException(directory);
+        }
+
+        if (uncertainDirectory is null && kind == CloudLocalChangeKind.Move && directoryProjection is null &&
+            observedState is null && !File.Exists(path.FullPath))
+        {
+            throw new CloudNamespaceObservationUncertainException(directory);
+        }
+
         IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
             .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
         CloudEchoSuppressionState? suppression = suppressions.FirstOrDefault(candidate =>
             RemoteCreationIntent.IsCreationEcho(candidate)
                 ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
                 : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId));
-        if (suppression is not null)
+        if (suppression is not null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
         {
             if (suppression.RemainingObservations == 1)
             {
@@ -704,7 +779,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 checkpoint.RequiresFullRescan,
                 observedAt,
                 cancellationToken).ConfigureAwait(false);
+            directoryProjection?.Validate();
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            directoryProjection?.Validate();
             SignalAvailable();
             return;
         }
@@ -715,14 +792,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemState? state = kind == CloudLocalChangeKind.Delete
             ? current
             : previous ?? current;
-        Guid? itemId = state?.ItemId;
-        if (kind == CloudLocalChangeKind.Move && previous is not null && current is not null &&
-            previous.ItemId != current.ItemId)
-        {
-            await transaction.Items.RemoveAsync(current.ItemId, cancellationToken).ConfigureAwait(false);
-        }
+        Guid? itemId = uncertainDirectory is not null ? null : directoryProjection?.ItemId ?? state?.ItemId;
 
-        if (state is null && kind != CloudLocalChangeKind.Delete)
+        if (uncertainDirectory is null && directoryProjection is null && state is null && kind != CloudLocalChangeKind.Delete)
         {
             itemId = Guid.NewGuid();
             state = new CloudItemState(
@@ -736,7 +808,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 observedAt);
         }
 
-        if (state is not null)
+        if (uncertainDirectory is null && directoryProjection is null && state is not null)
         {
             CloudItemState updated = new(
                 state.ItemId,
@@ -753,25 +825,61 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         LocalChangePayload payload = new(
             path.RelativePath,
             previousPath?.RelativePath,
-            state?.Kind == CloudItemKind.Directory ||
-                (state is null && Directory.Exists(path.FullPath)),
+            uncertainDirectory ?? (directoryProjection is not null || directory),
             observedAt);
-        await transaction.Operations.EnqueueAsync(
+        if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        {
+            await transaction.Operations.EnqueueAsync(
             new CloudOperationJournalEntry(
-                Guid.NewGuid(),
+                operationId,
                 operationKind,
                 itemId,
                 payload.Encode(),
                 observedAt),
             cancellationToken).ConfigureAwait(false);
+        }
+
+        bool requiresRescan = uncertainDirectory is not null || directoryProjection?.RequiresRescan == true;
+        long namespaceGeneration = requiresRescan ? SignalLoss() : Volatile.Read(ref _lossGeneration);
+        if (requiresRescan)
+        {
+            await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(NamespaceObservationsPrefix + "/" + operationId.ToString("N"),
+                payload.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+        }
+
         await UpsertCheckpointAsync(
             transaction,
             observation,
-            checkpoint.RequiresFullRescan,
+            checkpoint.RequiresFullRescan || requiresRescan,
             observedAt,
             cancellationToken).ConfigureAwait(false);
+        directoryProjection?.Validate();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        if (requiresRescan)
+        {
+            Volatile.Write(ref _persistedLossGeneration, namespaceGeneration);
+        }
+
+        directoryProjection?.Validate();
         SignalAvailable();
+
+        async ValueTask<DirectoryFeedProjection?> TryProjectDirectoryAsync()
+        {
+            CloudDirectoryMoveProof? proof = await CloudDirectoryMoveEvidence.GetOrPrepareRetainedIntentAsync(transaction,
+                previousPath!.Value.RelativePath, path.RelativePath, cancellationToken).ConfigureAwait(false);
+            if (proof is null && !directory)
+            {
+                return null;
+            }
+
+            if (proof is null || !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
+            {
+                throw new CloudNamespaceObservationUncertainException(true);
+            }
+
+            return await ProjectDirectoryObservationAsync(transaction, proof, path, previousPath.Value, observedAt,
+                cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static bool MatchesRemoteCreationEcho(CloudEchoSuppressionState suppression,

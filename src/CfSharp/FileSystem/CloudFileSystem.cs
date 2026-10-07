@@ -115,7 +115,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                             _localChangeFeed = null;
                         }
                     }
-                });
+                },
+                async (scopes, cancellationToken) => await AcquireOperationAsync(scopes, cancellationToken).ConfigureAwait(false));
         }
     }
 

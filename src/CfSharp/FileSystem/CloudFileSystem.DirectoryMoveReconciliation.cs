@@ -174,69 +174,13 @@ public sealed partial class CloudFileSystem
     }
 
     private (List<(string Path, NativeFileMetadata Metadata)> Observations, bool RequiresRescan) ObserveDirectoryMembers(
-        CloudDirectoryMoveProof proof, IReadOnlyList<CloudDirectoryMember> members, IReadOnlyList<CloudItemState> current)
-    {
-        Dictionary<Guid, CloudDirectoryMember> known = members.ToDictionary(member => member.ItemId);
-        List<(string Path, NativeFileMetadata Metadata)> observations = [];
-        bool requiresRescan = false;
-        foreach (CloudItemState item in current.Where(item => item.ItemId != proof.RootItemId))
-        {
-            string path = Path.Combine(SyncRootPath, CloudDirectoryStateProjection.MemberPath(proof.DestinationRelativePath, known[item.ItemId].Suffix));
-            using CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(SyncRootPath, [path]);
-            NativeFileMetadata metadata;
-            try
-            {
-                using SafeFileHandle handle = WindowsFileMetadata.Open(path);
-                metadata = WindowsFileMetadata.Read(handle.DangerousGetHandle());
-            }
-            catch (Win32Exception exception) when (item.IsTombstone && exception.NativeErrorCode is 2 or 3)
-            {
-                continue;
-            }
-
-            if (item.IsTombstone)
-            {
-                requiresRescan = true;
-                continue;
-            }
-
-            if (metadata.DeletePending || metadata.Directory != (item.Kind == CloudItemKind.Directory) ||
-                (metadata.PlaceholderIdentity.Length != 0 && CloudPlaceholderIdentity.Decode(metadata.PlaceholderIdentity).ItemId != item.ItemId) ||
-                (metadata.PlaceholderIdentity.Length == 0 && !item.RemoteId.StartsWith("local:", StringComparison.Ordinal)))
-            {
-                throw new CloudDirectoryProjectionConflictException("A native descendant no longer matches its known durable membership.");
-            }
-
-            requiresRescan |= metadata.PlaceholderIdentity.Length == 0;
-            observations.Add((path, metadata));
-        }
-
-        return (observations, requiresRescan);
-    }
+        CloudDirectoryMoveProof proof, IReadOnlyList<CloudDirectoryMember> members, IReadOnlyList<CloudItemState> current) =>
+        CloudDirectoryNativeValidation.ObserveMembers(SyncRootPath, proof, members, current);
 
     private void ValidateDirectoryObservation(SafeFileHandle guard, DirectoryNativeObservation expected,
-        List<(string Path, NativeFileMetadata Metadata)> children)
-    {
-        if (!expected.Matches(CloudDirectoryMoveEvidence.Capture(guard.DangerousGetHandle(), SyncRootPath)))
-        {
-            throw new CloudDirectoryProjectionConflictException("The native directory changed during projection.");
-        }
-
-        foreach ((string path, NativeFileMetadata original) in children)
-        {
-            using CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(SyncRootPath, [path]);
-            using SafeFileHandle handle = WindowsFileMetadata.Open(path);
-            NativeFileMetadata actual = WindowsFileMetadata.Read(handle.DangerousGetHandle());
-            if (original.Identity.VolumeSerialNumber != actual.Identity.VolumeSerialNumber || original.Identity.FileId != actual.Identity.FileId ||
-                original.Directory != actual.Directory || actual.DeletePending ||
-                !original.PlaceholderIdentity.AsSpan().SequenceEqual(actual.PlaceholderIdentity))
-            {
-                throw new CloudDirectoryProjectionConflictException("A native descendant changed during projection; reconcile the retained journal.");
-            }
-        }
-    }
+        List<(string Path, NativeFileMetadata Metadata)> children) =>
+        CloudDirectoryNativeValidation.Validate(SyncRootPath, guard, expected, children);
 }
-
 internal sealed class CloudDirectoryNativeObservationException : IOException
 {
     internal CloudDirectoryNativeObservationException(Exception inner, int hresult, int? win32ErrorCode)
