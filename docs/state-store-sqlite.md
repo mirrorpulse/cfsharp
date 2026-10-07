@@ -62,3 +62,12 @@ Custom stores must enforce the same protocol boundary when opening persistent st
 runtimes. Preserve CfSharp-owned checkpoint names and values transactionally, including immutable
 preparations and receipts; never treat them as disposable caches or infer native ownership from an
 item path. The schema fence changes protocol compatibility, not the replaceable core interfaces.
+
+Upgrading a preview.3 schema-5 database retains all six repositories, original journal sequences
+and retry fields, remote cursors/fingerprints, echo counts, and tombstones. The new directory
+protocol is used only after that durable schema fence commits. Reopening an upgraded database
+with an older package is rejected; do not rewrite its version to force a downgrade.
+Custom stores keep the existing interfaces and may optionally implement journal paging. They must
+atomically retain directory preparation, membership, projection receipt, item rows, and feed
+checkpoint/journal updates when the core coordinates a move. Never inspect or overwrite CfSharp's
+private namespace checkpoint payloads to fabricate recovery provenance.

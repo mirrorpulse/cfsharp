@@ -31,6 +31,28 @@ Replay is safe when the same immutable batch or callback is submitted again. Ver
 checkpoint and transaction commit rather than relying on an in-memory token. Duplicate attempts
 should converge to one namespace result; do not delete the state database to suppress a retry.
 
+## A deferred journal head hides later changes
+
+Use `BeginScanAsync` and `ReadPageAsync` with the returned finite boundary. Keep deferred IDs
+pending, carry dependencies across pages, and ACK only accepted IDs. `NotSupportedException`
+means the custom journal lacks optional paging; add that capability rather than guessing an
+unbounded read or rotating the queue. A `CloudLocalChangeJournalException` identifies a row whose
+payload is not an official local change. Leave it pending and resolve it through its originating
+component; consumers should not decode private payloads to bypass this error.
+
+## A directory moved but durable child paths are still old
+
+Retry the original source/destination through `MoveToAsync`, or decode and reconcile the original
+prepared proof against the same store. Matching remote IDs, paths, or copied placeholder identity
+do not prove that the target is the original native directory. Preserve the target and pending
+journal on `Conflict`/`NotApplicable`; complete ownership reconciliation before resuming dispatch.
+
+Report Outcome, Stage, NativeMoveObserved, DurableProjectionCommitted, RequiresFullRescan, proof ID,
+and the original Error. A null NativeHResult is expected for logical/store failures. A conflict after
+commit can accurately report `DurableProjectionCommitted = true`: the native namespace changed
+again after projection. Preserve the receipt and original proof rather than claiming rollback.
+Full-rescan acknowledgement clears the fence but does not ACK the unresolved formal move.
+
 ## Database locking or corruption concerns
 
 Keep one active owner per sync-root database, allow the bounded lock wait to expire, and preserve

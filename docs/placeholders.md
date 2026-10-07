@@ -53,6 +53,58 @@ directory binding and known membership into an independent immutable preparation
 manufactures historical evidence from a current target. Legacy directories without either source
 of provenance still require explicit preparation while at the original source.
 
+### Retain and recover an external move
+
+Keep the original source reference, exact destination spelling, and original encoded proof in
+application-owned durable intent storage outside the sync root. Before an external consumer is
+allowed to rename `Docs`:
+
+```csharp
+CloudDirectory original = fileSystem.GetDirectory("Docs");
+CloudDirectoryMoveProof proof = await original.PrepareMoveAsync(
+    fileSystem.Root, "Renamed", cancellationToken);
+await File.WriteAllBytesAsync(applicationProofPath, proof.Encode(), cancellationToken);
+// The application can now authorize its external consumer to perform that exact rename.
+```
+
+After the external consumer finishes, or after restarting against the same store:
+
+```csharp
+CloudDirectoryMoveProof retained = CloudDirectoryMoveProof.Decode(
+    await File.ReadAllBytesAsync(applicationProofPath, cancellationToken));
+CloudDirectoryMoveReconciliationResult result = await fileSystem.GetDirectory("Docs")
+    .ReconcileMoveAsync(retained, cancellationToken);
+
+if (result.RequiresFullRescan)
+{
+    await ReconcileEntireSyncRootAsync(fileSystem, cancellationToken);
+}
+// Inspect Outcome and native/committed facts before advancing the application intent.
+// Reconciliation does not ACK local operations or accept a remote mutation.
+```
+
+`applicationProofPath` is an example application intent file, not a CfSharp state-store setting.
+Persist it before allowing the native move; do not regenerate a missing original proof from the
+destination's present identity. An existing partial projection can also use the original source's
+`MoveToAsync` when CfSharp retained sufficient pre-rename provenance. Otherwise perform ownership
+reconciliation without relaxing target guards.
+
+| Result | Application action |
+| --- | --- |
+| `NotMoved` | The proven source remains. Inspect the rescan flag before authorizing the intended move. |
+| `Projected`, `AlreadyProjected` | Native movement and durable paths were validated; honor any remaining rescan requirement. |
+| `NativeObservedProjectionPending` | Preserve the proof and retry after the original store failure is resolved. |
+| `Conflict`, `NotApplicable` | Stop this intent and reconcile ownership; do not overwrite the target or invent provenance. |
+| `Busy`, `Canceled`, `Failed` | Inspect Stage, Error, and both native/committed facts before retrying the same intent. |
+
+A post-commit race can have `DurableProjectionCommitted = true` with a conflict/rescan outcome.
+`NativeHResult` is nullable because a logical conflict or store exception is not a failed native
+call. Log bounded identifiers, stage, outcome, and original error details as appropriate; avoid
+dumping complete opaque identities or arbitrary user paths into routine diagnostics.
+Proof version 1 bounds encoded paths to 32 KiB of UTF-8, identities to the native 4 KiB limit,
+and known-member manifests to 64 MiB. Unknown protocol versions fail closed. Preparation is
+metadata-only and does not freeze child content, identity writes, or later namespace moves.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 

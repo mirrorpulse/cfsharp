@@ -47,8 +47,10 @@ while (true)
         break;
     }
 
-    await DispatchEligibleChangesAsync(page.Changes, cancellationToken);
-    // ACK only operation IDs whose meaning the application has durably accepted.
+    IReadOnlyList<Guid> acceptedIds = await DispatchEligibleChangesAsync(
+        page.Changes, cancellationToken);
+    // This application method returns only IDs whose meaning it durably accepted.
+    await feed.AcknowledgeAsync(acceptedIds, cancellationToken);
     after = page.LastScannedSequence;
     if (!page.HasMore)
     {
@@ -69,6 +71,10 @@ stores throw `NotSupportedException` for scans and retain the existing batch API
 journal payloads throw `CloudLocalChangeJournalException` with the original operation ID and
 sequence, leaving the row pending. Consumers do not need private payload parsing or a copied queue.
 Scheduling across roots and preserving dependencies between changes remain application concerns.
+Keep a dependency view across pages before dispatching dependent moves/deletes. A deferred root
+does not have to be ACKed to reach an independent later root. Completing this finite scan does not
+accept deferred operations: begin the next cycle at zero, preserving those original IDs. Later writes
+belong to the next captured boundary. Multiple consumers must coordinate dispatch and ACK ownership.
 
 ## Rescan is a normal state
 
@@ -87,7 +93,7 @@ after the durable marker is cleared. Begin a new scan after recovery. If a new l
 `AcknowledgeFullRescanAsync`, it either rejects acknowledgement with `InvalidOperationException`
 or remains observable as a new rescan condition; finish reconciliation before retrying.
 
-## Provider echoes
+## Directory rename projection
 
 Directory renames use retained library-captured native bindings and historical membership to
 validate the target. Paths of the complete known subtree, its immutable move receipt, the new
@@ -106,6 +112,8 @@ the committed operation retains its original ID and sequence. Native notificatio
 For an existing partial projection, use the original source directory's `MoveToAsync` or the
 prepared-proof recovery described in [placeholders](placeholders.md). A matching path or remote ID
 alone cannot establish historical native ownership.
+
+## Provider echoes
 
 Provider-originated writes can be wrapped by `SuppressProviderEchoAsync` so they do not become
 uploads. Hydration, pinning, and availability transitions are not local upload operations by
