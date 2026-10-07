@@ -825,11 +825,28 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
 
         using Process process = new() { StartInfo = startInfo };
         Assert.True(process.Start());
+        // FailFast diagnostics can fill a redirected Windows pipe before the child terminates.
+        // Drain both streams concurrently with the exit wait, and always reap a timed-out child
+        // before fixture disposal tries to remove its still-open SQLite files.
+        Task<string> standardOutput = process.StandardOutput.ReadToEndAsync();
+        Task<string> standardError = process.StandardError.ReadToEndAsync();
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
-        await process.WaitForExitAsync(timeout.Token);
-        string output = await process.StandardOutput.ReadToEndAsync() +
-            await process.StandardError.ReadToEndAsync();
-        return (process.ExitCode, output);
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+            string output = await standardOutput + await standardError;
+            return (process.ExitCode, output);
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+
+            await Task.WhenAll(standardOutput, standardError);
+        }
     }
 
     private static async Task<long> ExecuteScalarInt64Async(string databasePath, string sql)
