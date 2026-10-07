@@ -26,4 +26,8 @@
     <Compile Include="..\CfSharp.Tests\Persistence\CloudStateStoreContractTests.cs"
              Link="Persistence\CloudStateStoreContractTests.cs" />
   </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Fixtures\preview3-state.zip" LogicalName="CfSharp.PreviewThreeStateFixture.zip" />
+  </ItemGroup>
 </Project>

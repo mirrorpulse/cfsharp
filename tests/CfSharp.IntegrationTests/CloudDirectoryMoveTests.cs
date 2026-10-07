@@ -1,6 +1,7 @@
 using System.Runtime.Versioning;
 
 using CfSharp.Storage.Sqlite;
+using CfSharp.Tests.Persistence;
 
 namespace CfSharp.IntegrationTests;
 
@@ -103,11 +104,15 @@ internal sealed class DirectoryMoveTestRoot(CloudFileSystem fileSystem, Director
         await fileSystem.StartAsync();
     }
 
-    internal static async Task<DirectoryMoveTestRoot> OpenAsync(ICloudFileContentProvider? provider = null)
+    internal static async Task<DirectoryMoveTestRoot> OpenAsync(ICloudFileContentProvider? provider = null, bool legacyState = false)
     {
         string area = Path.Combine(Path.GetTempPath(), "CfSharp-directory-move-tests", Guid.NewGuid().ToString("N"));
         string rootPath = Path.Combine(area, "root");
         Directory.CreateDirectory(Path.Combine(rootPath, "Ordinary"));
+        if (legacyState)
+        {
+            PreviewThreeStateFixture.Extract(Path.Combine(area, "state.db"), rootPath);
+        }
         Guid providerId = Guid.NewGuid();
         CapturingFactory factory = new(new SqliteCloudStateStoreFactory(Path.Combine(area, "state.db")));
         CloudFileSystem fileSystem = CloudFileSystem.CreateBuilder(rootPath).WithStateStore(factory)
