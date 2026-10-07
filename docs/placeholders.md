@@ -36,6 +36,9 @@ native observation failures. Metadata guards stabilize the root object but do no
 changes or identity writes. Validation around commit detects changed known descendants; local
 ordinary children without native placeholder identity require a rescan before dispatch. A detected
 post-commit race reports the committed fact and rescan requirement rather than claiming rollback.
+An approved external Cloud Files rename can change the namespace while a metadata guard remains
+open. Treat the result's native observation as a checked fact at that stage, not a continuing
+namespace lock; honor a later conflict/rescan even when `DurableProjectionCommitted` is true.
 
 `MoveToAsync` prepares supported managed directories before its native move. Retrying the original
 source/destination after a crash uses the retained indexed preparation and performs only verified
