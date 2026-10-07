@@ -108,10 +108,11 @@ public sealed class CloudItemSnapshot
 
     /// <summary>Gets the complete native volume, root, and file binding when available.</summary>
     /// <remarks>
-    /// Available for ordinary files as well as Cloud Files placeholders. No content is read or
+    /// Available for ordinary files and directories as well as Cloud Files placeholders. No content is read or
     /// hydrated. This observation holds no lock and is not a USN or content proof. Null denotes
-    /// absence, directories, or unsupported reparse targets. Retain the upload-time value rather
-    /// than replacing it with a later observation when confirming accepted content.
+    /// absence, storage without complete IDs, or unsupported reparse targets. Retain the upload-time
+    /// value when confirming accepted content, or capture a directory move proof before renaming;
+    /// a later observation alone cannot prove historical ownership.
     /// </remarks>
     public CloudLocalFileBinding? LocalBinding { get; }
 

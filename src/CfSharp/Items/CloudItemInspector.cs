@@ -170,7 +170,7 @@ internal static partial class CloudItemInspector
                     : CloudSynchronizationState.NotApplicable),
             LocalFileId = placeholder?.FileId,
             SyncRootFileId = placeholder?.SyncRootFileId,
-            LocalBinding = actualKind == CloudItemKind.File && syncRootPath is not null &&
+            LocalBinding = syncRootPath is not null &&
                 (!attributes.HasFlag(FileAttributes.ReparsePoint) || placeholder is not null)
                 ? CloudLocalFileBindingPlatform.TryRead(handle.DangerousGetHandle(), syncRootPath)
                 : null,

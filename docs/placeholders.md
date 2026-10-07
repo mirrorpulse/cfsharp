@@ -3,6 +3,18 @@
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 
+## Observe native object bindings
+
+`CloudItemSnapshot.LocalBinding` exposes the complete volume serial number, sync-root directory
+ID, and local object ID for files and directories on capable Windows storage. IDs retain all native
+bits and are opaque comparison values. Inspection reads metadata without reading or hydrating
+content and retains no handle or protection lifetime. Unsupported reparse targets, missing objects,
+and storage without complete IDs return null.
+
+A rename preserves the binding; a replacement can have a different binding even when its path,
+remote ID, or placeholder identity matches. A current target observation alone cannot prove that
+it belonged to an earlier source. File content confirmation still requires its accepted upload proof.
+
 ## Create a placeholder
 
 ```csharp

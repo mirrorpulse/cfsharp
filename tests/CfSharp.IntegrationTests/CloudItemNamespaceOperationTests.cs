@@ -66,6 +66,8 @@ public sealed class CloudItemNamespaceOperationTests
                 [sourceSpec, destinationSpec, renameSpec, replaceSpec, emptySpec]);
 
             CloudDirectory source = fileSystem.GetDirectory("Source");
+            CloudLocalFileBinding sourceBinding = Assert.IsType<CloudLocalFileBinding>(
+                (await source.InspectAsync()).LocalBinding);
             CloudDirectory destination = fileSystem.GetDirectory("Destination");
             CloudFilePlaceholderSpec sourceFileSpec = FileSpec(
                 "source-file.bin",
@@ -113,6 +115,7 @@ public sealed class CloudItemNamespaceOperationTests
             CloudDirectory movedDirectory = Assert.IsType<CloudDirectory>(movedDirectoryResult.Item);
             Assert.Equal(4, movedDirectoryResult.DurableStateEntriesUpdated);
             Assert.Equal(sourceSpec.Identity.ItemId, movedDirectoryResult.Snapshot.ItemId);
+            Assert.Equal(sourceBinding, movedDirectoryResult.Snapshot.LocalBinding);
             CloudFile movedDeepFile = movedDirectory.GetFile(Path.Combine("Nested", "deep.bin"));
             Assert.Equal(deepFileSpec.Identity.ItemId, (await movedDeepFile.InspectAsync()).ItemId);
             Assert.False((await source.GetFile(Path.Combine("Nested", "deep.bin")).InspectAsync()).Exists);
