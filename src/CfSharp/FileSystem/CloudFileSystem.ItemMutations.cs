@@ -248,6 +248,8 @@ public sealed partial class CloudFileSystem
                 isTombstone: false,
                 DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, item.SyncRootPath,
+            item.RelativePath, item.Kind, cancellationToken).ConfigureAwait(false);
         validateBeforeCommit?.Invoke();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         // Record success before transaction disposal, which can fail after a real commit.
@@ -294,6 +296,12 @@ public sealed partial class CloudFileSystem
 
         await transaction.Items.RemoveAsync(existing.ItemId, cancellationToken)
             .ConfigureAwait(false);
+        if (existing.Kind == CloudItemKind.Directory)
+        {
+            await transaction.Checkpoints.RemoveAsync(CloudDirectoryProvenance.BindingName(existing.ItemId), cancellationToken).ConfigureAwait(false);
+            await transaction.Checkpoints.RemoveAsync(CloudDirectoryProvenance.MembersName(existing.ItemId), cancellationToken).ConfigureAwait(false);
+        }
+
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return true;
     }

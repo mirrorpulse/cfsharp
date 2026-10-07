@@ -24,6 +24,7 @@ public sealed class ProviderDirectoryPopulationTests
         CloudSyncRoot? root = null;
         bool registered = false;
         DemandProvider provider = new();
+        DirectoryMoveTestRoot.CapturingFactory factory = new(new SqliteCloudStateStoreFactory(databasePath));
 
         try
         {
@@ -37,7 +38,7 @@ public sealed class ProviderDirectoryPopulationTests
                 .Build();
 
             fileSystem = CloudFileSystem.CreateBuilder(rootPath)
-                .WithStateStore(new SqliteCloudStateStoreFactory(databasePath))
+                .WithStateStore(factory)
                 .WithRegistration(registration)
                 .WithContentProvider(provider)
                 .Build();
@@ -85,6 +86,14 @@ public sealed class ProviderDirectoryPopulationTests
             Assert.Equal("remote-child", childSnapshot.RemoteId);
             Assert.NotNull(childSnapshot.DurableStateUpdatedAt);
             Assert.Equal(1, provider.RequestCount);
+            CloudItemSnapshot childDirectory = await fileSystem.GetDirectory("remote/folder").InspectAsync();
+            await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync())
+            {
+                CloudDirectoryProvenance provenance = CloudDirectoryProvenance.Decode((await transaction.Checkpoints.GetAsync(
+                    CloudDirectoryProvenance.BindingName(childDirectory.ItemId!.Value)))!.Value);
+                Assert.Equal(childDirectory.LocalBinding, provenance.Binding);
+                Assert.Equal(childDirectory.PlaceholderIdentity.ToArray(), provenance.Identity);
+            }
 
             await fileSystem.DisposeAsync();
             fileSystem = null;
@@ -164,7 +173,9 @@ public sealed class ProviderDirectoryPopulationTests
                 .CreateBuilder("child.txt", "remote-child", 3)
                 .WithInSyncState(false)
                 .Build();
-            return ValueTask.FromResult(new CloudProviderDirectoryPage([child], totalCount: 1));
+            CloudDirectoryPlaceholderSpec directory = CloudDirectoryPlaceholderSpec.CreateBuilder("folder", "remote-folder")
+                .WithPopulationState(CloudDirectoryPopulationState.Complete).Build();
+            return ValueTask.FromResult(new CloudProviderDirectoryPage([child, directory], totalCount: 2));
         }
     }
 }

@@ -14,6 +14,13 @@ observed at a renamed target for missing historical evidence. Ordinary directori
 `MoveToAsync`, but cannot prepare external recovery without a managed placeholder identity and
 complete native IDs. Metadata capture reads no content and holds no continuing lock after returning.
 
+Directory creation, conversion, identity replacement, remote creation, and provider population
+retain native provenance in the same transaction as their official item rows. Adding children
+refreshes known membership of captured ancestors without enumerating native subtrees. Immutable
+prepared proofs remain unchanged. Removing an identity or reverting a directory removes its live
+provenance. Storage without complete IDs retains existing creation behavior but cannot establish
+this recovery evidence; legacy directories can explicitly prepare while still at their source.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 

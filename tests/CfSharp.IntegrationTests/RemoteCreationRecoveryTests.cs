@@ -128,6 +128,14 @@ public sealed class RemoteCreationRecoveryTests
             Assert.Equal(2, (await complete.Items.ListSubtreeAsync(string.Empty)).Count);
             Assert.All(await complete.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow),
                 suppression => Assert.NotNull(suppression.ItemId));
+            if (!files)
+            {
+                CloudDirectoryProvenance provenance = CloudDirectoryProvenance.Decode((await complete.Checkpoints.GetAsync(
+                    CloudDirectoryProvenance.BindingName(nativeId)))!.Value);
+                Assert.Equal(nativeId, provenance.RootItemId);
+                Assert.Equal("one", provenance.RelativePath);
+                Assert.Equal(CloudPlaceholderIdentity.Decode(provenance.Identity).ItemId, nativeId);
+            }
         }
         finally
         {

@@ -93,6 +93,8 @@ public sealed partial class CloudFileSystem
         await transaction.Items.UpsertAsync(new CloudItemState(intent.Identity.ItemId, change.RemoteId,
             change.RelativePath, change.ItemKind, change.RemoteRevision, localFileId: null,
             isTombstone: false, now), CancellationToken.None).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, SyncRootPath,
+            change.RelativePath, change.ItemKind, CancellationToken.None).ConfigureAwait(false);
         if (options.SuppressLocalEcho && !intent.Committed)
         {
             await transaction.EchoSuppressions.UpsertAsync(new CloudEchoSuppressionState(

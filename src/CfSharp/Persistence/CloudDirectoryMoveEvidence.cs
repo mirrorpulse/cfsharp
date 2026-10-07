@@ -81,20 +81,23 @@ internal static class CloudDirectoryMoveEvidence
     }
 
     internal static byte[] EncodeMembers(CloudDirectoryMoveProof proof, IReadOnlyList<CloudItemState> members)
+        => EncodeMembers(proof.ProofId, proof.RootItemId, proof.SourceRelativePath, members);
+
+    internal static byte[] EncodeMembers(Guid evidenceId, Guid rootItemId, string sourcePath, IReadOnlyList<CloudItemState> members)
     {
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
         writer.Write(1);
-        writer.Write(proof.ProofId.ToByteArray());
+        writer.Write(evidenceId.ToByteArray());
         writer.Write(members.Count);
         HashSet<Guid> ids = [];
         HashSet<string> suffixes = new(StringComparer.OrdinalIgnoreCase);
         bool rootPresent = false;
         foreach (CloudItemState item in members)
         {
-            string suffix = CloudDirectoryStateProjection.MapPath(item.RelativePath, proof.SourceRelativePath, string.Empty);
+            string suffix = CloudDirectoryStateProjection.MapPath(item.RelativePath, sourcePath, string.Empty);
             if (!ids.Add(item.ItemId) || !suffixes.Add(suffix) ||
-                (suffix.Length == 0 && (item.ItemId != proof.RootItemId || item.Kind != CloudItemKind.Directory || item.IsTombstone)))
+                (suffix.Length == 0 && (item.ItemId != rootItemId || item.Kind != CloudItemKind.Directory || item.IsTombstone)))
             {
                 throw new InvalidDataException("The prepared subtree has ambiguous membership.");
             }
