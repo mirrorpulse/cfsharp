@@ -156,7 +156,7 @@ internal static class CloudDirectoryEvidenceCodec
         string canonical = CloudRemotePathValidation.Canonicalize(path, nameof(path)).Replace('/', '\\');
         if (Utf8.GetByteCount(canonical) > 32768)
         {
-            throw new ArgumentException("The directory evidence path is too long.", nameof(path));
+            throw new CloudDirectoryEvidenceUnavailableException("The directory evidence path exceeds the supported UTF-8 metadata limit.");
         }
 
         return canonical;
@@ -167,7 +167,7 @@ internal static class CloudDirectoryEvidenceCodec
         byte[] bytes = Utf8.GetBytes(value);
         if (bytes.Length > 32768)
         {
-            throw new InvalidDataException("The directory evidence path is too long.");
+            throw new CloudDirectoryEvidenceUnavailableException("The directory evidence path exceeds the supported UTF-8 metadata limit.");
         }
 
         writer.Write(bytes.Length);

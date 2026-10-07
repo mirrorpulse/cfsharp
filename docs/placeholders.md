@@ -104,6 +104,11 @@ dumping complete opaque identities or arbitrary user paths into routine diagnost
 Proof version 1 bounds encoded paths to 32 KiB of UTF-8, identities to the native 4 KiB limit,
 and known-member manifests to 64 MiB. Unknown protocol versions fail closed. Preparation is
 metadata-only and does not freeze child content, identity writes, or later namespace moves.
+These evidence bounds do not reduce existing directory conversion or ordinary `MoveToAsync`
+availability. If a valid native path or known subtree exceeds the recovery format's capacity,
+normal source-present operations retain their existing behavior and omit unusable live provenance;
+explicit preparation reports `NotSupportedException`. Immutable earlier proofs, receipts, official
+item rows, and pending operations remain intact.
 
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.

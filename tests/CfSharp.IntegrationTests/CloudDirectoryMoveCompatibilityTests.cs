@@ -8,6 +8,45 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudDirectoryMoveTests
 {
     [Fact]
+    public async Task BoundedUtf8HistoryPreservesLegacyManagedDirectoryConversionAndMove()
+    {
+        await using DirectoryMoveTestRoot root = await DirectoryMoveTestRoot.OpenAsync();
+        CloudDirectoryMoveProof original = await root.FileSystem.GetDirectory("Docs").PrepareMoveAsync(root.FileSystem.Root, "Other");
+        CloudDirectory source = root.FileSystem.GetDirectory("Ordinary");
+        string suffix = string.Join('\\', Enumerable.Repeat(new string('文', 250), 45));
+        Guid deletedId = Guid.NewGuid();
+        DateTimeOffset deletedAt = DateTimeOffset.UtcNow;
+        await using (ICloudStateTransaction seed = await root.Store.BeginTransactionAsync())
+        {
+            // Official historical rows can retain paths outside the bounded recovery format,
+            // independently of the current machine's native long-path support.
+            await seed.Items.UpsertAsync(new(deletedId, "deleted", Path.Combine("Ordinary", suffix),
+                CloudItemKind.File, "deleted-revision", 42, true, deletedAt));
+            await seed.CommitAsync();
+        }
+
+        CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Create("ordinary-directory");
+        await source.ConvertToPlaceholderAsync(identity);
+        await Assert.ThrowsAsync<CloudDirectoryEvidenceUnavailableException>(() => source.PrepareMoveAsync(root.FileSystem.Root, "Moved").AsTask());
+        CloudItemMoveResult moved = await source.MoveToAsync(root.FileSystem.Root, "Moved");
+        Assert.Null(moved.DirectoryReconciliation);
+        Assert.Equal(identity.ItemId, moved.Snapshot.ItemId);
+        Assert.False(Directory.Exists(source.FullPath));
+        Assert.True(Directory.Exists(Path.Combine(root.RootPath, "Moved")));
+        await using ICloudStateTransaction verify = await root.Store.BeginTransactionAsync();
+        Assert.Equal("Moved", (await verify.Items.GetByItemIdAsync(identity.ItemId))!.RelativePath);
+        CloudItemState deleted = (await verify.Items.GetByItemIdAsync(deletedId))!;
+        Assert.Equal(Path.Combine("Moved", suffix), deleted.RelativePath);
+        Assert.True(deleted.IsTombstone);
+        Assert.Equal("deleted-revision", deleted.RemoteRevision);
+        Assert.Equal(42, deleted.LocalFileId);
+        Assert.True(deleted.UpdatedAt >= deletedAt);
+        Assert.Null(await verify.Checkpoints.GetAsync(CloudDirectoryProvenance.BindingName(identity.ItemId)));
+        Assert.Null(await verify.Checkpoints.GetAsync(CloudDirectoryProvenance.MembersName(identity.ItemId)));
+        Assert.Equal(original.Encode(), (await verify.Checkpoints.GetAsync(CloudDirectoryMoveEvidence.ProofName(original.ProofId)))!.Value.ToArray());
+    }
+
+    [Fact]
     public async Task PublishedPreviewThreeStateSurvivesDirectoryFeedProjectionProofReplayAndRuntimeRestart()
     {
         await using DirectoryMoveTestRoot root = await DirectoryMoveTestRoot.OpenAsync(legacyState: true);

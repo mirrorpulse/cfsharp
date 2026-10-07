@@ -102,9 +102,7 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             Guid scope = await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, true, cancellationToken).ConfigureAwait(false);
             CloudDirectoryProvenance provenance = new(Guid.NewGuid(), scope, item.ItemId,
                 Path.GetRelativePath(syncRootPath, captured.ActualPath), captured.Binding, captured.Identity);
-            await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(BindingName(item.ItemId), provenance.Encode(), DateTimeOffset.UtcNow),
-                cancellationToken).ConfigureAwait(false);
-            await RefreshMembersAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
+            await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
 
         // Refresh known membership of already captured ancestors using official transactional
@@ -164,18 +162,58 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
                 provenance = provenance with { EvidenceId = Guid.NewGuid(), RelativePath = targetPath };
             }
 
-            await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(BindingName(item.ItemId), provenance.Encode(), DateTimeOffset.UtcNow),
-                cancellationToken).ConfigureAwait(false);
-            await RefreshMembersAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
+            await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private static async ValueTask RetainMetadataAsync(ICloudStateTransaction transaction, CloudDirectoryProvenance provenance,
+        CancellationToken cancellationToken)
+    {
+        byte[] binding;
+        byte[] manifest;
+        try
+        {
+            // Compute both bounded records before replacing either existing record. Recovery
+            // metadata limits must not fail an otherwise valid legacy namespace operation.
+            binding = provenance.Encode();
+            IReadOnlyList<CloudItemState> members = await transaction.Items.ListSubtreeAsync(provenance.RelativePath, cancellationToken).ConfigureAwait(false);
+            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath, members);
+        }
+        catch (CloudDirectoryEvidenceUnavailableException)
+        {
+            await RemoveUnusableMetadataAsync(transaction, provenance.RootItemId, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        await transaction.Checkpoints.UpsertAsync(new(BindingName(provenance.RootItemId), binding, now), cancellationToken).ConfigureAwait(false);
+        await transaction.Checkpoints.UpsertAsync(new(MembersName(provenance.RootItemId), manifest, now), cancellationToken).ConfigureAwait(false);
     }
 
     private static async ValueTask RefreshMembersAsync(ICloudStateTransaction transaction, CloudDirectoryProvenance provenance,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<CloudItemState> members = await transaction.Items.ListSubtreeAsync(provenance.RelativePath, cancellationToken).ConfigureAwait(false);
-        await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(MembersName(provenance.RootItemId),
-            CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath, members), DateTimeOffset.UtcNow),
+        byte[] manifest;
+        try
+        {
+            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath, members);
+        }
+        catch (CloudDirectoryEvidenceUnavailableException)
+        {
+            await RemoveUnusableMetadataAsync(transaction, provenance.RootItemId, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(MembersName(provenance.RootItemId), manifest, DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async ValueTask RemoveUnusableMetadataAsync(ICloudStateTransaction transaction, Guid itemId, CancellationToken cancellationToken)
+    {
+        // Remove only mutable live provenance. Original immutable preparations and receipts,
+        // official item rows, and pending journal entries remain in their caller's transaction.
+        await transaction.Checkpoints.RemoveAsync(BindingName(itemId), cancellationToken).ConfigureAwait(false);
+        await transaction.Checkpoints.RemoveAsync(MembersName(itemId), cancellationToken).ConfigureAwait(false);
     }
 }

@@ -5,6 +5,19 @@ namespace CfSharp.Tests.Persistence;
 public sealed class CloudDirectoryMoveProofTests
 {
     [Fact]
+    public void EvidenceCapacityDoesNotRestrictCanonicalIntentIndexOrRelaxBadPathValidation()
+    {
+        string path = string.Join('\\', Enumerable.Repeat(new string('文', 250), 45));
+        CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Create("remote");
+        Assert.Throws<CloudDirectoryEvidenceUnavailableException>(() => new CloudDirectoryMoveProof(Guid.NewGuid(), Guid.NewGuid(),
+            path, "Target", identity.ItemId, new CloudLocalFileBinding(1, Guid.NewGuid(), Guid.NewGuid()), identity.Encode()));
+        string index = CloudDirectoryMoveEvidence.IntentName(path, "Target");
+        Assert.Equal("cfsharp/namespace/intents/".Length + 64, index.Length);
+        Assert.Equal(index, CloudDirectoryMoveEvidence.IntentName(path.Replace('\\', '/'), "Target"));
+        Assert.Throws<ArgumentException>(() => CloudDirectoryMoveEvidence.IntentName("..\\Docs", "Target"));
+    }
+
+    [Fact]
     public void SerializationOwnsCompleteBindingAndIdentityAndRejectsMalformedLengths()
     {
         CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Create("remote", "revision");

@@ -15,7 +15,8 @@ internal static class CloudDirectoryMoveEvidence
     internal static string ReceiptName(Guid id) => $"cfsharp/namespace/preparations/{id:N}/receipt";
     internal static string IntentName(string source, string target) => "cfsharp/namespace/intents/" +
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
-            CloudDirectoryEvidenceCodec.CanonicalPath(source).ToUpperInvariant() + "\0" + CloudDirectoryEvidenceCodec.CanonicalPath(target))));
+            CloudRemotePathValidation.Canonicalize(source, nameof(source)).Replace('/', '\\').ToUpperInvariant() + "\0" +
+            CloudRemotePathValidation.Canonicalize(target, nameof(target)).Replace('/', '\\'))));
 
     internal static async ValueTask<CloudDirectoryMoveProof?> ReadIntentAsync(ICloudStateStore store,
         string source, string target, CancellationToken cancellationToken)
