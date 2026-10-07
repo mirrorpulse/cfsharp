@@ -1,5 +1,19 @@
 # Placeholders and hydration
 
+## Prepare directory move evidence
+
+Before authorizing an external rename of a managed directory, call
+`await directory.PrepareMoveAsync(destination, name)` and persist the returned proof's `Encode()`
+bytes. Preparation performs no native move and returns only after immutable evidence and the
+known durable subtree membership commit. `CloudDirectoryMoveProof.Decode(bytes)` restores copied
+metadata; it does not make caller-constructed data authoritative. Recovery must still validate the
+library's original preparation in the same store and the actual complete native binding and identity.
+
+Each preparation has its own ID and survives restart independently. Do not substitute a binding
+observed at a renamed target for missing historical evidence. Ordinary directories may use normal
+`MoveToAsync`, but cannot prepare external recovery without a managed placeholder identity and
+complete native IDs. Metadata capture reads no content and holds no continuing lock after returning.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 
