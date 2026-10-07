@@ -28,6 +28,48 @@ The feed normalizes paths relative to the sync root, pairs renames, and persists
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
 only after the application has accepted the batch.
 
+## Scan a finite backlog without acknowledging its head
+
+Use typed scans when some pending changes cannot currently be dispatched. A scan captures the
+highest pending sequence once; each page uses an exclusive lower bound and that inclusive upper
+bound. Reads never ACK a deferred row, wait for a new event, or extend the scan with later writes.
+
+```csharp
+CloudLocalChangeScan scan = await feed.BeginScanAsync(cancellationToken);
+long after = 0;
+while (true)
+{
+    CloudLocalChangePage page = await feed.ReadPageAsync(scan, after, 4, cancellationToken);
+    if (page.RequiresFullRescan)
+    {
+        // Stop dispatch. Replay pending remote creations, reconcile, explicitly acknowledge
+        // the rescan, then begin a new scan from zero.
+        break;
+    }
+
+    await DispatchEligibleChangesAsync(page.Changes, cancellationToken);
+    // ACK only operation IDs whose meaning the application has durably accepted.
+    after = page.LastScannedSequence;
+    if (!page.HasMore)
+    {
+        break;
+    }
+}
+```
+
+The page limit is 1 through 4096 and is independent of the legacy `BatchSize` (default 64).
+Use `LastScannedSequence` directly, without adding one. ACKs between pages can leave sequence
+gaps and can make the next page empty. Empty terminal pages return `ThroughSequence` immediately.
+Restarting the feed or runtime invalidates old scans; create a new scan from zero against the same
+durable store. `StoreScope` identifies the running feed lifetime, not a persisted database identity.
+Scans and pages retain no transaction, reader, native handle, or file content.
+
+Custom stores opt in by implementing `ICloudOperationJournalPaging` on `Operations`; unsupported
+stores throw `NotSupportedException` for scans and retain the existing batch API. Invalid or foreign
+journal payloads throw `CloudLocalChangeJournalException` with the original operation ID and
+sequence, leaving the row pending. Consumers do not need private payload parsing or a copied queue.
+Scheduling across roots and preserving dependencies between changes remain application concerns.
+
 ## Rescan is a normal state
 
 A buffer overflow, watcher error, or ambiguous rename is reported as `RequiresFullRescan`. Stop

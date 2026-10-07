@@ -19,7 +19,7 @@ namespace CfSharp;
 /// intentionally outside CfSharp.
 /// </para>
 /// </remarks>
-public sealed class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
+public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 {
     internal const string CheckpointName = "cfsharp.local-change-feed.v1";
 

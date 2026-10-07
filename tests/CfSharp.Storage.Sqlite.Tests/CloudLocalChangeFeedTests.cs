@@ -1,6 +1,6 @@
 namespace CfSharp.Storage.Sqlite.Tests;
 
-public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
+public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
 {
     private string _temporaryDirectory = null!;
     private string _syncRootPath = null!;
