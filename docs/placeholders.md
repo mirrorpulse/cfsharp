@@ -37,6 +37,19 @@ changes or identity writes. Validation around commit detects changed known desce
 ordinary children without native placeholder identity require a rescan before dispatch. A detected
 post-commit race reports the committed fact and rescan requirement rather than claiming rollback.
 
+`MoveToAsync` prepares supported managed directories before its native move. Retrying the original
+source/destination after a crash uses the retained indexed preparation and performs only verified
+projection. To select a specific externally prepared proof, pass `new CloudMoveOptions(proof)`;
+it must name that exact target. Missing-source directory retries without evidence fail closed.
+Normal ordinary-directory moves and the existing boolean file-replacement options remain available.
+Directory move results and coordination exceptions expose `DirectoryReconciliation`, preserving a
+post-commit race or rescan requirement without inventing a failed commit. The bounded intent index
+may select a newer preparation but never replaces previous immutable proofs or receipts.
+When no explicit preparation exists, recovery may promote the library's retained pre-rename
+directory binding and known membership into an independent immutable preparation. It never
+manufactures historical evidence from a current target. Legacy directories without either source
+of provenance still require explicit preparation while at the original source.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
 

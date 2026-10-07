@@ -19,7 +19,10 @@ public sealed partial class CloudDirectory
     /// </remarks>
     /// <exception cref="ArgumentException">The destination belongs to another file system or the name is invalid.</exception>
     /// <exception cref="InvalidOperationException">The root, destination, or durable/native identity is unsuitable.</exception>
-    /// <exception cref="NotSupportedException">Storage cannot supply the complete native binding.</exception>
+    /// <exception cref="NotSupportedException">
+    /// Storage cannot supply the complete native binding, known subtree metadata exceeds 64 MiB,
+    /// or durable recovery records use an unsupported protocol version.
+    /// </exception>
     /// <exception cref="IOException">Native metadata, path protection, or durable preparation failed.</exception>
     /// <exception cref="OperationCanceledException">Preparation was canceled; no proof is returned.</exception>
     public ValueTask<CloudDirectoryMoveProof> PrepareMoveAsync(CloudDirectory destination, string name,

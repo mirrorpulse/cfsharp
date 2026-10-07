@@ -85,7 +85,7 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
                 // recovery evidence on storage that cannot report them.
                 return;
             }
-            catch (NotSupportedException)
+            catch (CloudDirectoryEvidenceUnavailableException)
             {
                 return;
             }

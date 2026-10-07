@@ -5,13 +5,17 @@ public abstract partial class CloudItem
     /// <summary>Moves or renames this item within the owning sync root.</summary>
     /// <param name="destination">Existing destination directory owned by the same file system.</param>
     /// <param name="name">One valid destination child name.</param>
-    /// <param name="options">Collision behavior, or null for no replacement.</param>
+    /// <param name="options">Collision behavior or an original directory proof, or null for no replacement.</param>
     /// <param name="cancellationToken">
     /// Token observed before the synchronous file-system move and during durable-state work.
     /// </param>
     /// <returns>
     /// A new immutable reference and snapshot at the destination. This reference remains bound to
     /// the old path and is not mutated.
+    /// Managed directory results also expose <see cref="CloudItemMoveResult.DirectoryReconciliation"/>
+    /// and its rescan requirement. Supported managed directories prepare durable evidence before
+    /// moving; a retry uses that retained evidence or the explicitly supplied proof and never moves
+    /// an absent source again. An absent directory without historical evidence fails closed.
     /// </returns>
     /// <exception cref="ArgumentException">
     /// The destination belongs to another file system, the name is invalid, or replacement was
@@ -23,7 +27,8 @@ public abstract partial class CloudItem
     /// </exception>
     /// <exception cref="CloudFilesException">Windows rejects the namespace move.</exception>
     /// <exception cref="CloudItemCoordinationException">
-    /// Windows moved the item but durable subtree paths could not be committed.
+    /// Windows moved the item but durable subtree paths or native completion validation failed.
+    /// Directory recovery facts preserve whether projection actually committed.
     /// </exception>
     /// <exception cref="OperationCanceledException">
     /// Cancellation was observed before the synchronous move or during pre-move state access.

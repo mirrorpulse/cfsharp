@@ -57,6 +57,11 @@ public sealed partial class CloudFileSystem
             root.ItemId, captured.Binding, captured.Identity);
         IReadOnlyList<CloudItemState> members = await transaction.Items.ListSubtreeAsync(source.RelativePath, cancellationToken).ConfigureAwait(false);
         await CloudDirectoryMoveEvidence.PrepareAsync(transaction, proof, members, cancellationToken).ConfigureAwait(false);
+        // The bounded pair index selects the latest preparation for legacy MoveTo retry. It may
+        // change without overwriting any immutable proof, member manifest, or completion receipt.
+        await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
+            CloudDirectoryMoveEvidence.IntentName(proof.SourceRelativePath, proof.DestinationRelativePath),
+            proof.Encode(), DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
         if (!captured.Matches(CloudDirectoryMoveEvidence.Capture(guard.DangerousGetHandle(), SyncRootPath)))
         {
             throw new InvalidOperationException("The native directory changed during preparation.");
