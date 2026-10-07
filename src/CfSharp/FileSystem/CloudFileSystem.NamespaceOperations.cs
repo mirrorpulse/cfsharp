@@ -294,29 +294,8 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        DateTimeOffset updatedAt = DateTimeOffset.UtcNow;
-        foreach (CloudItemState item in sourceEntries)
-        {
-            string suffix = item.RelativePath.Length == sourceRelativePath.Length
-                ? string.Empty
-                : item.RelativePath[sourceRelativePath.Length..]
-                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string updatedPath = suffix.Length == 0
-                ? destinationRelativePath
-                : Path.Combine(destinationRelativePath, suffix);
-            await transaction.Items.UpsertAsync(
-                new CloudItemState(
-                    item.ItemId,
-                    item.RemoteId,
-                    updatedPath,
-                    item.Kind,
-                    item.RemoteRevision,
-                    item.LocalFileId,
-                    item.IsTombstone,
-                    updatedAt),
-                cancellationToken).ConfigureAwait(false);
-        }
-
+        await CloudDirectoryStateProjection.ProjectAsync(transaction, sourceEntries,
+            sourceRelativePath, destinationRelativePath, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
