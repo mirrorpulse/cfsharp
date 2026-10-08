@@ -210,6 +210,7 @@ public sealed partial class CloudFileSystem
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             if (item.Kind is CloudItemKind.File)

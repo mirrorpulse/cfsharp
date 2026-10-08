@@ -65,10 +65,16 @@ An approved external Cloud Files rename can change the namespace while a metadat
 open. Treat the result's native observation as a checked fact at that stage, not a continuing
 namespace lock; honor a later conflict/rescan even when `DurableProjectionCommitted` is true.
 
-`MoveToAsync` prepares supported managed directories before its native move. Retrying the original
-source/destination after a crash uses the retained indexed preparation and performs only verified
-projection. To select a specific externally prepared proof, pass `new CloudMoveOptions(proof)`;
-it must name that exact target. Missing-source directory retries without evidence fail closed.
+`MoveToAsync` prepares supported managed directories before its native move.
+Cancellation is checked again after automatic preparation, including capability fallback,
+immediately before native movement. Cancellation at that boundary may retain committed proof
+metadata while leaving the native source and official item paths unchanged. After native success,
+durable recovery completes independently of caller cancellation.
+
+Retrying the original source/destination after a crash uses the retained indexed preparation and
+performs only verified projection. To select a specific externally prepared proof, pass
+`new CloudMoveOptions(proof)`; it must name that exact target. Missing-source directory retries
+without evidence fail closed.
 Normal ordinary-directory moves and the existing boolean file-replacement options remain available.
 Moving an ordinary ancestor relocates any existing managed descendants' live binding paths and
 rebuilds their mutable membership in the same official subtree transaction. It retains their

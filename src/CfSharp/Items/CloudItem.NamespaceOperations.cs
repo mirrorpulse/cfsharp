@@ -7,7 +7,8 @@ public abstract partial class CloudItem
     /// <param name="name">One valid destination child name.</param>
     /// <param name="options">Collision behavior or an original directory proof, or null for no replacement.</param>
     /// <param name="cancellationToken">
-    /// Token observed before the synchronous file-system move and during durable-state work.
+    /// Token observed during preparation and immediately before the synchronous file-system move,
+    /// including after capability fallback. Durable recovery after native success ignores cancellation.
     /// </param>
     /// <returns>
     /// A new immutable reference and snapshot at the destination. This reference remains bound to
@@ -22,6 +23,8 @@ public abstract partial class CloudItem
     /// durable recovery. Concurrent owner disposal waits for that work; new public operations
     /// are rejected after stopping begins. Cancellation cannot interrupt durable recovery after
     /// the synchronous native move succeeds.
+    /// Cancellation after preparation may leave its metadata committed while the native source
+    /// and official item paths remain unchanged.
     /// Known file paths and retained live membership of source and destination ancestors commit
     /// together, with each ancestor refreshed once. Their native bindings, immutable directory
     /// preparations and receipts, and existing pending journal operations remain unchanged.
