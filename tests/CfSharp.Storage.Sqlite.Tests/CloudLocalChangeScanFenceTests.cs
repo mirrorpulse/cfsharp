@@ -162,9 +162,14 @@ public sealed partial class CloudLocalChangeFeedTests
 
         Assert.True(batch.RequiresFullRescan);
         Assert.Empty(batch.Changes);
-        await using (ICloudStateTransaction verify = await store.BeginTransactionAsync(timeout.Token))
+        // The read budget ends with its completed handoff. A queued test-runner continuation
+        // may resume later; durable verification must not reuse that expired operation token.
+        timeout.Cancel();
+        using CancellationTokenSource verificationTimeout = new(TimeSpan.FromSeconds(10));
+        CancellationToken verificationToken = verificationTimeout.Token;
+        await using (ICloudStateTransaction verify = await store.BeginTransactionAsync(verificationToken))
         {
-            IReadOnlyList<CloudOperationJournalEntry> retained = await verify.Operations.ListAsync(10, timeout.Token);
+            IReadOnlyList<CloudOperationJournalEntry> retained = await verify.Operations.ListAsync(10, verificationToken);
             Assert.Equal(rows.Length, retained.Count);
             for (int index = 0; index < rows.Length; index++)
             {
@@ -178,14 +183,14 @@ public sealed partial class CloudLocalChangeFeedTests
                 Assert.Equal(rows[index].RetryAfter, retained[index].RetryAfter);
             }
 
-            await verify.RollbackAsync(timeout.Token);
+            await verify.RollbackAsync(verificationToken);
         }
 
-        await feed.AcknowledgeFullRescanAsync(timeout.Token);
-        Assert.False((await feed.BeginScanAsync(timeout.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(verificationToken);
+        Assert.False((await feed.BeginScanAsync(verificationToken)).RequiresFullRescan);
         if (backlogSize != 0)
         {
-            CloudLocalChangeBatch recovered = await feed.ReadBatchAsync(timeout.Token);
+            CloudLocalChangeBatch recovered = await feed.ReadBatchAsync(verificationToken);
             Assert.False(recovered.RequiresFullRescan);
             Assert.Equal(rows.Select(row => row.OperationId), recovered.Changes.Select(change => change.OperationId));
             Assert.Equal(rows.Select(row => row.Sequence), recovered.Changes.Select(change => change.Sequence));
