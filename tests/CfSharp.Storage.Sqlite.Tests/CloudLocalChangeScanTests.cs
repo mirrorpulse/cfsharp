@@ -1,3 +1,5 @@
+using Microsoft.Data.Sqlite;
+
 namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
@@ -145,6 +147,64 @@ public sealed partial class CloudLocalChangeFeedTests
         await using ICloudStateTransaction verify = await store.BeginTransactionAsync();
         Assert.Equal(payload, (await verify.Operations.GetAsync(operationId))!.Payload.ToArray());
         await verify.RollbackAsync();
+    }
+
+    [Fact]
+    public async Task SqliteQueryFailureReleasesScanTransactionsAndPreservesOriginalJournal()
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        CloudOperationJournalEntry[] expected = await SeedChangesAsync(store, 2);
+        await using CloudLocalChangeFeed feed = CreateFeed(store, new FakeSource());
+        await feed.StartAsync();
+        CloudLocalChangeScan scan = await feed.BeginScanAsync();
+        await using SqliteConnection repair = new(new SqliteConnectionStringBuilder
+        {
+            DataSource = _databasePath,
+            Pooling = false,
+        }.ToString());
+        await repair.OpenAsync();
+        await SqliteSchema.ConfigureConnectionAsync(repair, 5000, CancellationToken.None);
+        await using SqliteCommand command = repair.CreateCommand();
+        // Interrupt the real SQLite query without deleting or rewriting any journal row.
+        // Restoring the table and reusing this scan must remain possible after both failures.
+        command.CommandText = "ALTER TABLE operations RENAME TO interrupted_operations;";
+        await command.ExecuteNonQueryAsync();
+        try
+        {
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
+            SqliteCloudStateStoreException beginFailure = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(
+                async () => await feed.BeginScanAsync(timeout.Token));
+            SqliteCloudStateStoreException pageFailure = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(
+                async () => await feed.ReadPageAsync(scan, 0, 1, timeout.Token));
+            Assert.Equal(1, beginFailure.SqliteErrorCode);
+            Assert.Equal(1, pageFailure.SqliteErrorCode);
+            Assert.IsType<SqliteException>(beginFailure.InnerException);
+            Assert.IsType<SqliteException>(pageFailure.InnerException);
+        }
+        finally
+        {
+            command.CommandText = "ALTER TABLE interrupted_operations RENAME TO operations;";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        using CancellationTokenSource recoveryTimeout = new(TimeSpan.FromSeconds(30));
+        CloudLocalChangePage page = await feed.ReadPageAsync(scan, 0, 2, recoveryTimeout.Token);
+        Assert.False(page.RequiresFullRescan);
+        Assert.False(page.HasMore);
+        Assert.Equal(expected.Select(row => row.OperationId), page.Changes.Select(change => change.OperationId));
+        await using ICloudStateTransaction verify = await store.BeginTransactionAsync(recoveryTimeout.Token);
+        IReadOnlyList<CloudOperationJournalEntry> retained = await verify.Operations.ListAsync(2, recoveryTimeout.Token);
+        Assert.Equal(expected.Select(row => row.OperationId), retained.Select(row => row.OperationId));
+        for (int index = 0; index < expected.Length; index++)
+        {
+            Assert.Equal(expected[index].Sequence, retained[index].Sequence);
+            Assert.Equal(expected[index].Payload.ToArray(), retained[index].Payload.ToArray());
+            Assert.Equal(expected[index].CreatedAt, retained[index].CreatedAt);
+            Assert.Equal(expected[index].AttemptCount, retained[index].AttemptCount);
+            Assert.Equal(expected[index].RetryAfter, retained[index].RetryAfter);
+        }
+
+        await verify.RollbackAsync(recoveryTimeout.Token);
     }
 
     private static async Task<CloudOperationJournalEntry[]> SeedChangesAsync(ICloudStateStore store, int count)
