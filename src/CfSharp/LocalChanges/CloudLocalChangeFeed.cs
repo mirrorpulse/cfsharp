@@ -22,6 +22,8 @@ namespace CfSharp;
 /// Known file rename paths, retained source/destination ancestor membership, and the new journal
 /// observation commit in one transaction. Ancestor native bindings, immutable directory recovery
 /// evidence and existing pending operations remain unchanged. Shared ancestors are refreshed once.
+/// First discovery of a local file or directory also refreshes captured ancestor membership in
+/// its item/journal transaction, without inferring a managed native binding for that local item.
 /// </para>
 /// </remarks>
 public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
@@ -844,8 +846,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             ? current
             : previous ?? current;
         Guid? itemId = uncertainDirectory is not null ? null : directoryProjection?.ItemId ?? state?.ItemId;
+        bool discovered = state is null && kind != CloudLocalChangeKind.Delete;
 
-        if (uncertainDirectory is null && directoryProjection is null && state is null && kind != CloudLocalChangeKind.Delete)
+        if (uncertainDirectory is null && directoryProjection is null && discovered)
         {
             itemId = Guid.NewGuid();
             state = new CloudItemState(
@@ -875,6 +878,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             {
                 await CloudDirectoryProvenance.RefreshMoveAncestorsAsync(transaction, previousPath.Value.RelativePath,
                     path.RelativePath, cancellationToken).ConfigureAwait(false);
+            }
+            else if (discovered)
+            {
+                await CloudDirectoryProvenance.RefreshProjectionAncestorsAsync(transaction, path.RelativePath,
+                    cancellationToken).ConfigureAwait(false);
             }
         }
 

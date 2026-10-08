@@ -27,6 +27,12 @@ prepared proofs remain unchanged. Removing an identity or reverting a directory 
 provenance. Storage without complete IDs retains existing creation behavior but cannot establish
 this recovery evidence; legacy directories can explicitly prepare while still at their source.
 
+When the local-change feed first discovers a file or directory through creation or another
+observation, its new item row, journal entry and captured ancestors' live membership commit
+together. It does not infer a managed binding for an ordinary local item or modify any immutable
+prepared manifest. A later parent move can project these known rows; ordinary native children
+still retain their separate full-reconciliation requirement.
+
 Known file moves and renames through `MoveToAsync` or the local-change feed update official paths
 and refresh retained live membership of both source and destination ancestors in one transaction.
 Shared ancestors are refreshed once, including for case-only renames and files moved into or out

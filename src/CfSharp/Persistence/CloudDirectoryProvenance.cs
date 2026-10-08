@@ -214,6 +214,14 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             cancellationToken).ConfigureAwait(false);
     }
 
+    internal static async ValueTask RefreshProjectionAncestorsAsync(ICloudStateTransaction transaction,
+        string relativePath, CancellationToken cancellationToken)
+    {
+        HashSet<string> ancestors = new(StringComparer.OrdinalIgnoreCase);
+        AddAncestors(ancestors, relativePath);
+        await RefreshAncestorsAsync(transaction, ancestors, cancellationToken).ConfigureAwait(false);
+    }
+
     internal static async ValueTask RefreshMoveAncestorsAsync(ICloudStateTransaction transaction,
         string sourceRelativePath, string destinationRelativePath, CancellationToken cancellationToken)
     {
