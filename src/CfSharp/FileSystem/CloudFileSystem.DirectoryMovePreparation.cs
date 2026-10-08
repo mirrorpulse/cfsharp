@@ -32,6 +32,12 @@ public sealed partial class CloudFileSystem
             throw new DirectoryNotFoundException("The destination parent does not exist.");
         }
 
+        return await PrepareDirectoryMoveCoreAsync(source, target, operation, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<CloudDirectoryMoveProof> PrepareDirectoryMoveCoreAsync(CloudDirectory source,
+        CloudDirectory target, CloudFileSystemOperationLease operation, CancellationToken cancellationToken)
+    {
         // A metadata-only no-delete guard stabilizes this object during preparation. It does not
         // freeze descendant writes or placeholder identity changes and is never CFAPI protection.
         using SafeFileHandle guard = WindowsFileMetadata.Open(source.FullPath, preventDelete: true);

@@ -17,18 +17,36 @@ public sealed partial class CloudFileSystem
             throw new ArgumentException("Recovery must be called on the original source reference.", nameof(proof));
         }
 
-        CloudDirectoryMoveReconciliationStage stage = CloudDirectoryMoveReconciliationStage.Acquisition;
-        bool observed = false;
-        bool committed = false;
-        int updatedCount = 0;
-        string? durableRootPath = null;
         try
         {
             CloudDirectory target = GetDirectory(proof.DestinationRelativePath);
             using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
                 [CloudItemOperationScope.Subtree(source.FullPath), CloudItemOperationScope.Subtree(target.FullPath)],
                 cancellationToken).ConfigureAwait(false);
-            stage = CloudDirectoryMoveReconciliationStage.PreparationValidation;
+            return await ReconcileDirectoryMoveCoreAsync(source, target, proof, operation, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException exception)
+        {
+            return new(CloudDirectoryMoveReconciliationOutcome.Canceled, CloudDirectoryMoveReconciliationStage.Acquisition,
+                false, false, false, exception, null);
+        }
+        catch (Exception exception)
+        {
+            return new(CloudDirectoryMoveReconciliationOutcome.Failed, CloudDirectoryMoveReconciliationStage.Acquisition,
+                false, false, false, exception, null);
+        }
+    }
+
+    private async ValueTask<CloudDirectoryMoveReconciliationResult> ReconcileDirectoryMoveCoreAsync(CloudDirectory source,
+        CloudDirectory target, CloudDirectoryMoveProof proof, CloudFileSystemOperationLease operation, CancellationToken cancellationToken)
+    {
+        CloudDirectoryMoveReconciliationStage stage = CloudDirectoryMoveReconciliationStage.PreparationValidation;
+        bool observed = false;
+        bool committed = false;
+        int updatedCount = 0;
+        string? durableRootPath = null;
+        try
+        {
             await using (ICloudStateTransaction authentication = await operation.StateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (await CloudDirectoryMoveEvidence.AuthenticateAsync(authentication, proof, cancellationToken).ConfigureAwait(false) is null)

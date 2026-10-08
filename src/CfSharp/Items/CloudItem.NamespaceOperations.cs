@@ -17,6 +17,12 @@ public abstract partial class CloudItem
     /// moving; a retry uses that retained evidence or the explicitly supplied proof and never moves
     /// an absent source again. An absent directory without historical evidence fails closed.
     /// </returns>
+    /// <remarks>
+    /// An admitted move retains its operation lease through preparation, native movement, and
+    /// durable recovery. Concurrent owner disposal waits for that work; new public operations
+    /// are rejected after stopping begins. Cancellation cannot interrupt durable recovery after
+    /// the synchronous native move succeeds.
+    /// </remarks>
     /// <exception cref="ArgumentException">
     /// The destination belongs to another file system, the name is invalid, or replacement was
     /// requested for a directory.
@@ -33,6 +39,7 @@ public abstract partial class CloudItem
     /// <exception cref="OperationCanceledException">
     /// Cancellation was observed before the synchronous move or during pre-move state access.
     /// </exception>
+    /// <exception cref="ObjectDisposedException">The owner began stopping before this move was admitted.</exception>
     public ValueTask<CloudItemMoveResult> MoveToAsync(
         CloudDirectory destination,
         string name,

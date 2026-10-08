@@ -83,8 +83,8 @@ public sealed partial class CloudFileSystem
                 throw new FileNotFoundException("Directory recovery requires original durable pre-move evidence.", item.FullPath);
             }
 
-            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveAsync(directory,
-                directoryProof, cancellationToken).ConfigureAwait(false);
+            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveCoreAsync(directory,
+                (CloudDirectory)movedItem, directoryProof, operation, cancellationToken).ConfigureAwait(false);
             if (IsCompletedDirectoryRecovery(recovery))
             {
                 return await CreateRecoveredMoveResultAsync(item, movedItem, operation.StateStore, recovery).ConfigureAwait(false);
@@ -179,8 +179,8 @@ public sealed partial class CloudFileSystem
         {
             try
             {
-                directoryProof = await PrepareDirectoryMoveAsync(managedDirectory, destination,
-                    validatedName, cancellationToken).ConfigureAwait(false);
+                directoryProof = await PrepareDirectoryMoveCoreAsync(managedDirectory, (CloudDirectory)movedItem,
+                    operation, cancellationToken).ConfigureAwait(false);
             }
             catch (CloudDirectoryEvidenceUnavailableException)
             {
@@ -207,8 +207,11 @@ public sealed partial class CloudFileSystem
 
         if (item is CloudDirectory movedDirectory && directoryProof is not null)
         {
-            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveAsync(movedDirectory,
-                directoryProof, CancellationToken.None).ConfigureAwait(false);
+            // Native success must finish its durable phase under the already admitted lease.
+            // Public reference creation or reacquisition would reject Stopping while disposal
+            // is waiting for this operation to release the still-live store and path scopes.
+            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveCoreAsync(movedDirectory,
+                (CloudDirectory)movedItem, directoryProof, operation, CancellationToken.None).ConfigureAwait(false);
             if (!IsCompletedDirectoryRecovery(recovery))
             {
                 ThrowDirectoryRecoveryFailure(item, movedItem, recovery, nativeMoveIssued: true, CancellationToken.None);

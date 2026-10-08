@@ -34,6 +34,11 @@ state. Accepted renames retain internal path-scope admission during `Stopping`; 
 hold the lifecycle admission lock while awaiting their completion. Concurrent disposal attempts
 remain serialized. It intentionally leaves the sync-root registration installed.
 
+An admitted `MoveToAsync` retains the same operation lease, validated destination reference, and
+state store through directory preparation and recovery. If disposal starts after preparation or
+native movement, it waits for the admitted durable projection and native validation to finish.
+Public operations remain closed during `Stopping`, including calls on existing item references.
+
 ## Unregister only for removal
 
 Call `CloudSyncRoot.Unregister()` only when removing an account or uninstalling the provider. Windows
