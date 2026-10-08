@@ -210,12 +210,19 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
 
-        // A child move changes membership outside the moved subtree as well. Refresh both
-        // ancestor chains from the final official rows in the projection/receipt transaction,
-        // retaining their native bindings and every immutable preparation and receipt.
+        await RefreshMoveAncestorsAsync(transaction, proof.SourceRelativePath, proof.DestinationRelativePath,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static async ValueTask RefreshMoveAncestorsAsync(ICloudStateTransaction transaction,
+        string sourceRelativePath, string destinationRelativePath, CancellationToken cancellationToken)
+    {
+        // A namespace move also changes membership outside the moved item/subtree. Refresh
+        // both ancestor chains from final official rows in the caller's projection transaction,
+        // retaining native bindings and every immutable preparation, manifest and receipt.
         HashSet<string> ancestors = new(StringComparer.OrdinalIgnoreCase);
-        AddAncestors(ancestors, proof.SourceRelativePath);
-        AddAncestors(ancestors, proof.DestinationRelativePath);
+        AddAncestors(ancestors, sourceRelativePath);
+        AddAncestors(ancestors, destinationRelativePath);
         await RefreshAncestorsAsync(transaction, ancestors, cancellationToken).ConfigureAwait(false);
     }
 

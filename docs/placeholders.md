@@ -27,6 +27,15 @@ prepared proofs remain unchanged. Removing an identity or reverting a directory 
 provenance. Storage without complete IDs retains existing creation behavior but cannot establish
 this recovery evidence; legacy directories can explicitly prepare while still at their source.
 
+Known file moves and renames through `MoveToAsync` or the local-change feed update official paths
+and refresh retained live membership of both source and destination ancestors in one transaction.
+Shared ancestors are refreshed once, including for case-only renames and files moved into or out
+of a directory. Existing ancestor native bindings and immutable preparations, manifests and receipts
+remain unchanged, and pending journal operations are not rewritten or acknowledged. If file
+projection fails after the native move, retry the original source/destination, including after
+restart; the facade does not move an absent source again. Feed storage failures still retain their
+original unresolved observation and rescan fence until application reconciliation completes.
+
 After the external move, call `await originalDirectory.ReconcileMoveAsync(proof)` on the original
 source reference. Recovery never issues another native move. It validates the original stored
 preparation, complete native root/directory binding and opaque identity, actual namespace spelling,

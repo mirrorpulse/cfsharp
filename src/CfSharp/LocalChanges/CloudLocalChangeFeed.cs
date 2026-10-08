@@ -18,6 +18,11 @@ namespace CfSharp;
 /// perform a full reconciliation before acknowledging that condition; periodic reconciliation is
 /// intentionally outside CfSharp.
 /// </para>
+/// <para>
+/// Known file rename paths, retained source/destination ancestor membership, and the new journal
+/// observation commit in one transaction. Ancestor native bindings, immutable directory recovery
+/// evidence and existing pending operations remain unchanged. Shared ancestors are refreshed once.
+/// </para>
 /// </remarks>
 public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 {
@@ -866,6 +871,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 isTombstone: kind == CloudLocalChangeKind.Delete,
                 observedAt);
             await transaction.Items.UpsertAsync(updated, cancellationToken).ConfigureAwait(false);
+            if (kind == CloudLocalChangeKind.Move && updated.Kind == CloudItemKind.File && previousPath is not null)
+            {
+                await CloudDirectoryProvenance.RefreshMoveAncestorsAsync(transaction, previousPath.Value.RelativePath,
+                    path.RelativePath, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         LocalChangePayload payload = new(

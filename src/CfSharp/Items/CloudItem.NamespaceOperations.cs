@@ -22,6 +22,11 @@ public abstract partial class CloudItem
     /// durable recovery. Concurrent owner disposal waits for that work; new public operations
     /// are rejected after stopping begins. Cancellation cannot interrupt durable recovery after
     /// the synchronous native move succeeds.
+    /// Known file paths and retained live membership of source and destination ancestors commit
+    /// together, with each ancestor refreshed once. Their native bindings, immutable directory
+    /// preparations and receipts, and existing pending journal operations remain unchanged.
+    /// A failed file projection can be retried on the original source reference and destination,
+    /// including after restart, without issuing another move when the source is already absent.
     /// </remarks>
     /// <exception cref="ArgumentException">
     /// The destination belongs to another file system, the name is invalid, or replacement was
