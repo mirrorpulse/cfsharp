@@ -35,17 +35,34 @@ internal static class CloudDirectoryMoveEvidence
         string source, string target, CancellationToken cancellationToken)
     {
         CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(IntentName(source, target), cancellationToken).ConfigureAwait(false);
+        CloudDirectoryMoveProof? indexed = null;
         if (checkpoint is not null)
         {
-            CloudDirectoryMoveProof indexed = CloudDirectoryMoveProof.Decode(checkpoint.Value.Span);
-            return CloudDirectoryStateProjection.SamePath(source, indexed.SourceRelativePath) && target == indexed.DestinationRelativePath
-                ? indexed : throw new InvalidDataException("The directory intent index identifies another move.");
+            indexed = CloudDirectoryMoveProof.Decode(checkpoint.Value.Span);
+            if (!CloudDirectoryStateProjection.SamePath(source, indexed.SourceRelativePath) || target != indexed.DestinationRelativePath)
+            {
+                throw new InvalidDataException("The directory intent index identifies another move.");
+            }
+
+            CloudStateCheckpoint? receipt = await transaction.Checkpoints.GetAsync(ReceiptName(indexed.ProofId), cancellationToken).ConfigureAwait(false);
+            if (receipt is null)
+            {
+                return indexed;
+            }
+
+            if (!receipt.Value.Span.SequenceEqual(indexed.Encode()))
+            {
+                throw new InvalidDataException("The completed directory intent has an inconsistent receipt.");
+            }
+            // An unfinished preparation always retries its original proof. A completed index
+            // may instead identify an earlier cycle through this path pair; look for retained
+            // pre-rename provenance before falling back to historical replay.
         }
 
         Guid scope = await GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false);
         if (scope == Guid.Empty)
         {
-            return null;
+            return indexed;
         }
 
         CloudItemState? from = await transaction.Items.GetByRelativePathAsync(source, cancellationToken).ConfigureAwait(false);
@@ -67,6 +84,13 @@ internal static class CloudDirectoryMoveEvidence
             if (provenance.StoreScope != scope || provenance.RootItemId != item.ItemId ||
                 !CloudDirectoryStateProjection.SamePath(source, provenance.RelativePath))
             {
+                continue;
+            }
+
+            if (indexed is not null && provenance.RelativePath == indexed.DestinationRelativePath)
+            {
+                // A duplicate completed notification still sees post-move provenance. Exact
+                // spelling matters for case-only renames: it is not evidence of another move.
                 continue;
             }
 
@@ -97,7 +121,7 @@ internal static class CloudDirectoryMoveEvidence
             return prepared;
         }
 
-        return null;
+        return indexed;
     }
 
     internal static async ValueTask<IReadOnlyList<CloudDirectoryMember>?> AuthenticateAsync(ICloudStateTransaction transaction,

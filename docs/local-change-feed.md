@@ -116,6 +116,13 @@ operations pending. Dispatch and acknowledge them only after their meaning has b
 Native changes racing the transaction can require reconciliation even after its projection committed;
 the committed operation retains its original ID and sequence. Native notifications remain advisory.
 
+Renaming a directory, undoing that rename, and repeating the same path pair uses a new preparation
+from the latest retained pre-rename provenance, including after runtime/store restart and for
+case-only renames. The mutable path-pair index points to that new preparation; earlier proofs,
+membership manifests, receipts, and journal rows remain unchanged. Duplicate completed observations
+still replay the original preparation. An explicitly supplied historical proof cannot project a
+later namespace transition using its old receipt.
+
 For an existing partial projection, use the original source directory's `MoveToAsync` or the
 prepared-proof recovery described in [placeholders](placeholders.md). A matching path or remote ID
 alone cannot establish historical native ownership.
