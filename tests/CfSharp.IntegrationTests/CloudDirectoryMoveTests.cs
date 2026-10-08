@@ -104,7 +104,8 @@ internal sealed class DirectoryMoveTestRoot(CloudFileSystem fileSystem, Director
         await fileSystem.StartAsync();
     }
 
-    internal static async Task<DirectoryMoveTestRoot> OpenAsync(ICloudFileContentProvider? provider = null, bool legacyState = false)
+    internal static async Task<DirectoryMoveTestRoot> OpenAsync(ICloudFileContentProvider? provider = null, bool legacyState = false,
+        CloudPopulationPolicy populationPolicy = CloudPopulationPolicy.Partial)
     {
         string area = Path.Combine(Path.GetTempPath(), "CfSharp-directory-move-tests", Guid.NewGuid().ToString("N"));
         string rootPath = Path.Combine(area, "root");
@@ -118,7 +119,7 @@ internal sealed class DirectoryMoveTestRoot(CloudFileSystem fileSystem, Director
         CloudFileSystem fileSystem = CloudFileSystem.CreateBuilder(rootPath).WithStateStore(factory)
             .WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Directory Move", "1.0-test")
                 .WithProviderId(providerId).WithSyncRootIdentity(providerId.ToByteArray())
-                .WithHydrationPolicy(CloudHydrationPolicy.Progressive).WithPopulationPolicy(CloudPopulationPolicy.Partial)
+                .WithHydrationPolicy(CloudHydrationPolicy.Progressive).WithPopulationPolicy(populationPolicy)
                 .WithRootMarkedInSync().Build()).WithContentProvider(provider ?? new EmptyContentProvider()).Build();
         bool registered = false;
         try
@@ -169,14 +170,16 @@ internal sealed class DirectoryMoveFaultStore(ICloudStateStore inner) : ICloudSt
 {
     internal Action? BeforeCommit { get; set; }
     internal Action? AfterCommit { get; set; }
+    internal Action<string>? SubtreeRead { get; set; }
+    internal Action<string>? CheckpointWritten { get; set; }
     public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
         new Transaction(await inner.BeginTransactionAsync(cancellationToken), this);
     public ValueTask DisposeAsync() => inner.DisposeAsync();
 
     private sealed class Transaction(ICloudStateTransaction transaction, DirectoryMoveFaultStore owner) : ICloudStateTransaction
     {
-        public ICloudItemStateRepository Items => transaction.Items;
-        public ICloudCheckpointRepository Checkpoints => transaction.Checkpoints;
+        public ICloudItemStateRepository Items => owner.SubtreeRead is null ? transaction.Items : new ObservedItems(transaction.Items, owner);
+        public ICloudCheckpointRepository Checkpoints => owner.CheckpointWritten is null ? transaction.Checkpoints : new ObservedCheckpoints(transaction.Checkpoints, owner);
         public ICloudOperationJournal Operations => transaction.Operations;
         public ICloudConflictRepository Conflicts => transaction.Conflicts;
         public ICloudRemoteBatchRepository RemoteBatches => transaction.RemoteBatches;
@@ -190,5 +193,38 @@ internal sealed class DirectoryMoveFaultStore(ICloudStateStore inner) : ICloudSt
 
         public ValueTask RollbackAsync(CancellationToken cancellationToken = default) => transaction.RollbackAsync(cancellationToken);
         public ValueTask DisposeAsync() => transaction.DisposeAsync();
+    }
+
+    private sealed class ObservedItems(ICloudItemStateRepository items, DirectoryMoveFaultStore owner) : ICloudItemStateRepository
+    {
+        public ValueTask<CloudItemState?> GetByItemIdAsync(Guid itemId, CancellationToken cancellationToken = default) =>
+            items.GetByItemIdAsync(itemId, cancellationToken);
+        public ValueTask<CloudItemState?> GetByRemoteIdAsync(string remoteId, CancellationToken cancellationToken = default) =>
+            items.GetByRemoteIdAsync(remoteId, cancellationToken);
+        public ValueTask<CloudItemState?> GetByRelativePathAsync(string relativePath, CancellationToken cancellationToken = default) =>
+            items.GetByRelativePathAsync(relativePath, cancellationToken);
+        public ValueTask<IReadOnlyList<CloudItemState>> ListSubtreeAsync(string relativePath, CancellationToken cancellationToken = default)
+        {
+            owner.SubtreeRead?.Invoke(relativePath);
+            return items.ListSubtreeAsync(relativePath, cancellationToken);
+        }
+
+        public ValueTask UpsertAsync(CloudItemState item, CancellationToken cancellationToken = default) => items.UpsertAsync(item, cancellationToken);
+        public ValueTask RemoveAsync(Guid itemId, CancellationToken cancellationToken = default) => items.RemoveAsync(itemId, cancellationToken);
+    }
+
+    private sealed class ObservedCheckpoints(ICloudCheckpointRepository checkpoints, DirectoryMoveFaultStore owner) : ICloudCheckpointRepository
+    {
+        public ValueTask<CloudStateCheckpoint?> GetAsync(string name, CancellationToken cancellationToken = default) =>
+            checkpoints.GetAsync(name, cancellationToken);
+        public ValueTask<IReadOnlyList<CloudStateCheckpoint>> ListAsync(string namePrefix, CancellationToken cancellationToken = default) =>
+            checkpoints.ListAsync(namePrefix, cancellationToken);
+        public ValueTask UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken = default)
+        {
+            owner.CheckpointWritten?.Invoke(checkpoint.Name);
+            return checkpoints.UpsertAsync(checkpoint, cancellationToken);
+        }
+
+        public ValueTask RemoveAsync(string name, CancellationToken cancellationToken = default) => checkpoints.RemoveAsync(name, cancellationToken);
     }
 }

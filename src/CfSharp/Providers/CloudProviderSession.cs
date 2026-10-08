@@ -923,12 +923,9 @@ public sealed class CloudProviderSession : IDisposable, IAsyncDisposable
                 _shutdown.Token).ConfigureAwait(false);
         }
 
-        foreach (CloudPlaceholderSpec child in page.Children)
-        {
-            string relativePath = relativeDirectory.Length == 0 ? child.Name : Path.Combine(relativeDirectory, child.Name);
-            await CloudDirectoryProvenance.RetainProjectionAsync(transaction, _syncRootPath,
-                relativePath, child.Kind, _shutdown.Token).ConfigureAwait(false);
-        }
+        await CloudDirectoryProvenance.RetainProjectionsAsync(transaction, _syncRootPath,
+            page.Children.Select(child => (relativeDirectory.Length == 0 ? child.Name : Path.Combine(relativeDirectory, child.Name), child.Kind)),
+            _shutdown.Token).ConfigureAwait(false);
 
         string checkpointName = GetDirectoryCheckpointName(request.NormalizedPath);
         if (page.ContinuationToken is null)

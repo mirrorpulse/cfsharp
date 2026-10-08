@@ -308,11 +308,8 @@ public sealed partial class CloudFileSystem
                 CancellationToken.None).ConfigureAwait(false);
         }
 
-        foreach (PlaceholderCreationWorkEntry entry in entries)
-        {
-            await CloudDirectoryProvenance.RetainProjectionAsync(transaction, entry.Item.SyncRootPath,
-                entry.Item.RelativePath, entry.Specification.Kind, CancellationToken.None).ConfigureAwait(false);
-        }
+        await CloudDirectoryProvenance.RetainProjectionsAsync(transaction, entries[0].Item.SyncRootPath,
+            entries.Select(static entry => (entry.Item.RelativePath, entry.Specification.Kind)), CancellationToken.None).ConfigureAwait(false);
 
         await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
     }

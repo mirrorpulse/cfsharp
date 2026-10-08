@@ -16,7 +16,10 @@ complete native IDs. Metadata capture reads no content and holds no continuing l
 
 Directory creation, conversion, identity replacement, remote creation, and provider population
 retain native provenance in the same transaction as their official item rows. Adding children
-refreshes known membership of captured ancestors without enumerating native subtrees. Immutable
+refreshes known membership of captured ancestors without enumerating native subtrees. Batch creation
+and each provider population page capture new directory bindings first, then refresh each affected
+directory's membership once from all item rows in the same transaction, including shared ancestors.
+The existing recovery metadata limits still apply. Immutable
 prepared proofs remain unchanged. Removing an identity or reverting a directory removes its live
 provenance. Storage without complete IDs retains existing creation behavior but cannot establish
 this recovery evidence; legacy directories can explicitly prepare while still at their source.

@@ -68,48 +68,54 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
     }
 
     [SupportedOSPlatform("windows10.0.16299")]
-    internal static async ValueTask RetainProjectionAsync(ICloudStateTransaction transaction, string syncRootPath,
-        string relativePath, CloudItemKind kind, CancellationToken cancellationToken)
+    internal static ValueTask RetainProjectionAsync(ICloudStateTransaction transaction, string syncRootPath,
+        string relativePath, CloudItemKind kind, CancellationToken cancellationToken) =>
+        RetainProjectionsAsync(transaction, syncRootPath, [(relativePath, kind)], cancellationToken);
+
+    [SupportedOSPlatform("windows10.0.16299")]
+    internal static async ValueTask RetainProjectionsAsync(ICloudStateTransaction transaction, string syncRootPath,
+        IEnumerable<(string RelativePath, CloudItemKind Kind)> projections, CancellationToken cancellationToken)
     {
-        if (kind == CloudItemKind.Directory && relativePath.Length != 0)
+        Dictionary<string, CloudDirectoryProvenance> captured = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> ancestors = new(StringComparer.OrdinalIgnoreCase);
+        foreach ((string relativePath, CloudItemKind kind) in projections)
         {
-            using SafeFileHandle guard = WindowsFileMetadata.Open(Path.Combine(syncRootPath, relativePath), preventDelete: true);
-            DirectoryNativeObservation captured;
-            try
+            if (kind == CloudItemKind.Directory && relativePath.Length != 0 && !captured.ContainsKey(relativePath))
             {
-                captured = CloudDirectoryMoveEvidence.Capture(guard.DangerousGetHandle(), syncRootPath);
-            }
-            catch (Win32Exception exception) when (exception.NativeErrorCode is 1 or 50 or 87)
-            {
-                // Complete file IDs are optional for existing creation APIs. Do not fabricate
-                // recovery evidence on storage that cannot report them.
-                return;
-            }
-            catch (CloudDirectoryEvidenceUnavailableException)
-            {
-                return;
+                CloudDirectoryProvenance? provenance = await CaptureProjectionAsync(transaction, syncRootPath,
+                    relativePath, cancellationToken).ConfigureAwait(false);
+                if (provenance is null)
+                {
+                    continue;
+                }
+
+                captured.Add(relativePath, provenance);
             }
 
-            CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Decode(captured.Identity);
-            CloudItemState? item = await transaction.Items.GetByItemIdAsync(identity.ItemId, cancellationToken).ConfigureAwait(false);
-            if (item is null || item.Kind != CloudItemKind.Directory || item.IsTombstone || item.RemoteId != identity.RemoteId ||
-                !string.Equals(item.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(captured.ActualPath, Path.Combine(syncRootPath, relativePath), StringComparison.OrdinalIgnoreCase))
+            string? parent = Path.GetDirectoryName(relativePath);
+            while (!string.IsNullOrEmpty(parent) && ancestors.Add(parent))
             {
-                throw new InvalidOperationException("Directory provenance does not match the projected native item.");
+                parent = Path.GetDirectoryName(parent);
             }
+        }
 
-            Guid scope = await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, true, cancellationToken).ConfigureAwait(false);
-            CloudDirectoryProvenance provenance = new(Guid.NewGuid(), scope, item.ItemId,
-                Path.GetRelativePath(syncRootPath, captured.ActualPath), captured.Binding, captured.Identity);
+        // All item rows must already be written. Capture each new native binding first, then
+        // encode each affected directory's complete membership once in this transaction. A
+        // newly captured directory can also be another entry's ancestor; do not scan it twice.
+        foreach (CloudDirectoryProvenance provenance in captured.Values)
+        {
             await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
 
-        // Refresh known membership of already captured ancestors using official transactional
-        // rows, without traversing native subtrees or manufacturing a new historical binding.
-        string? parent = Path.GetDirectoryName(relativePath);
-        while (!string.IsNullOrEmpty(parent))
+        // Refresh existing bindings without traversing native subtrees or manufacturing new
+        // historical evidence. Shared ancestors of siblings use the same final row snapshot.
+        foreach (string parent in ancestors)
         {
+            if (captured.ContainsKey(parent))
+            {
+                continue;
+            }
+
             CloudItemState? directory = await transaction.Items.GetByRelativePathAsync(parent, cancellationToken).ConfigureAwait(false);
             if (directory is { Kind: CloudItemKind.Directory, IsTombstone: false })
             {
@@ -124,9 +130,41 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
                     }
                 }
             }
-
-            parent = Path.GetDirectoryName(parent);
         }
+    }
+
+    [SupportedOSPlatform("windows10.0.16299")]
+    private static async ValueTask<CloudDirectoryProvenance?> CaptureProjectionAsync(ICloudStateTransaction transaction,
+        string syncRootPath, string relativePath, CancellationToken cancellationToken)
+    {
+        using SafeFileHandle guard = WindowsFileMetadata.Open(Path.Combine(syncRootPath, relativePath), preventDelete: true);
+        DirectoryNativeObservation captured;
+        try
+        {
+            captured = CloudDirectoryMoveEvidence.Capture(guard.DangerousGetHandle(), syncRootPath);
+        }
+        catch (Win32Exception exception) when (exception.NativeErrorCode is 1 or 50 or 87)
+        {
+            // Complete file IDs are optional for existing creation APIs. Do not fabricate
+            // recovery evidence on storage that cannot report them.
+            return null;
+        }
+        catch (CloudDirectoryEvidenceUnavailableException)
+        {
+            return null;
+        }
+
+        CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Decode(captured.Identity);
+        CloudItemState? item = await transaction.Items.GetByItemIdAsync(identity.ItemId, cancellationToken).ConfigureAwait(false);
+        if (item is null || item.Kind != CloudItemKind.Directory || item.IsTombstone || item.RemoteId != identity.RemoteId ||
+            !string.Equals(item.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(captured.ActualPath, Path.Combine(syncRootPath, relativePath), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Directory provenance does not match the projected native item.");
+        }
+
+        Guid scope = await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, true, cancellationToken).ConfigureAwait(false);
+        return new(Guid.NewGuid(), scope, item.ItemId, Path.GetRelativePath(syncRootPath, captured.ActualPath), captured.Binding, captured.Identity);
     }
 
     internal static async ValueTask ProjectPathsAsync(ICloudStateTransaction transaction, CloudDirectoryMoveProof proof,
