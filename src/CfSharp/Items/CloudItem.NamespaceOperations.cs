@@ -27,6 +27,9 @@ public abstract partial class CloudItem
     /// preparations and receipts, and existing pending journal operations remain unchanged.
     /// A failed file projection can be retried on the original source reference and destination,
     /// including after restart, without issuing another move when the source is already absent.
+    /// An ordinary directory move also relocates existing managed descendants' live provenance
+    /// and rebuilds their membership in that path transaction, retaining their native identities
+    /// and immutable recovery history. It does not create evidence for an ordinary directory.
     /// </remarks>
     /// <exception cref="ArgumentException">
     /// The destination belongs to another file system, the name is invalid, or replacement was

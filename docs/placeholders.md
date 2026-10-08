@@ -70,6 +70,11 @@ source/destination after a crash uses the retained indexed preparation and perfo
 projection. To select a specific externally prepared proof, pass `new CloudMoveOptions(proof)`;
 it must name that exact target. Missing-source directory retries without evidence fail closed.
 Normal ordinary-directory moves and the existing boolean file-replacement options remain available.
+Moving an ordinary ancestor relocates any existing managed descendants' live binding paths and
+rebuilds their mutable membership in the same official subtree transaction. It retains their
+native bindings and immutable recovery history, so later external descendant moves can use
+pre-rename provenance, including after restart. Directories without captured bindings acquire no
+recovery evidence from this path; absent ordinary sources still require historical pre-move proof.
 Directory move results and coordination exceptions expose `DirectoryReconciliation`, preserving a
 post-commit race or rescan requirement without inventing a failed commit. The bounded intent index
 may select a newer preparation but never replaces previous immutable proofs or receipts.

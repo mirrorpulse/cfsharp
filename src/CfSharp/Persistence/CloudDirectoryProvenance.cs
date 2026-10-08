@@ -214,6 +214,40 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             cancellationToken).ConfigureAwait(false);
     }
 
+    internal static async ValueTask RelocateRetainedPathsAsync(ICloudStateTransaction transaction,
+        IReadOnlyList<CloudItemState> sourceEntries, string sourceRelativePath,
+        string destinationRelativePath, CancellationToken cancellationToken)
+    {
+        Guid? scope = null;
+        foreach (CloudItemState item in sourceEntries.Where(item => item.Kind == CloudItemKind.Directory && !item.IsTombstone))
+        {
+            CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(BindingName(item.ItemId), cancellationToken).ConfigureAwait(false);
+            if (checkpoint is null)
+            {
+                continue;
+            }
+
+            scope ??= await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false);
+            CloudDirectoryProvenance provenance = Decode(checkpoint.Value);
+            string targetPath = CloudDirectoryStateProjection.MapPath(item.RelativePath, sourceRelativePath, destinationRelativePath);
+            if (provenance.RootItemId != item.ItemId || provenance.StoreScope != scope ||
+                (!CloudDirectoryStateProjection.SamePath(provenance.RelativePath, item.RelativePath) &&
+                 !CloudDirectoryStateProjection.SamePath(provenance.RelativePath, targetPath)))
+            {
+                throw new CloudDirectoryProjectionConflictException("Retained directory provenance belongs to another namespace location.");
+            }
+
+            // Moving an ordinary ancestor changes existing managed descendants' locations,
+            // not their native identities. Rebuild only mutable records from final item rows;
+            // directories without retained bindings must not acquire fabricated provenance.
+            await RetainMetadataAsync(transaction, provenance with { EvidenceId = Guid.NewGuid(), RelativePath = targetPath },
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        await RefreshMoveAncestorsAsync(transaction, sourceRelativePath, destinationRelativePath,
+            cancellationToken).ConfigureAwait(false);
+    }
+
     internal static async ValueTask RefreshProjectionAncestorsAsync(ICloudStateTransaction transaction,
         string relativePath, CancellationToken cancellationToken)
     {

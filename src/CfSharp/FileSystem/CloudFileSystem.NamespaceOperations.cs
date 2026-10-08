@@ -433,8 +433,8 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         await CloudDirectoryStateProjection.ProjectAsync(transaction, sourceEntries,
             sourceRelativePath, destinationRelativePath, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
-        await CloudDirectoryProvenance.RefreshMoveAncestorsAsync(transaction, sourceRelativePath,
-            destinationRelativePath, cancellationToken).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RelocateRetainedPathsAsync(transaction, sourceEntries,
+            sourceRelativePath, destinationRelativePath, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
