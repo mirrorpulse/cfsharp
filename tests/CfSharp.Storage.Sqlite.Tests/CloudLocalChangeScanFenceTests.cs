@@ -1,3 +1,6 @@
+using System.Reflection;
+using System.Threading.Channels;
+
 namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
@@ -50,6 +53,74 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.Empty(page.Changes);
         Assert.Equal(0, page.LastScannedSequence);
         Assert.True(page.HasMore);
+    }
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(false, 2)]
+    [InlineData(true, 0)]
+    [InlineData(true, 2)]
+    public async Task PersistedLossAtBatchTransactionReleaseWithholdsBacklog(bool watcherError, int backlogSize)
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        CloudOperationJournalEntry[] rows = await SeedChangesAsync(store, backlogSize);
+        RaceStore raceStore = new(store);
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(raceStore, source);
+        await feed.StartAsync();
+        Channel<bool> availability = (Channel<bool>)typeof(CloudLocalChangeFeed)
+            .GetField("_availability", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(feed)!;
+        Assert.False(availability.Reader.TryPeek(out _));
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
+        raceStore.AfterRollback = async () =>
+        {
+            await source.EmitAsync(new(watcherError ? LocalChangeSourceAction.Error : LocalChangeSourceAction.Overflow,
+                string.Empty, watcherError ? 5 : 0));
+            // The production worker publishes availability only after both committing its loss
+            // marker and marking that generation persisted. Preserve the signal for empty reads,
+            // but hold this older snapshot until the vulnerable handoff is complete.
+            Assert.True(await availability.Reader.WaitToReadAsync(timeout.Token));
+            await using ICloudStateTransaction persisted = await store.BeginTransactionAsync(timeout.Token);
+            Assert.True(LocalChangeCheckpoint.Decode((await persisted.Checkpoints
+                .GetAsync(CloudLocalChangeFeed.CheckpointName, timeout.Token))!.Value).RequiresFullRescan);
+            await persisted.RollbackAsync(timeout.Token);
+        };
+
+        CloudLocalChangeBatch batch = await feed.ReadBatchAsync(timeout.Token);
+        Assert.True(batch.RequiresFullRescan);
+        Assert.Empty(batch.Changes);
+        await using (ICloudStateTransaction verify = await store.BeginTransactionAsync(timeout.Token))
+        {
+            IReadOnlyList<CloudOperationJournalEntry> retained = await verify.Operations.ListAsync(10, timeout.Token);
+            Assert.Equal(rows.Length, retained.Count);
+            for (int index = 0; index < rows.Length; index++)
+            {
+                Assert.Equal(rows[index].OperationId, retained[index].OperationId);
+                Assert.Equal(rows[index].Sequence, retained[index].Sequence);
+                Assert.Equal(rows[index].Kind, retained[index].Kind);
+                Assert.Equal(rows[index].ItemId, retained[index].ItemId);
+                Assert.Equal(rows[index].Payload.ToArray(), retained[index].Payload.ToArray());
+                Assert.Equal(rows[index].CreatedAt, retained[index].CreatedAt);
+                Assert.Equal(rows[index].AttemptCount, retained[index].AttemptCount);
+                Assert.Equal(rows[index].RetryAfter, retained[index].RetryAfter);
+            }
+
+            await verify.RollbackAsync(timeout.Token);
+        }
+
+        await feed.AcknowledgeFullRescanAsync(timeout.Token);
+        Assert.False((await feed.BeginScanAsync(timeout.Token)).RequiresFullRescan);
+        if (backlogSize != 0)
+        {
+            CloudLocalChangeBatch recovered = await feed.ReadBatchAsync(timeout.Token);
+            Assert.False(recovered.RequiresFullRescan);
+            Assert.Equal(rows.Select(row => row.OperationId), recovered.Changes.Select(change => change.OperationId));
+            Assert.Equal(rows.Select(row => row.Sequence), recovered.Changes.Select(change => change.Sequence));
+            Assert.Equal(rows.Select(row => LocalChangePayload.Decode(row.Payload).RelativePath),
+                recovered.Changes.Select(change => change.RelativePath));
+            Assert.Equal(rows.Select(row => LocalChangePayload.Decode(row.Payload).ObservedAt),
+                recovered.Changes.Select(change => change.ObservedAt));
+        }
     }
 
     [Fact]

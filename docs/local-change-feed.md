@@ -95,6 +95,10 @@ observations are checked in the same transaction as each page. Replay creation r
 acknowledging reconciliation. A loss received while the watcher worker waits for the store also
 blocks pages immediately. Reading a page never clears recovery markers.
 
+Legacy batch reads also withhold their already-read backlog if loss arrives during the read,
+even when the worker commits the rescan marker before the reading transaction returns.
+The original journal remains pending until explicitly acknowledged after reconciliation.
+
 An overflow/error or a full-rescan acknowledgement invalidates previously captured scans even
 after the durable marker is cleared. Begin a new scan after recovery. If a new loss races
 `AcknowledgeFullRescanAsync`, it either rejects acknowledgement with `InvalidOperationException`

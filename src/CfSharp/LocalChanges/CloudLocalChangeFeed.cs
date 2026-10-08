@@ -120,6 +120,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Token that cancels the read without acknowledging anything.</param>
     /// <returns>An ordered bounded batch. The batch is immutable and safe to retain.</returns>
+    /// <remarks>
+    /// Loss received during the journal read withholds changes and requires full reconciliation,
+    /// even if the worker persists its marker before the read finishes. Reading does not clear
+    /// that marker or acknowledge any pending operation.
+    /// </remarks>
     /// <exception cref="InvalidOperationException">The feed has not been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
     public async ValueTask<CloudLocalChangeBatch> ReadBatchAsync(
@@ -129,6 +134,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         while (true)
         {
             ThrowIfFailed();
+            long generation = Volatile.Read(ref _lossGeneration);
             await using ICloudStateTransaction transaction = await _stateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -138,7 +144,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             ThrowIfFailed();
-            bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss;
+            // Persistence can clear HasUnpersistedLoss after this snapshot was read. Retain
+            // the generation boundary so that handoff cannot expose the earlier backlog.
+            bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
+                generation != Volatile.Read(ref _lossGeneration);
             if (rescan && (creation || operations.Count != 0 ||
                 Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0))
             {
