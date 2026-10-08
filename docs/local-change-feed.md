@@ -3,6 +3,13 @@
 The local change feed turns Windows directory notifications into an explicit, bounded application
 queue. It is a coordination aid, not a lossless replacement for reconciliation.
 
+Disposal stops notification production and drains accepted events while the state store remains
+open, including queue-tail renames during owner shutdown. If draining times out or fails, the feed
+persists a full-rescan marker before canceling its worker. Persisting that fence can wait for an
+active store transaction beyond the worker's `ShutdownTimeout`. If fence persistence fails, disposal
+reports the failure, leaves the worker uncanceled, and retains the owner's store for a disposal retry;
+the retry must complete the drain and persist the fence before the store is closed.
+
 ## Start one feed per sync root
 
 ```csharp

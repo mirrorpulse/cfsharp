@@ -378,6 +378,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     }
 
     /// <summary>Stops the watcher and releases all feed-owned resources.</summary>
+    /// <remarks>
+    /// Accepted notifications drain before worker cancellation. A failed or timed-out drain persists
+    /// a full-rescan fence before cancellation; this store transaction may outlast the worker timeout.
+    /// If fence persistence fails, the worker remains uncanceled and disposal must be retried while
+    /// the state store remains open. Concurrent disposal callers wait for worker cleanup.
+    /// </remarks>
     /// <exception cref="TimeoutException">
     /// The processor did not stop within the configured shutdown timeout. Deferred cleanup keeps
     /// feed-owned resources alive until the processor exits.
@@ -387,10 +393,16 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             await _disposeCompletion.Task.ConfigureAwait(false);
+            if (HasUnpersistedLoss)
+            {
+                await MarkRescanRequiredAsync(CancellationToken.None).ConfigureAwait(false);
+                _onDisposed?.Invoke(this);
+            }
             return;
         }
 
         Exception? failure = null;
+        bool cancelProcessor = true;
         try
         {
             await _source.DisposeAsync().ConfigureAwait(false);
@@ -408,17 +420,35 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             {
                 await _processorTask.WaitAsync(_options.ShutdownTimeout).ConfigureAwait(false);
             }
-        }
-        catch (OperationCanceledException)
-        {
+
+            if (HasUnpersistedLoss)
+            {
+                await MarkRescanRequiredAsync(CancellationToken.None).ConfigureAwait(false);
+            }
         }
         catch (Exception exception)
         {
             failure = exception;
+            // Cancellation can abandon a notification before it creates a journal row. Fence
+            // durable consumers first, while the owner still keeps the store alive. If persistence
+            // fails, leave the worker uncanceled and retain ownership for a later marker retry.
+            cancelProcessor = false;
+            try
+            {
+                await MarkRescanRequiredAsync(CancellationToken.None).ConfigureAwait(false);
+                cancelProcessor = true;
+            }
+            catch (Exception markerFailure)
+            {
+                failure = new AggregateException("The local-change feed could not persist shutdown loss.", exception, markerFailure);
+            }
         }
         finally
         {
-            _shutdown.Cancel();
+            if (cancelProcessor)
+            {
+                _shutdown.Cancel();
+            }
             _sourceEvents.Writer.TryComplete();
             if (_processorTask is null || _processorTask.IsCompleted)
             {
@@ -457,7 +487,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     {
         _availability.Writer.TryComplete();
         _shutdown.Dispose();
-        _onDisposed?.Invoke(this);
+        if (!HasUnpersistedLoss)
+        {
+            _onDisposed?.Invoke(this);
+        }
         _disposeCompletion.TrySetResult(null);
     }
 

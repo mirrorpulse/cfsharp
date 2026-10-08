@@ -39,6 +39,7 @@ namespace CfSharp;
 public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
 {
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
+    private readonly SemaphoreSlim _disposalGate = new(1, 1);
     private readonly CloudItemOperationCoordinator _operationCoordinator = new();
     private readonly AsyncLocal<CloudFileSystemOperationLease?> _operationContext = new();
     private readonly ICloudStateStoreFactory _stateStoreFactory;
@@ -116,7 +117,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                         }
                     }
                 },
-                async (scopes, cancellationToken) => await AcquireOperationAsync(scopes, cancellationToken).ConfigureAwait(false));
+                async (scopes, cancellationToken) => await AcquireOperationCoreAsync(
+                    scopes, allowLocalChangeDrain: true, cancellationToken).ConfigureAwait(false));
         }
     }
 
@@ -311,7 +313,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// context should call <see cref="DisposeAsync"/> instead and await it.
     /// </remarks>
     /// <exception cref="AggregateException">
-    /// More than one owned resource failed during disposal. Every resource is still attempted.
+    /// More than one owned resource failed during disposal. Resources are attempted in dependency
+    /// order; an unfinished or failed feed drain keeps its dependent resources alive for a retry.
     /// Failed resources remain owned so disposal can be retried.
     /// </exception>
     public void Dispose()
@@ -325,48 +328,53 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// An operation that completes after admitted item operations drain and the provider session
     /// and state store terminate.
     /// </returns>
+    /// <remarks>
+    /// Public operation admission stops immediately. Accepted local notifications retain internal
+    /// path-scope admission until their feed drains, without holding the lifecycle admission lock.
+    /// A failed feed drain retains dependent resources for a later disposal attempt.
+    /// </remarks>
     /// <exception cref="AggregateException">
-    /// More than one owned resource failed during disposal. Every resource is still attempted.
+    /// More than one owned resource failed during disposal. Resources are attempted in dependency order.
     /// Failed resources remain owned so disposal can be retried.
     /// </exception>
     public async ValueTask DisposeAsync()
     {
-        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+        // Serialize disposal attempts independently of admission. The feed must acquire the
+        // lifecycle gate while draining accepted renames, including after public admission stops.
+        await _disposalGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (LifecycleState is CloudFileSystemLifecycleState.Disposed)
+            await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+            try
             {
-                return;
+                if (LifecycleState is CloudFileSystemLifecycleState.Disposed)
+                {
+                    return;
+                }
+
+                Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Stopping);
+                _contentConfirmationStopping.Cancel();
             }
-
-            Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Stopping);
-            _contentConfirmationStopping.Cancel();
-        }
-        finally
-        {
-            _lifecycleGate.Release();
-        }
-
-        Task operationsDrained = Volatile.Read(ref _activeOperations) == 0
-            ? Task.CompletedTask
-            : Volatile.Read(ref _operationsDrained)?.Task ?? Task.CompletedTask;
-        await operationsDrained.ConfigureAwait(false);
-
-        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            if (LifecycleState is CloudFileSystemLifecycleState.Disposed)
+            finally
             {
-                return;
+                _lifecycleGate.Release();
             }
 
             IReadOnlyList<Exception> failures = await DisposeOwnedResourcesAsync()
                 .ConfigureAwait(false);
-            if (failures.Count == 0)
+            await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+            try
             {
-                _contentConfirmationStopping.Dispose();
-                Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Disposed);
-                GC.SuppressFinalize(this);
+                if (failures.Count == 0)
+                {
+                    _contentConfirmationStopping.Dispose();
+                    Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Disposed);
+                    GC.SuppressFinalize(this);
+                }
+            }
+            finally
+            {
+                _lifecycleGate.Release();
             }
 
             if (failures.Count == 1)
@@ -383,7 +391,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         }
         finally
         {
-            _lifecycleGate.Release();
+            _disposalGate.Release();
         }
     }
 
@@ -408,6 +416,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
 
     private async ValueTask<CloudFileSystemOperationLease> AcquireOperationCoreAsync(
         IEnumerable<CloudItemOperationScope> scopes,
+        bool allowLocalChangeDrain = false,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(scopes);
@@ -416,7 +425,13 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            EnsureStarted();
+            // Only the owned feed receives this internal admission path. Public operations
+            // remain rejected in Stopping, while accepted notifications retain path exclusion
+            // and a store-lifetime lease until the feed has completely drained.
+            if (!allowLocalChangeDrain || LifecycleState != CloudFileSystemLifecycleState.Stopping || _stateStore is null)
+            {
+                EnsureStarted();
+            }
             CloudFileSystemOperationLease? currentContext = _operationContext.Value;
             if (currentContext is not null &&
                 currentContext.Owner is not null &&
@@ -572,35 +587,29 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
 
         if (localChangeFeed is not null)
         {
-            bool disposed = false;
             try
             {
                 await localChangeFeed.DisposeAsync().ConfigureAwait(false);
-                disposed = true;
             }
             catch (Exception exception)
             {
                 (failures ??= []).Add(exception);
-                if (!localChangeFeed.DisposeCompletion.IsCompleted)
-                {
-                    // The feed may still be draining a journal transaction. Its owner must keep
-                    // the state store alive until the deferred completion callback runs.
-                    lock (_localChangeFeedGate)
-                    {
-                        _localChangeFeed ??= localChangeFeed;
-                    }
-                    return failures;
-                }
-            }
-
-            if (!disposed)
-            {
                 lock (_localChangeFeedGate)
                 {
                     _localChangeFeed ??= localChangeFeed;
                 }
+                // Keep the store available for both deferred worker completion and a durable
+                // loss-marker retry, even if the worker completed concurrently with the failure.
+                return failures;
             }
         }
+
+        // The stopped producer cannot admit more feed operations. Drain remaining facade
+        // leases before disconnecting callbacks or disposing the store they still reference.
+        Task operationsDrained = Volatile.Read(ref _activeOperations) == 0
+            ? Task.CompletedTask
+            : Volatile.Read(ref _operationsDrained)?.Task ?? Task.CompletedTask;
+        await operationsDrained.ConfigureAwait(false);
 
         if (_runtimeSession is not null)
         {

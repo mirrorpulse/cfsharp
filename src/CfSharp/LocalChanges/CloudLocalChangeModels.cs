@@ -34,7 +34,11 @@ public sealed record CloudLocalChangeFeedOptions
     /// <summary>Gets the maximum number of journal entries returned by one read.</summary>
     public int BatchSize { get; init; } = 64;
 
-    /// <summary>Gets the maximum time allowed for cooperative watcher shutdown.</summary>
+    /// <summary>Gets the maximum time allowed for the notification worker to drain during shutdown.</summary>
+    /// <remarks>
+    /// A timed-out drain persists a full-rescan fence before canceling the worker. Waiting for that
+    /// durable store transaction and deferred cleanup can extend disposal beyond this timeout.
+    /// </remarks>
     public TimeSpan ShutdownTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     internal void Validate()
