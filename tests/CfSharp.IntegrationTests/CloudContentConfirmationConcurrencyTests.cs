@@ -87,7 +87,7 @@ public sealed partial class CloudContentConfirmationTests
     [InlineData("write")]
     [InlineData("rename")]
     [InlineData("replace")]
-    public async Task IndependentProcessWaitsForReferenceAndContinuesAfterRelease(string action)
+    public async Task IndependentProcessCannotMutateUntilReferenceRelease(string action)
     {
         await using Fixture fixture = await Fixture.StartAsync();
         byte[] content = "upload"u8.ToArray();
@@ -109,13 +109,40 @@ public sealed partial class CloudContentConfirmationTests
             await WaitForReadyAsync(competitor);
             competitor.Go.Set();
             await Task.Delay(100);
-            Assert.True(!competitor.HasExited,
+            // Some Cloud Files states reject the write open with ERROR_SHARING_VIOLATION
+            // instead of waiting for an oplock break. Both outcomes prevent mutation. Retry
+            // only an observed pre-release sharing conflict, while the original lease lives.
+            bool sharingConflict = action == "write" && competitor.HasExited && competitor.ExitCode == 32;
+            Assert.True(sharingConflict || !competitor.HasExited,
                 $"Competitor completed while the reference was held: action={action}; exit={(competitor.HasExited ? competitor.ExitCode : null)}");
             long released = Stopwatch.GetTimestamp();
             await reference.DisposeAsync();
-            await competitor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.True(competitor.ExitCode == 0, $"Competitor exit={competitor.ExitCode}; Native=0x{competitor.ExitCode:X8}");
-            output.WriteLine($"Competitor={action}; WaitAfterReleaseMs={Stopwatch.GetElapsedTime(released).TotalMilliseconds}");
+            if (sharingConflict)
+            {
+                using Competitor retry = StartCompetitor(fixture.File.FullPath, target, action);
+                try
+                {
+                    await WaitForReadyAsync(retry);
+                    retry.Go.Set();
+                    await retry.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                    Assert.Equal(0, retry.ExitCode);
+                }
+                finally
+                {
+                    if (!retry.HasExited)
+                    {
+                        retry.Kill(entireProcessTree: true);
+                        await retry.WaitForExitAsync();
+                    }
+                }
+            }
+            else
+            {
+                await competitor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+                Assert.True(competitor.ExitCode == 0, $"Competitor exit={competitor.ExitCode}; Native=0x{competitor.ExitCode:X8}");
+            }
+
+            output.WriteLine($"Competitor={action}; PreReleaseSharingConflict={sharingConflict}; WaitAfterReleaseMs={Stopwatch.GetElapsedTime(released).TotalMilliseconds}");
             await Assert.ThrowsAsync<InvalidOperationException>(() => lease.BeginTransferAsync().AsTask());
             await lease.DisposeAsync();
             if (action == "write")
