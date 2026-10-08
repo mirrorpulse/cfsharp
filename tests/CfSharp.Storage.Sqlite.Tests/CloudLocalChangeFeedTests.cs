@@ -280,6 +280,7 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
 
         await using ICloudStateStore store = await OpenStoreAsync();
         int acknowledged = 0;
+        CloudLocalChange[] retainedBeforeRestart;
         FakeSource source = new();
         await using (CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(
             _syncRootPath,
@@ -298,6 +299,28 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
             Assert.NotEmpty(batch.Changes);
             acknowledged = batch.Changes.Count;
             await feed.AcknowledgeAsync(batch.Changes.Select(change => change.OperationId), timeout.Token);
+
+            // This test verifies bounded durable replay, not a five-second flush of a queued
+            // burst. Observe the finite committed boundary before closing the first runtime.
+            using CancellationTokenSource persistenceTimeout = new(TimeSpan.FromSeconds(30));
+            CloudLocalChangeScan scan;
+            do
+            {
+                scan = await feed.BeginScanAsync(persistenceTimeout.Token);
+                Assert.False(scan.RequiresFullRescan);
+                if (scan.ThroughSequence < eventsBeforeRestart)
+                {
+                    await Task.Delay(10, persistenceTimeout.Token);
+                }
+            }
+            while (scan.ThroughSequence < eventsBeforeRestart);
+
+            Assert.Equal(eventsBeforeRestart, scan.ThroughSequence);
+            CloudLocalChangePage retained = await feed.ReadPageAsync(scan, 0, eventCount, persistenceTimeout.Token);
+            Assert.False(retained.RequiresFullRescan);
+            Assert.False(retained.HasMore);
+            retainedBeforeRestart = retained.Changes.ToArray();
+            Assert.Equal(eventsBeforeRestart - acknowledged, retainedBeforeRestart.Length);
         }
 
         FakeSource restartedSource = new();
@@ -307,6 +330,12 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
             options,
             restartedSource);
         await restarted.StartAsync();
+        CloudLocalChangePage replayed = await restarted.ReadPageAsync(await restarted.BeginScanAsync(), 0, eventCount);
+        Assert.False(replayed.RequiresFullRescan);
+        Assert.Equal(retainedBeforeRestart.Select(change => (change.OperationId, change.Sequence, change.Kind,
+            change.ItemId, change.RelativePath, change.PreviousRelativePath, change.IsDirectory, change.ObservedAt)),
+            replayed.Changes.Select(change => (change.OperationId, change.Sequence, change.Kind,
+                change.ItemId, change.RelativePath, change.PreviousRelativePath, change.IsDirectory, change.ObservedAt)));
         for (int index = eventsBeforeRestart; index < eventCount; index++)
         {
             await restartedSource.EmitAsync(new(LocalChangeSourceAction.Created, paths[index]));
