@@ -34,6 +34,8 @@ else
 The feed normalizes paths relative to the sync root, pairs renames, and persists the ordered
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
 only after the application has accepted the batch.
+Background notification processing does not require pumping the synchronization context that
+started the feed; loss persistence and shutdown drain continue independently of that context.
 
 ## Scan a finite backlog without acknowledging its head
 

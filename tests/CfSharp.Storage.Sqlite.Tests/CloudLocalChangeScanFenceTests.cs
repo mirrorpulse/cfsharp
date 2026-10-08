@@ -4,6 +4,51 @@ namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
 {
+    [Fact]
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "xUnit1031:Do not use blocking task operations in test method",
+        Justification = "A dedicated background caller installs a paused context; the test awaits startup and rescues queued callbacks.")]
+    public async Task SourceWorkerPersistsLossWithoutPumpingTheStartingContext()
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(store, source);
+        PausedSourceContext context = new();
+        TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Thread caller = new(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            try
+            {
+                feed.StartAsync().AsTask().GetAwaiter().GetResult();
+                started.TrySetResult();
+            }
+            catch (Exception exception) { started.TrySetException(exception); }
+            finally { SynchronizationContext.SetSynchronizationContext(null); }
+        })
+        { IsBackground = true };
+        caller.Start();
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(caller.Join(TimeSpan.FromSeconds(5)));
+            await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
+            bool persistedWithoutPumping = true;
+            try { await WaitForLossPersistenceAsync(feed, timeout.Token); }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested) { persistedWithoutPumping = false; }
+            Assert.True(persistedWithoutPumping, $"Loss persistence required pumping the startup context; queued callbacks={context.Posts}.");
+            Assert.Equal(0, context.Posts);
+            await using ICloudStateTransaction verify = await store.BeginTransactionAsync(timeout.Token);
+            Assert.True(LocalChangeCheckpoint.Decode((await verify.Checkpoints
+                .GetAsync(CloudLocalChangeFeed.CheckpointName, timeout.Token))!.Value).RequiresFullRescan);
+        }
+        finally
+        {
+            // Rescue the baseline worker before disposal, rather than leak a blocked processor.
+            context.Release();
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -290,6 +335,41 @@ public sealed partial class CloudLocalChangeFeedTests
             catch (InvalidOperationException exception) when (exception.Message.StartsWith("A new loss signal", StringComparison.Ordinal))
             {
                 await Task.Delay(10, timeout.Token);
+            }
+        }
+    }
+
+    private sealed class PausedSourceContext : SynchronizationContext
+    {
+        private readonly object _gate = new();
+        private readonly Queue<(SendOrPostCallback Callback, object? State)> _pending = new();
+        private bool _released;
+        private int _posts;
+        internal int Posts => Volatile.Read(ref _posts);
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            Interlocked.Increment(ref _posts);
+            lock (_gate)
+            {
+                if (!_released)
+                {
+                    _pending.Enqueue((callback, state));
+                    return;
+                }
+            }
+
+            ThreadPool.QueueUserWorkItem(_ => callback(state));
+        }
+
+        internal void Release()
+        {
+            lock (_gate)
+            {
+                _released = true;
+                while (_pending.TryDequeue(out var continuation))
+                {
+                    ThreadPool.QueueUserWorkItem(_ => continuation.Callback(continuation.State));
+                }
             }
         }
     }

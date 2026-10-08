@@ -86,6 +86,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     /// <summary>Starts the native watcher and the durable normalization worker.</summary>
     /// <param name="cancellationToken">Token that cancels startup before the watcher is opened.</param>
+    /// <remarks>Background notification consumption does not require pumping the starting synchronization context.</remarks>
     /// <exception cref="InvalidOperationException">The feed has already been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
@@ -515,7 +516,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     {
         try
         {
-            await foreach (LocalChangeSourceEvent change in _sourceEvents.Reader.ReadAllAsync(_shutdown.Token))
+            // The processor outlives StartAsync. Its next notification must not depend on the
+            // caller's UI/test context remaining available to commit loss or finish draining.
+            await foreach (LocalChangeSourceEvent change in _sourceEvents.Reader.ReadAllAsync(_shutdown.Token).ConfigureAwait(false))
             {
                 await ProcessEventAsync(change, _shutdown.Token).ConfigureAwait(false);
                 if (Interlocked.Exchange(ref _overflowSignaled, 0) != 0)
