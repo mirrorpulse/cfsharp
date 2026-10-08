@@ -13,6 +13,9 @@ Each preparation has its own ID and survives restart independently. Do not subst
 observed at a renamed target for missing historical evidence. Ordinary directories may use normal
 `MoveToAsync`, but cannot prepare external recovery without a managed placeholder identity and
 complete native IDs. Metadata capture reads no content and holds no continuing lock after returning.
+The proof records the validated parent's actual native spelling and the requested child name.
+Parent references may differ in casing; the final child name remains exact for case-only renames
+and must match during both facade and feed recovery.
 
 Directory creation, conversion, identity replacement, remote creation, and provider population
 retain native provenance in the same transaction as their official item rows. Adding children

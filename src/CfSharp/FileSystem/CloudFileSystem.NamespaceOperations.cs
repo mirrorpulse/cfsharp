@@ -39,7 +39,8 @@ public sealed partial class CloudFileSystem
         CloudDirectoryMoveProof? directoryProof = options.DirectoryMoveProof;
         if (directoryProof is not null && (item.Kind != CloudItemKind.Directory ||
             !CloudDirectoryStateProjection.SamePath(item.RelativePath, directoryProof.SourceRelativePath) ||
-            movedItem.RelativePath != directoryProof.DestinationRelativePath))
+            !CloudDirectoryStateProjection.SamePath(movedItem.RelativePath, directoryProof.DestinationRelativePath) ||
+            validatedName != Path.GetFileName(directoryProof.DestinationRelativePath)))
         {
             throw new ArgumentException("The directory proof must identify this source and exact intended destination.", nameof(options));
         }
@@ -72,6 +73,17 @@ public sealed partial class CloudFileSystem
         {
             throw new DirectoryNotFoundException(
                 $"The destination directory does not exist: '{destination.FullPath}'.");
+        }
+
+        if (item is CloudDirectory)
+        {
+            // Resolve under the admitted lease, without entering a public reference API that
+            // would reject Stopping. Its path scopes already cover the case-insensitive alias.
+            movedItem = ResolveDirectoryMoveTarget(destination, validatedName);
+            if (directoryProof is not null && movedItem.RelativePath != directoryProof.DestinationRelativePath)
+            {
+                throw new ArgumentException("The directory proof must identify this source and exact intended destination.", nameof(options));
+            }
         }
 
         if (item is CloudDirectory directory && (directoryProof is not null || !sourceState.Exists))
@@ -160,7 +172,16 @@ public sealed partial class CloudFileSystem
                 statePlan.SourceEntries.Count);
         }
 
-        if (string.Equals(item.FullPath, movedItem.FullPath, StringComparison.Ordinal))
+        string nativeSourcePath = item.FullPath;
+        if (item is CloudDirectory samePathDirectory &&
+            string.Equals(item.FullPath, movedItem.FullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            // A case-insensitive source reference alone cannot distinguish a no-op from a
+            // case-only rename. Use the observed spelling, including for the native rename.
+            nativeSourcePath = ReadDirectoryMovePath(samePathDirectory);
+        }
+
+        if (string.Equals(nativeSourcePath, movedItem.FullPath, StringComparison.Ordinal))
         {
             CloudItemSnapshot unchangedSnapshot = await InspectCoreAsync(
                 movedItem,
@@ -197,7 +218,7 @@ public sealed partial class CloudFileSystem
             }
             else
             {
-                Directory.Move(item.FullPath, movedItem.FullPath);
+                Directory.Move(nativeSourcePath, movedItem.FullPath);
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)

@@ -32,7 +32,26 @@ public sealed partial class CloudFileSystem
             throw new DirectoryNotFoundException("The destination parent does not exist.");
         }
 
+        target = ResolveDirectoryMoveTarget(destination, validatedName);
         return await PrepareDirectoryMoveCoreAsync(source, target, operation, cancellationToken).ConfigureAwait(false);
+    }
+
+    private CloudDirectory ResolveDirectoryMoveTarget(CloudDirectory destination, string name) =>
+        (CloudDirectory)CreateItemReference(Path.GetRelativePath(SyncRootPath,
+            Path.Combine(ReadDirectoryMovePath(destination), name)), CloudItemKind.Directory);
+
+    private static string ReadDirectoryMovePath(CloudDirectory directory)
+    {
+        using SafeFileHandle guard = WindowsFileMetadata.Open(directory.FullPath, preventDelete: true);
+        string actualPath = WindowsFileMetadata.ReadFinalPath(guard.DangerousGetHandle());
+        if (!string.Equals(actualPath, directory.FullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("The native directory is outside the requested namespace path.");
+        }
+
+        // References may vary in parent casing. Preserve the requested child name separately:
+        // normalizing the whole target would erase an intended case-only leaf rename.
+        return actualPath;
     }
 
     private async ValueTask<CloudDirectoryMoveProof> PrepareDirectoryMoveCoreAsync(CloudDirectory source,

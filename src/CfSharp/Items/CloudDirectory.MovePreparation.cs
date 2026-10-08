@@ -16,6 +16,8 @@ public sealed partial class CloudDirectory
     /// the returned value confers no continuing protection. Concurrent operations are coordinated
     /// within this file system. Cross-process identity and descendant changes still require recovery
     /// validation. Ordinary directories retain their existing normal move API.
+    /// The destination parent uses its observed native spelling; the requested child name remains
+    /// exact, including case-only renames. Parent reference casing does not change the proof target.
     /// </remarks>
     /// <exception cref="ArgumentException">The destination belongs to another file system or the name is invalid.</exception>
     /// <exception cref="InvalidOperationException">The root, destination, or durable/native identity is unsuitable.</exception>
