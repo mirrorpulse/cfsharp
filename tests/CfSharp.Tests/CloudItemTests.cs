@@ -26,7 +26,9 @@ public sealed class CloudItemTests
         Assert.Equal(3, first.Length);
         Assert.NotNull(first.LocalBinding);
         Assert.Equal(first.LocalBinding, second.LocalBinding);
-        Assert.Null(rootSnapshot.LocalBinding);
+        Assert.NotNull(rootSnapshot.LocalBinding);
+        Assert.Equal(rootSnapshot.LocalBinding.LocalFileId, rootSnapshot.LocalBinding.SyncRootFileId);
+        Assert.Equal(rootSnapshot.LocalBinding.SyncRootFileId, first.LocalBinding.SyncRootFileId);
         Assert.Equal(12, second.Length);
         Assert.Equal(3, first.Length);
         Assert.True(first.Exists);
@@ -36,6 +38,23 @@ public sealed class CloudItemTests
         Assert.True(rootSnapshot.Exists);
         Assert.Null(rootSnapshot.Length);
         Assert.Null(fileSystem.Root.Parent);
+    }
+
+    [Fact]
+    public async Task DirectoryBindingSurvivesRenameAndDistinguishesReplacement()
+    {
+        using TestDirectory root = new();
+        string sourcePath = Path.Combine(root.Path, "Source");
+        string destinationPath = Path.Combine(root.Path, "Moved");
+        Directory.CreateDirectory(sourcePath);
+        await using CloudFileSystem fileSystem = await StartAsync(root.Path, new InspectionStore());
+        CloudLocalFileBinding before = Assert.IsType<CloudLocalFileBinding>(
+            (await fileSystem.GetDirectory("Source").InspectAsync()).LocalBinding);
+        Directory.Move(sourcePath, destinationPath);
+        Assert.Equal(before, (await fileSystem.GetDirectory("Moved").InspectAsync()).LocalBinding);
+        Assert.Null((await fileSystem.GetDirectory("Source").InspectAsync()).LocalBinding);
+        Directory.CreateDirectory(sourcePath);
+        Assert.NotEqual(before, (await fileSystem.GetDirectory("Source").InspectAsync()).LocalBinding);
     }
 
     [Fact]
@@ -263,6 +282,7 @@ public sealed class CloudItemTests
 
         IReadOnlyList<CloudItem> first = await CollectAsync(
             fileSystem.Root.EnumerateLocalChildrenAsync(recursive));
+        Assert.Null((await fileSystem.GetDirectory("alias").InspectAsync()).LocalBinding);
         await File.WriteAllTextAsync(Path.Combine(root.Path, "added.txt"), "new");
         IReadOnlyList<CloudItem> second = await CollectAsync(
             fileSystem.Root.EnumerateLocalChildrenAsync(recursive));

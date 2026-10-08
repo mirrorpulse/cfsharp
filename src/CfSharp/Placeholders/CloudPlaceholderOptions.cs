@@ -269,8 +269,25 @@ public sealed class CloudMoveOptions
         ReplaceExisting = replaceExisting;
     }
 
+    /// <summary>Initializes a directory move or recovery with its original durable pre-move proof.</summary>
+    /// <param name="directoryMoveProof">Owned evidence for this exact source and intended destination.</param>
+    /// <exception cref="ArgumentNullException">The proof is null.</exception>
+    /// <remarks>
+    /// Does not permit replacement. The immutable value owns no native protection; the move
+    /// authenticates its original store record and verifies the actual object. Use only for
+    /// directories; files retain the boolean constructor and existing replacement behavior.
+    /// </remarks>
+    public CloudMoveOptions(CloudDirectoryMoveProof directoryMoveProof)
+    {
+        ArgumentNullException.ThrowIfNull(directoryMoveProof);
+        DirectoryMoveProof = directoryMoveProof;
+    }
+
     /// <summary>Gets whether an existing destination file may be replaced.</summary>
     public bool ReplaceExisting { get; }
+
+    /// <summary>Gets optional durable directory move evidence, or null for normal automatic preparation.</summary>
+    public CloudDirectoryMoveProof? DirectoryMoveProof { get; }
 }
 
 /// <summary>Controls explicit recursive execution over materialized local entries.</summary>

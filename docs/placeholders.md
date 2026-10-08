@@ -1,7 +1,165 @@
 # Placeholders and hydration
 
+## Prepare directory move evidence
+
+Before authorizing an external rename of a managed directory, call
+`await directory.PrepareMoveAsync(destination, name)` and persist the returned proof's `Encode()`
+bytes. Preparation performs no native move and returns only after immutable evidence and the
+known durable subtree membership commit. `CloudDirectoryMoveProof.Decode(bytes)` restores copied
+metadata; it does not make caller-constructed data authoritative. Recovery must still validate the
+library's original preparation in the same store and the actual complete native binding and identity.
+
+Each preparation has its own ID and survives restart independently. Do not substitute a binding
+observed at a renamed target for missing historical evidence. Ordinary directories may use normal
+`MoveToAsync`, but cannot prepare external recovery without a managed placeholder identity and
+complete native IDs. Metadata capture reads no content and holds no continuing lock after returning.
+The proof records the validated parent's actual native spelling and the requested child name.
+Parent references may differ in casing; the final child name remains exact for case-only renames
+and must match during both facade and feed recovery.
+
+Directory creation, conversion, identity replacement, remote creation, and provider population
+retain native provenance in the same transaction as their official item rows. Adding children
+refreshes known membership of captured ancestors without enumerating native subtrees. Batch creation
+and each provider population page capture new directory bindings first, then refresh each affected
+directory's membership once from all item rows in the same transaction, including shared ancestors.
+The existing recovery metadata limits still apply. Immutable
+prepared proofs remain unchanged. Removing an identity or reverting a directory removes its live
+provenance. Storage without complete IDs retains existing creation behavior but cannot establish
+this recovery evidence; legacy directories can explicitly prepare while still at their source.
+
+When the local-change feed first discovers a file or directory through creation or another
+observation, its new item row, journal entry and captured ancestors' live membership commit
+together. It does not infer a managed binding for an ordinary local item or modify any immutable
+prepared manifest. A later parent move can project these known rows; ordinary native children
+still retain their separate full-reconciliation requirement.
+
+Known file moves and renames through `MoveToAsync` or the local-change feed update official paths
+and refresh retained live membership of both source and destination ancestors in one transaction.
+Shared ancestors are refreshed once, including for case-only renames and files moved into or out
+of a directory. Existing ancestor native bindings and immutable preparations, manifests and receipts
+remain unchanged, and pending journal operations are not rewritten or acknowledged. If file
+projection fails after the native move, retry the original source/destination, including after
+restart; the facade does not move an absent source again. Feed storage failures still retain their
+original unresolved observation and rescan fence until application reconciliation completes.
+
+After the external move, call `await originalDirectory.ReconcileMoveAsync(proof)` on the original
+source reference. Recovery never issues another native move. It validates the original stored
+preparation, complete native root/directory binding and opaque identity, actual namespace spelling,
+and known current membership. Source and destination paths and an immutable completion receipt
+commit together. The same transaction refreshes retained live membership of source and destination
+ancestors once each, including the common parent of a renamed child. This allows a later external
+parent move to recover from its current membership; ancestor bindings and immutable historical
+preparations, manifests, and receipts remain unchanged. Current revisions, local IDs, tombstones,
+and pending journal IDs/sequences/payloads are retained; a root already at the target is still a
+proven member. Unrelated target rows remain
+untouched and cause a conflict. A historical receipt cannot regress later state.
+
+Inspect `Outcome`, `Stage`, `NativeMoveObserved`, `DurableProjectionCommitted`, and
+`RequiresFullRescan`. A store failure can leave a verified native move pending; retry its original
+proof. `Error` preserves the underlying failure and `NativeHResult` is populated only for actual
+native observation failures. Metadata guards stabilize the root object but do not freeze descendant
+changes or identity writes. Validation around commit detects changed known descendants; local
+ordinary children without native placeholder identity require a rescan before dispatch. A detected
+post-commit race reports the committed fact and rescan requirement rather than claiming rollback.
+An approved external Cloud Files rename can change the namespace while a metadata guard remains
+open. Treat the result's native observation as a checked fact at that stage, not a continuing
+namespace lock; honor a later conflict/rescan even when `DurableProjectionCommitted` is true.
+
+`MoveToAsync` prepares supported managed directories before its native move.
+Cancellation is checked again after automatic preparation, including capability fallback,
+immediately before native movement. Cancellation at that boundary may retain committed proof
+metadata while leaving the native source and official item paths unchanged. After native success,
+durable recovery completes independently of caller cancellation.
+
+Retrying the original source/destination after a crash uses the retained indexed preparation and
+performs only verified projection. To select a specific externally prepared proof, pass
+`new CloudMoveOptions(proof)`; it must name that exact target. Missing-source directory retries
+without evidence fail closed.
+Normal ordinary-directory moves and the existing boolean file-replacement options remain available.
+Moving an ordinary ancestor relocates any existing managed descendants' live binding paths and
+rebuilds their mutable membership in the same official subtree transaction. It retains their
+native bindings and immutable recovery history, so later external descendant moves can use
+pre-rename provenance, including after restart. Directories without captured bindings acquire no
+recovery evidence from this path; absent ordinary sources still require historical pre-move proof.
+Directory move results and coordination exceptions expose `DirectoryReconciliation`, preserving a
+post-commit race or rescan requirement without inventing a failed commit. The bounded intent index
+may select a newer preparation but never replaces previous immutable proofs or receipts.
+When no explicit preparation exists, recovery may promote the library's retained pre-rename
+directory binding and known membership into an independent immutable preparation. It never
+manufactures historical evidence from a current target. Legacy directories without either source
+of provenance still require explicit preparation while at the original source.
+
+### Retain and recover an external move
+
+Keep the original source reference, exact destination spelling, and original encoded proof in
+application-owned durable intent storage outside the sync root. Before an external consumer is
+allowed to rename `Docs`:
+
+```csharp
+CloudDirectory original = fileSystem.GetDirectory("Docs");
+CloudDirectoryMoveProof proof = await original.PrepareMoveAsync(
+    fileSystem.Root, "Renamed", cancellationToken);
+await File.WriteAllBytesAsync(applicationProofPath, proof.Encode(), cancellationToken);
+// The application can now authorize its external consumer to perform that exact rename.
+```
+
+After the external consumer finishes, or after restarting against the same store:
+
+```csharp
+CloudDirectoryMoveProof retained = CloudDirectoryMoveProof.Decode(
+    await File.ReadAllBytesAsync(applicationProofPath, cancellationToken));
+CloudDirectoryMoveReconciliationResult result = await fileSystem.GetDirectory("Docs")
+    .ReconcileMoveAsync(retained, cancellationToken);
+
+if (result.RequiresFullRescan)
+{
+    await ReconcileEntireSyncRootAsync(fileSystem, cancellationToken);
+}
+// Inspect Outcome and native/committed facts before advancing the application intent.
+// Reconciliation does not ACK local operations or accept a remote mutation.
+```
+
+`applicationProofPath` is an example application intent file, not a CfSharp state-store setting.
+Persist it before allowing the native move; do not regenerate a missing original proof from the
+destination's present identity. An existing partial projection can also use the original source's
+`MoveToAsync` when CfSharp retained sufficient pre-rename provenance. Otherwise perform ownership
+reconciliation without relaxing target guards.
+
+| Result | Application action |
+| --- | --- |
+| `NotMoved` | The proven source remains. Inspect the rescan flag before authorizing the intended move. |
+| `Projected`, `AlreadyProjected` | Native movement and durable paths were validated; honor any remaining rescan requirement. |
+| `NativeObservedProjectionPending` | Preserve the proof and retry after the original store failure is resolved. |
+| `Conflict`, `NotApplicable` | Stop this intent and reconcile ownership; do not overwrite the target or invent provenance. |
+| `Busy`, `Canceled`, `Failed` | Inspect Stage, Error, and both native/committed facts before retrying the same intent. |
+
+A post-commit race can have `DurableProjectionCommitted = true` with a conflict/rescan outcome.
+`NativeHResult` is nullable because a logical conflict or store exception is not a failed native
+call. Log bounded identifiers, stage, outcome, and original error details as appropriate; avoid
+dumping complete opaque identities or arbitrary user paths into routine diagnostics.
+Proof version 1 bounds encoded paths to 32 KiB of UTF-8, identities to the native 4 KiB limit,
+and known-member manifests to 64 MiB. Unknown protocol versions fail closed. Preparation is
+metadata-only and does not freeze child content, identity writes, or later namespace moves.
+These evidence bounds do not reduce existing directory conversion or ordinary `MoveToAsync`
+availability. If a valid native path or known subtree exceeds the recovery format's capacity,
+normal source-present operations retain their existing behavior and omit unusable live provenance;
+explicit preparation reports `NotSupportedException`. Immutable earlier proofs, receipts, official
+item rows, and pending operations remain intact.
+
 Placeholder operations use immutable, kind-specific specifications rather than exposing native
 unions and flag combinations directly to application code.
+
+## Observe native object bindings
+
+`CloudItemSnapshot.LocalBinding` exposes the complete volume serial number, sync-root directory
+ID, and local object ID for files and directories on capable Windows storage. IDs retain all native
+bits and are opaque comparison values. Inspection reads metadata without reading or hydrating
+content and retains no handle or protection lifetime. Unsupported reparse targets, missing objects,
+and storage without complete IDs return null.
+
+A rename preserves the binding; a replacement can have a different binding even when its path,
+remote ID, or placeholder identity matches. A current target observation alone cannot prove that
+it belonged to an earlier source. File content confirmation still requires its accepted upload proof.
 
 ## Create a placeholder
 

@@ -56,6 +56,7 @@ public sealed class InMemoryCloudStateStoreContractTests : CloudStateStoreContra
         ICloudItemStateRepository,
         ICloudCheckpointRepository,
         ICloudOperationJournal,
+        ICloudOperationJournalPaging,
         ICloudConflictRepository,
         ICloudRemoteBatchRepository,
         ICloudEchoSuppressionRepository
@@ -246,6 +247,33 @@ public sealed class InMemoryCloudStateStoreContractTests : CloudStateStoreContra
                 .Take(maximumCount)
                 .ToArray();
             return ValueTask.FromResult(operations);
+        }
+
+        public ValueTask<long> GetHighWaterSequenceAsync(CancellationToken cancellationToken = default)
+        {
+            CheckActive(cancellationToken);
+            return ValueTask.FromResult(_state.Operations.Values.Select(row => row.Sequence).DefaultIfEmpty().Max());
+        }
+
+        public ValueTask<CloudOperationJournalPage> ReadPageAsync(
+            long afterSequence, long throughSequence, int limit, CancellationToken cancellationToken = default)
+        {
+            CheckActive(cancellationToken);
+            ArgumentOutOfRangeException.ThrowIfNegative(afterSequence);
+            ArgumentOutOfRangeException.ThrowIfLessThan(throughSequence, afterSequence);
+            ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 4096);
+            CloudOperationJournalEntry[] rows = _state.Operations.Values
+                .Where(row => row.Sequence > afterSequence && row.Sequence <= throughSequence)
+                .OrderBy(row => row.Sequence).Take(limit + 1).ToArray();
+            bool more = rows.Length > limit;
+            if (more)
+            {
+                rows = rows[..limit];
+            }
+
+            return ValueTask.FromResult(new CloudOperationJournalPage(rows,
+                rows.Length == 0 ? throughSequence : rows[^1].Sequence, more));
         }
 
         public ValueTask<IReadOnlyList<CloudOperationJournalEntry>> ListByItemIdAsync(

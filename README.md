@@ -25,6 +25,11 @@ The dependency direction is one way: `CfSharp.Native` is the interop layer, `CfS
 the safe domain API, and the SQLite package depends on `CfSharp`. Remote transport, authentication,
 content bytes, and business conflict policy remain application-owned.
 
+The source API supports [finite typed scans of pending local changes](docs/local-change-feed.md)
+without acknowledging a deferred head, and [verified directory move recovery](docs/placeholders.md)
+that preserves subtree identities, current revisions, and pending journal operations. Applications
+retain their own dispatch policy and durable move intents.
+
 ## Quick start
 
 ### Requirements

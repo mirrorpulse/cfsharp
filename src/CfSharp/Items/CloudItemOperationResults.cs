@@ -138,7 +138,8 @@ public sealed class CloudItemMoveResult
         string destinationPath,
         CloudItem item,
         CloudItemSnapshot snapshot,
-        int durableStateEntriesUpdated)
+        int durableStateEntriesUpdated,
+        CloudDirectoryMoveReconciliationResult? directoryReconciliation = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
@@ -150,6 +151,7 @@ public sealed class CloudItemMoveResult
         Item = item;
         Snapshot = snapshot;
         DurableStateEntriesUpdated = durableStateEntriesUpdated;
+        DirectoryReconciliation = directoryReconciliation;
     }
 
     /// <summary>Gets the normalized absolute source path used by the operation.</summary>
@@ -166,6 +168,13 @@ public sealed class CloudItemMoveResult
 
     /// <summary>Gets the number of durable item paths updated in the committed transaction.</summary>
     public int DurableStateEntriesUpdated { get; }
+
+    /// <summary>
+    /// Gets verified directory coordination facts, including any required rescan, or null for a
+    /// file, ordinary directory, unchanged path, or storage without supported recovery evidence.
+    /// The value owns no protection lifetime and does not acknowledge pending operations.
+    /// </summary>
+    public CloudDirectoryMoveReconciliationResult? DirectoryReconciliation { get; }
 }
 
 /// <summary>Describes a completed file or empty-directory deletion.</summary>
@@ -203,8 +212,8 @@ public sealed class CloudItemDeleteResult
 }
 
 /// <summary>
-/// Reports that a file-system mutation completed but its corresponding durable-state change did
-/// not commit.
+/// Reports that a file-system mutation completed but durable coordination or native completion
+/// validation failed.
 /// </summary>
 /// <remarks>
 /// Windows and a configured state store cannot share one physical transaction. The exception
@@ -227,9 +236,12 @@ public sealed class CloudItemCoordinationException : Exception
         string path,
         string? destinationPath,
         long? operationUsn,
-        Exception innerException)
+        Exception innerException,
+        CloudDirectoryMoveReconciliationResult? directoryReconciliation = null)
         : base(
-            destinationPath is null
+            directoryReconciliation?.DurableProjectionCommitted == true
+                ? $"File-system operation '{operation}' completed for '{path}' and committed its paths, but native completion requires reconciliation."
+                : destinationPath is null
                 ? $"File-system operation '{operation}' completed for '{path}', but its durable state could not be committed."
                 : $"File-system operation '{operation}' moved '{path}' to '{destinationPath}', but its durable state could not be committed.",
             innerException)
@@ -240,6 +252,7 @@ public sealed class CloudItemCoordinationException : Exception
         Path = path;
         DestinationPath = destinationPath;
         OperationUsn = operationUsn;
+        DirectoryReconciliation = directoryReconciliation;
     }
 
     internal CloudItemCoordinationException(
@@ -271,4 +284,10 @@ public sealed class CloudItemCoordinationException : Exception
     /// <see langword="null"/> for a non-recursive operation.
     /// </summary>
     public CloudRecursiveOperationResult? PartialResult { get; }
+
+    /// <summary>
+    /// Gets directory recovery facts, including a real commit followed by failed native validation,
+    /// or null for other coordination failures. The original underlying failure remains the inner exception.
+    /// </summary>
+    public CloudDirectoryMoveReconciliationResult? DirectoryReconciliation { get; }
 }

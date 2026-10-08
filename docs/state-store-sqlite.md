@@ -35,6 +35,39 @@ Applications that need another database can implement `ICloudStateStoreFactory`,
 `ICloudStateStore`, and `ICloudStateTransaction`. Preserve the same commit, rollback, ownership,
 checkpoint, and retry semantics; the high-level API does not require SQLite.
 
-### Schema 5 recovery fence
+### Optional bounded journal paging
 
-Schema 5 preserves the existing table layout and data while fencing the remote placeholder creation and observation-reconciliation protocol. Versions 0 through 4 upgrade in place. Older libraries reject the newer version rather than ignore pending creation records. Do not downgrade the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
+SQLite implements `ICloudOperationJournalPaging` on each transaction's `Operations` repository.
+Capture `GetHighWaterSequenceAsync()` once, then call `ReadPageAsync(after, through, limit)` with
+an exclusive lower bound, the captured inclusive upper bound, and a limit from 1 through 4096.
+Use `LastScannedSequence` directly as the next lower bound. The sequence index bounds both the
+query and its memory use; one extra row determines `HasMore` without advancing past that row.
+Later enqueues stay outside the scan, and concurrent acknowledgements may leave sequence gaps or
+an empty next page. A terminal empty page returns the upper bound and never waits.
+
+Pages own no reader or transaction and do not acknowledge operations or update item revisions.
+The legacy `ICloudOperationJournal` contract is unchanged: custom stores may opt into paging on
+their repository, preserving monotonic enqueue sequences and transactional read semantics.
+
+### Schema 6 recovery fence
+
+Schema 6 preserves the existing table layout and data while fencing directory object provenance,
+move preparation, and completion-receipt recovery. It includes schema 5's remote placeholder
+creation and observation-reconciliation fence. Versions 0 through 5 upgrade in place, retaining
+item IDs, revisions, tombstones, journal sequences and payloads, suppressions, and checkpoints.
+Older SQLite packages reject version 6 before accessing its recovery metadata. Do not downgrade
+the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
+
+Custom stores must enforce the same protocol boundary when opening persistent state with older
+runtimes. Preserve CfSharp-owned checkpoint names and values transactionally, including immutable
+preparations and receipts; never treat them as disposable caches or infer native ownership from an
+item path. The schema fence changes protocol compatibility, not the replaceable core interfaces.
+
+Upgrading a preview.3 schema-5 database retains all six repositories, original journal sequences
+and retry fields, remote cursors/fingerprints, echo counts, and tombstones. The new directory
+protocol is used only after that durable schema fence commits. Reopening an upgraded database
+with an older package is rejected; do not rewrite its version to force a downgrade.
+Custom stores keep the existing interfaces and may optionally implement journal paging. They must
+atomically retain directory preparation, membership, projection receipt, item rows, and feed
+checkpoint/journal updates when the core coordinates a move. Never inspect or overwrite CfSharp's
+private namespace checkpoint payloads to fabricate recovery provenance.

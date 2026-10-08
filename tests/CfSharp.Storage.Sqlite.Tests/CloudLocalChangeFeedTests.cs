@@ -1,6 +1,6 @@
 namespace CfSharp.Storage.Sqlite.Tests;
 
-public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
+public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
 {
     private string _temporaryDirectory = null!;
     private string _syncRootPath = null!;
@@ -89,7 +89,7 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
         CloudLocalChangeBatch rescan = await feed.ReadBatchAsync();
         Assert.True(rescan.RequiresFullRescan);
         Assert.Empty(rescan.Changes);
-        await feed.AcknowledgeFullRescanAsync();
+        await AcknowledgePersistedRescanAsync(feed);
 
         await source.EmitAsync(new(LocalChangeSourceAction.Created, "after-rescan.txt"));
         CloudLocalChangeBatch afterRescan = await feed.ReadBatchAsync();
@@ -142,35 +142,42 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
             expectedObservationCount: 2);
         await source.EmitAsync(new(LocalChangeSourceAction.Modified, "replayed.txt"));
         await source.EmitAsync(new(LocalChangeSourceAction.Modified, "replayed.txt"));
-        await WaitForJournalStateAsync(store, expectedOperations: 0, expectedSuppressions: 0);
+        // Suppressed observations produce no journal row to await. The public drain boundary
+        // establishes completion without racing a polling deadline against worker scheduling.
+        await feed.DisposeAsync();
 
         await using (ICloudStateTransaction transaction = await store.BeginTransactionAsync())
         {
             Assert.Empty(await transaction.Operations.ListAsync(10));
             Assert.Empty(await transaction.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+            LocalChangeCheckpoint checkpoint = LocalChangeCheckpoint.Decode(
+                (await transaction.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value);
+            Assert.Equal(2, checkpoint.Observation);
+            Assert.False(checkpoint.RequiresFullRescan);
             await transaction.RollbackAsync();
         }
 
-        await source.EmitAsync(new(LocalChangeSourceAction.Modified, "replayed.txt"));
-        await WaitForJournalStateAsync(store, expectedOperations: 1, expectedSuppressions: 0);
-        await using (ICloudStateTransaction afterBudget = await store.BeginTransactionAsync())
-        {
-            Assert.Single(await afterBudget.Operations.ListAsync(10));
-            await afterBudget.RollbackAsync();
-        }
+        FakeSource restartedSource = new();
+        await using CloudLocalChangeFeed restarted = CreateFeed(store, restartedSource);
+        await restarted.StartAsync();
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
+        await restartedSource.EmitAsync(new(LocalChangeSourceAction.Modified, "replayed.txt"));
+        CloudLocalChangeBatch afterBudget = await restarted.ReadBatchAsync(timeout.Token);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, Assert.Single(afterBudget.Changes).Kind);
+        Assert.False(afterBudget.RequiresFullRescan);
 
-        await feed.AcknowledgeAsync(
-            (await feed.ReadBatchAsync()).Changes.Select(change => change.OperationId));
-        await feed.SuppressProviderEchoAsync(
+        await restarted.AcknowledgeAsync(afterBudget.Changes.Select(change => change.OperationId), timeout.Token);
+        await restarted.SuppressProviderEchoAsync(
             CloudStateOperationKind.ContentUpdate,
             "kind-sensitive.txt",
             DateTimeOffset.UtcNow.AddMinutes(1));
-        await source.EmitAsync(new(LocalChangeSourceAction.Created, "kind-sensitive.txt"));
-        await WaitForJournalStateAsync(store, expectedOperations: 1, expectedSuppressions: 1);
+        await restartedSource.EmitAsync(new(LocalChangeSourceAction.Created, "kind-sensitive.txt"));
+        Assert.Equal(CloudLocalChangeKind.Create, Assert.Single((await restarted.ReadBatchAsync(timeout.Token)).Changes).Kind);
         await using ICloudStateTransaction kindMismatch = await store.BeginTransactionAsync();
         CloudOperationJournalEntry kindSensitiveOperation = Assert.Single(
             await kindMismatch.Operations.ListAsync(10));
         Assert.Equal(CloudStateOperationKind.Create, kindSensitiveOperation.Kind);
+        Assert.Equal(1, Assert.Single(await kindMismatch.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow)).RemainingObservations);
         await kindMismatch.RollbackAsync();
     }
 
@@ -214,7 +221,7 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
         await source.EmitAsync(new(LocalChangeSourceAction.Created, "..\\outside.txt"));
         CloudLocalChangeBatch invalidPath = await feed.ReadBatchAsync();
         Assert.True(invalidPath.RequiresFullRescan);
-        await feed.AcknowledgeFullRescanAsync();
+        await AcknowledgePersistedRescanAsync(feed);
 
         await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
         CloudLocalChangeBatch overflow = await feed.ReadBatchAsync();
@@ -273,6 +280,7 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
 
         await using ICloudStateStore store = await OpenStoreAsync();
         int acknowledged = 0;
+        CloudLocalChange[] retainedBeforeRestart;
         FakeSource source = new();
         await using (CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(
             _syncRootPath,
@@ -291,6 +299,28 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
             Assert.NotEmpty(batch.Changes);
             acknowledged = batch.Changes.Count;
             await feed.AcknowledgeAsync(batch.Changes.Select(change => change.OperationId), timeout.Token);
+
+            // This test verifies bounded durable replay, not a five-second flush of a queued
+            // burst. Observe the finite committed boundary before closing the first runtime.
+            using CancellationTokenSource persistenceTimeout = new(TimeSpan.FromSeconds(30));
+            CloudLocalChangeScan scan;
+            do
+            {
+                scan = await feed.BeginScanAsync(persistenceTimeout.Token);
+                Assert.False(scan.RequiresFullRescan);
+                if (scan.ThroughSequence < eventsBeforeRestart)
+                {
+                    await Task.Delay(10, persistenceTimeout.Token);
+                }
+            }
+            while (scan.ThroughSequence < eventsBeforeRestart);
+
+            Assert.Equal(eventsBeforeRestart, scan.ThroughSequence);
+            CloudLocalChangePage retained = await feed.ReadPageAsync(scan, 0, eventCount, persistenceTimeout.Token);
+            Assert.False(retained.RequiresFullRescan);
+            Assert.False(retained.HasMore);
+            retainedBeforeRestart = retained.Changes.ToArray();
+            Assert.Equal(eventsBeforeRestart - acknowledged, retainedBeforeRestart.Length);
         }
 
         FakeSource restartedSource = new();
@@ -300,6 +330,12 @@ public sealed class CloudLocalChangeFeedTests : IAsyncLifetime
             options,
             restartedSource);
         await restarted.StartAsync();
+        CloudLocalChangePage replayed = await restarted.ReadPageAsync(await restarted.BeginScanAsync(), 0, eventCount);
+        Assert.False(replayed.RequiresFullRescan);
+        Assert.Equal(retainedBeforeRestart.Select(change => (change.OperationId, change.Sequence, change.Kind,
+            change.ItemId, change.RelativePath, change.PreviousRelativePath, change.IsDirectory, change.ObservedAt)),
+            replayed.Changes.Select(change => (change.OperationId, change.Sequence, change.Kind,
+                change.ItemId, change.RelativePath, change.PreviousRelativePath, change.IsDirectory, change.ObservedAt)));
         for (int index = eventsBeforeRestart; index < eventCount; index++)
         {
             await restartedSource.EmitAsync(new(LocalChangeSourceAction.Created, paths[index]));

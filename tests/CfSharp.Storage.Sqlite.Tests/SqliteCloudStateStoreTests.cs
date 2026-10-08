@@ -55,6 +55,29 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     protected override CloudStateStoreContext CreateContext() => new(_syncRootPath);
 
     [Fact]
+    public async Task JournalPagingUsesSequenceIndexWithoutTemporarySort()
+    {
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        {
+        }
+
+        await using SqliteConnection connection = new($"Data Source={_databasePath};Pooling=False");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN SELECT sequence, operation_id FROM operations " +
+            "WHERE sequence > 1 AND sequence <= 100000 ORDER BY sequence LIMIT 8;";
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        List<string> plan = [];
+        while (await reader.ReadAsync())
+        {
+            plan.Add(reader.GetString(3));
+        }
+
+        Assert.Contains(plan, detail => detail.Contains("SEARCH operations USING INTEGER PRIMARY KEY", StringComparison.Ordinal));
+        Assert.DoesNotContain(plan, detail => detail.Contains("TEMP B-TREE", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task CommitDoesNotReportCleanupCallbackFailureAsCommitFailure()
     {
         await using SqliteConnection connection = new("Data Source=:memory:");
@@ -352,7 +375,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            5L,
+            6L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -364,7 +387,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     }
 
     [Fact]
-    public async Task VersionOneRemoteBatchSchemaMigratesToVersionFive()
+    public async Task VersionOneRemoteBatchSchemaMigratesToVersionSix()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -379,7 +402,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            5L,
+            6L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -392,7 +415,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     }
 
     [Fact]
-    public async Task VersionTwoEchoSuppressionSchemaMigratesToVersionFive()
+    public async Task VersionTwoEchoSuppressionSchemaMigratesToVersionSix()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -407,7 +430,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            5L,
+            6L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -436,8 +459,93 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             Assert.Equal(new byte[] { 7 }, (await transaction.Checkpoints.GetAsync("existing/checkpoint"))!.Value.ToArray());
         }
 
-        Assert.Equal(5L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
+    }
+
+    [Fact]
+    public async Task VersionFiveUpgradePreservesCoordinationRowsAndSequenceAllocation()
+    {
+        Guid itemId = Guid.NewGuid();
+        Guid operationId = Guid.NewGuid();
+        Guid conflictId = Guid.NewGuid();
+        Guid suppressionId = Guid.NewGuid();
+        DateTimeOffset timestamp = DateTimeOffset.UtcNow;
+        CloudOperationJournalEntry original;
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
+        {
+            await write.Items.UpsertAsync(new CloudItemState(itemId, "retained-remote", "Docs\\gone.txt",
+                CloudItemKind.File, "retained-revision", 321, true, timestamp));
+            await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint("retained/checkpoint", [1, 2], timestamp));
+            original = await write.Operations.EnqueueAsync(new CloudOperationJournalEntry(operationId,
+                CloudStateOperationKind.Move, itemId, [3, 4], timestamp, 3, timestamp.AddMinutes(1)));
+            await write.Conflicts.UpsertAsync(new CloudConflictState(conflictId, itemId, CloudStateConflictKind.Move, [5, 6], timestamp));
+            await write.RemoteBatches.UpsertAsync(new CloudRemoteBatchState("retained-batch", [7], 1, 2,
+                CloudRemoteBatchStatus.Applying, [8], timestamp, new byte[] { 9 }, "retained-change"));
+            await write.EchoSuppressions.UpsertAsync(new CloudEchoSuppressionState(suppressionId,
+                itemId, CloudStateOperationKind.Move, "Docs\\gone.txt", [10], timestamp.AddMinutes(5), "old.txt", 2));
+            await write.CommitAsync();
+        }
+
+        await ExecuteSqlAsync(_databasePath, "UPDATE cfsharp_schema SET version = 5 WHERE singleton = 1;");
+        await using (ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext()))
+        await using (ICloudStateTransaction verify = await reopened.BeginTransactionAsync())
+        {
+            CloudItemState item = (await verify.Items.GetByItemIdAsync(itemId))!;
+            Assert.Equal("Docs\\gone.txt", item.RelativePath);
+            Assert.Equal("retained-remote", item.RemoteId);
+            Assert.Equal("retained-revision", item.RemoteRevision);
+            Assert.Equal(321, item.LocalFileId);
+            Assert.True(item.IsTombstone);
+            Assert.Equal(timestamp, item.UpdatedAt);
+            Assert.Equal(new byte[] { 1, 2 }, (await verify.Checkpoints.GetAsync("retained/checkpoint"))!.Value.ToArray());
+            CloudOperationJournalEntry operation = (await verify.Operations.GetAsync(operationId))!;
+            Assert.Equal(original.Sequence, operation.Sequence);
+            Assert.Equal(itemId, operation.ItemId);
+            Assert.Equal(new byte[] { 3, 4 }, operation.Payload.ToArray());
+            Assert.Equal(timestamp, operation.CreatedAt);
+            Assert.Equal(3, operation.AttemptCount);
+            Assert.Equal(original.RetryAfter, operation.RetryAfter);
+            Assert.Equal(new byte[] { 5, 6 }, (await verify.Conflicts.GetAsync(conflictId))!.Payload.ToArray());
+            CloudRemoteBatchState batch = (await verify.RemoteBatches.GetAsync("retained-batch"))!;
+            Assert.Equal(new byte[] { 7 }, batch.Cursor.ToArray());
+            Assert.Equal(new byte[] { 9 }, batch.Fingerprint.ToArray());
+            Assert.Equal("retained-change", batch.LastAppliedChangeId);
+            CloudEchoSuppressionState suppression = (await verify.EchoSuppressions.GetAsync(suppressionId))!;
+            Assert.Equal("old.txt", suppression.PreviousRelativePath);
+            Assert.Equal(2, suppression.RemainingObservations);
+            Assert.Equal(new byte[] { 10 }, suppression.Payload.ToArray());
+            CloudOperationJournalEntry next = await verify.Operations.EnqueueAsync(new CloudOperationJournalEntry(
+                Guid.NewGuid(), CloudStateOperationKind.MetadataUpdate, itemId, [11], timestamp));
+            Assert.True(next.Sequence > original.Sequence);
+            await verify.CommitAsync();
+        }
+
+        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
+            "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
+    }
+
+    [Fact]
+    public async Task VersionSixFenceSurvivesProcessExitBeforeApplicationCommit()
+    {
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            await seed.Checkpoints.UpsertAsync(new CloudStateCheckpoint("retained/before-crash", [12], DateTimeOffset.UtcNow));
+            await seed.CommitAsync();
+        }
+
+        await ExecuteSqlAsync(_databasePath, "UPDATE cfsharp_schema SET version = 5 WHERE singleton = 1;");
+        (int exitCode, _) = await RunCrashHarnessAsync("before-commit", _databasePath, _syncRootPath);
+        Assert.NotEqual(0, exitCode);
+        Assert.True(File.Exists(_databasePath + ".before-commit.started"));
+        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
+            "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
+        await using ICloudStateStore recovered = await CreateFactory().OpenAsync(CreateContext());
+        await using ICloudStateTransaction verify = await recovered.BeginTransactionAsync();
+        Assert.Equal(new byte[] { 12 }, (await verify.Checkpoints.GetAsync("retained/before-crash"))!.Value.ToArray());
+        Assert.Null(await verify.Items.GetByRelativePathAsync("crash-recovery.txt"));
     }
 
     [Fact]
@@ -450,7 +558,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
                 singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             );
-            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 6);
+            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 7);
             """);
 
         SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<
@@ -717,11 +825,28 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
 
         using Process process = new() { StartInfo = startInfo };
         Assert.True(process.Start());
+        // FailFast diagnostics can fill a redirected Windows pipe before the child terminates.
+        // Drain both streams concurrently with the exit wait, and always reap a timed-out child
+        // before fixture disposal tries to remove its still-open SQLite files.
+        Task<string> standardOutput = process.StandardOutput.ReadToEndAsync();
+        Task<string> standardError = process.StandardError.ReadToEndAsync();
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
-        await process.WaitForExitAsync(timeout.Token);
-        string output = await process.StandardOutput.ReadToEndAsync() +
-            await process.StandardError.ReadToEndAsync();
-        return (process.ExitCode, output);
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+            string output = await standardOutput + await standardError;
+            return (process.ExitCode, output);
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync();
+            }
+
+            await Task.WhenAll(standardOutput, standardError);
+        }
     }
 
     private static async Task<long> ExecuteScalarInt64Async(string databasePath, string sql)

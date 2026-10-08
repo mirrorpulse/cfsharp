@@ -1,3 +1,3 @@
-# Default owner for repository changes. Replace with an organization team when
-# a dedicated MirrorPulse maintainers team is created.
+# MirrorPulse Team maintains the project. Keep the individual GitHub owner until
+# a visible organization team is available; team entries require @org/team-slug.
 * @Quaternion8192

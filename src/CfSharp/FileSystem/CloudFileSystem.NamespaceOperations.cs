@@ -36,6 +36,14 @@ public sealed partial class CloudFileSystem
             ? validatedName
             : Path.Combine(destination.RelativePath, validatedName);
         CloudItem movedItem = CreateItemReference(destinationRelativePath, item.Kind);
+        CloudDirectoryMoveProof? directoryProof = options.DirectoryMoveProof;
+        if (directoryProof is not null && (item.Kind != CloudItemKind.Directory ||
+            !CloudDirectoryStateProjection.SamePath(item.RelativePath, directoryProof.SourceRelativePath) ||
+            !CloudDirectoryStateProjection.SamePath(movedItem.RelativePath, directoryProof.DestinationRelativePath) ||
+            validatedName != Path.GetFileName(directoryProof.DestinationRelativePath)))
+        {
+            throw new ArgumentException("The directory proof must identify this source and exact intended destination.", nameof(options));
+        }
         if (item.Kind is CloudItemKind.Directory &&
             IsStrictDescendant(movedItem.FullPath, item.FullPath))
         {
@@ -52,6 +60,10 @@ public sealed partial class CloudFileSystem
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
             [sourceScope, destinationScope],
             cancellationToken).ConfigureAwait(false);
+        if (operation.Covers([sourceScope, destinationScope]))
+        {
+            operation.EstablishContext();
+        }
 
         LocalCloudItemInspection sourceState = CloudItemInspector.Inspect(item.FullPath, item.Kind);
         LocalCloudItemInspection destinationDirectoryState = CloudItemInspector.Inspect(
@@ -61,6 +73,45 @@ public sealed partial class CloudFileSystem
         {
             throw new DirectoryNotFoundException(
                 $"The destination directory does not exist: '{destination.FullPath}'.");
+        }
+
+        if (item is CloudDirectory)
+        {
+            // Resolve under the admitted lease, without entering a public reference API that
+            // would reject Stopping. Its path scopes already cover the case-insensitive alias.
+            movedItem = ResolveDirectoryMoveTarget(destination, validatedName);
+            if (directoryProof is not null && movedItem.RelativePath != directoryProof.DestinationRelativePath)
+            {
+                throw new ArgumentException("The directory proof must identify this source and exact intended destination.", nameof(options));
+            }
+        }
+
+        if (item is CloudDirectory directory && (directoryProof is not null || !sourceState.Exists))
+        {
+            directoryProof ??= await CloudDirectoryMoveEvidence.ReadIntentAsync(operation.StateStore,
+                item.RelativePath, movedItem.RelativePath, cancellationToken).ConfigureAwait(false);
+            if (directoryProof is null)
+            {
+                throw new FileNotFoundException("Directory recovery requires original durable pre-move evidence.", item.FullPath);
+            }
+
+            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveCoreAsync(directory,
+                (CloudDirectory)movedItem, directoryProof, operation, cancellationToken).ConfigureAwait(false);
+            if (IsCompletedDirectoryRecovery(recovery))
+            {
+                return await CreateRecoveredMoveResultAsync(item, movedItem, operation.StateStore, recovery).ConfigureAwait(false);
+            }
+
+            if (recovery.Outcome != CloudDirectoryMoveReconciliationOutcome.NotMoved || recovery.RequiresFullRescan)
+            {
+                ThrowDirectoryRecoveryFailure(item, movedItem, recovery, nativeMoveIssued: false, cancellationToken);
+            }
+
+            sourceState = CloudItemInspector.Inspect(item.FullPath, item.Kind);
+            if (!sourceState.Exists)
+            {
+                throw new FileNotFoundException("The directory changed during move validation; retry its original proof.", item.FullPath);
+            }
         }
 
         MoveStatePlan statePlan = await ReadMoveStatePlanAsync(
@@ -121,7 +172,16 @@ public sealed partial class CloudFileSystem
                 statePlan.SourceEntries.Count);
         }
 
-        if (string.Equals(item.FullPath, movedItem.FullPath, StringComparison.Ordinal))
+        string nativeSourcePath = item.FullPath;
+        if (item is CloudDirectory samePathDirectory &&
+            string.Equals(item.FullPath, movedItem.FullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            // A case-insensitive source reference alone cannot distinguish a no-op from a
+            // case-only rename. Use the observed spelling, including for the native rename.
+            nativeSourcePath = ReadDirectoryMovePath(samePathDirectory);
+        }
+
+        if (string.Equals(nativeSourcePath, movedItem.FullPath, StringComparison.Ordinal))
         {
             CloudItemSnapshot unchangedSnapshot = await InspectCoreAsync(
                 movedItem,
@@ -136,6 +196,21 @@ public sealed partial class CloudFileSystem
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        if (item is CloudDirectory managedDirectory && directoryProof is null && HasManagedDirectoryRoot(sourceState, statePlan.SourceEntries, item.RelativePath))
+        {
+            try
+            {
+                directoryProof = await PrepareDirectoryMoveCoreAsync(managedDirectory, (CloudDirectory)movedItem,
+                    operation, cancellationToken).ConfigureAwait(false);
+            }
+            catch (CloudDirectoryEvidenceUnavailableException)
+            {
+                // Additive recovery evidence cannot remove ordinary native move availability
+                // on storage without complete IDs or beyond the bounded preparation capacity.
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             if (item.Kind is CloudItemKind.File)
@@ -144,12 +219,27 @@ public sealed partial class CloudFileSystem
             }
             else
             {
-                Directory.Move(item.FullPath, movedItem.FullPath);
+                Directory.Move(nativeSourcePath, movedItem.FullPath);
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             throw CloudFilesException.FromException("CloudItem.Move", item.FullPath, exception);
+        }
+
+        if (item is CloudDirectory movedDirectory && directoryProof is not null)
+        {
+            // Native success must finish its durable phase under the already admitted lease.
+            // Public reference creation or reacquisition would reject Stopping while disposal
+            // is waiting for this operation to release the still-live store and path scopes.
+            CloudDirectoryMoveReconciliationResult recovery = await ReconcileDirectoryMoveCoreAsync(movedDirectory,
+                (CloudDirectory)movedItem, directoryProof, operation, CancellationToken.None).ConfigureAwait(false);
+            if (!IsCompletedDirectoryRecovery(recovery))
+            {
+                ThrowDirectoryRecoveryFailure(item, movedItem, recovery, nativeMoveIssued: true, CancellationToken.None);
+            }
+
+            return await CreateRecoveredMoveResultAsync(item, movedItem, operation.StateStore, recovery).ConfigureAwait(false);
         }
 
         try
@@ -181,6 +271,54 @@ public sealed partial class CloudFileSystem
             movedItem,
             snapshot,
             statePlan.SourceEntries.Count);
+    }
+
+    private static bool HasManagedDirectoryRoot(LocalCloudItemInspection native,
+        IReadOnlyList<CloudItemState> entries, string relativePath)
+    {
+        if (!native.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder))
+        {
+            return false;
+        }
+
+        try
+        {
+            CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Decode(native.PlaceholderIdentity);
+            return entries.Any(entry => entry.ItemId == identity.ItemId && entry.RemoteId == identity.RemoteId &&
+                entry.Kind == CloudItemKind.Directory && !entry.IsTombstone &&
+                CloudDirectoryStateProjection.SamePath(entry.RelativePath, relativePath));
+        }
+        catch (Exception exception) when (exception is InvalidDataException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsCompletedDirectoryRecovery(CloudDirectoryMoveReconciliationResult recovery) =>
+        recovery.Outcome is CloudDirectoryMoveReconciliationOutcome.Projected or CloudDirectoryMoveReconciliationOutcome.AlreadyProjected &&
+        recovery.DurableProjectionCommitted;
+
+    private static async ValueTask<CloudItemMoveResult> CreateRecoveredMoveResultAsync(CloudItem source,
+        CloudItem target, ICloudStateStore store, CloudDirectoryMoveReconciliationResult recovery) =>
+        new(source.FullPath, target.FullPath, target, await InspectCoreAsync(target, store, CancellationToken.None).ConfigureAwait(false),
+            recovery.DurableStateEntriesUpdated, recovery);
+
+    private static void ThrowDirectoryRecoveryFailure(CloudItem source, CloudItem target,
+        CloudDirectoryMoveReconciliationResult recovery, bool nativeMoveIssued, CancellationToken cancellationToken)
+    {
+        Exception error = recovery.Error ?? new InvalidOperationException(
+            $"The directory proof cannot coordinate this move ({recovery.Outcome}); reconcile the namespace before retrying.");
+        if (nativeMoveIssued || recovery.NativeMoveObserved)
+        {
+            throw new CloudItemCoordinationException("CloudItem.Move", source.FullPath, target.FullPath, null, error, recovery);
+        }
+
+        if (recovery.Outcome == CloudDirectoryMoveReconciliationOutcome.Canceled)
+        {
+            throw new OperationCanceledException("Directory move validation was canceled.", error, cancellationToken);
+        }
+
+        throw new InvalidOperationException("The directory move proof could not be verified.", error);
     }
 
     internal async ValueTask<CloudItemDeleteResult> DeleteAsync(
@@ -294,29 +432,10 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        DateTimeOffset updatedAt = DateTimeOffset.UtcNow;
-        foreach (CloudItemState item in sourceEntries)
-        {
-            string suffix = item.RelativePath.Length == sourceRelativePath.Length
-                ? string.Empty
-                : item.RelativePath[sourceRelativePath.Length..]
-                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string updatedPath = suffix.Length == 0
-                ? destinationRelativePath
-                : Path.Combine(destinationRelativePath, suffix);
-            await transaction.Items.UpsertAsync(
-                new CloudItemState(
-                    item.ItemId,
-                    item.RemoteId,
-                    updatedPath,
-                    item.Kind,
-                    item.RemoteRevision,
-                    item.LocalFileId,
-                    item.IsTombstone,
-                    updatedAt),
-                cancellationToken).ConfigureAwait(false);
-        }
-
+        await CloudDirectoryStateProjection.ProjectAsync(transaction, sourceEntries,
+            sourceRelativePath, destinationRelativePath, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RelocateRetainedPathsAsync(transaction, sourceEntries,
+            sourceRelativePath, destinationRelativePath, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 

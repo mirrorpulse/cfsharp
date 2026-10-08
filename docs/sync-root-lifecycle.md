@@ -28,8 +28,16 @@ registration after the call succeeds.
 registration, and connects the optional content provider. Work admitted after start holds an
 explicit operation lease.
 
-Disposal rejects new work, waits for admitted operations, stops the provider session, and closes
-durable state. It intentionally leaves the sync-root registration installed.
+Disposal rejects new public work, stops the local notification producer, and drains accepted
+notifications and admitted operations before stopping the provider session and closing durable
+state. Accepted renames retain internal path-scope admission during `Stopping`; disposal does not
+hold the lifecycle admission lock while awaiting their completion. Concurrent disposal attempts
+remain serialized. It intentionally leaves the sync-root registration installed.
+
+An admitted `MoveToAsync` retains the same operation lease, validated destination reference, and
+state store through directory preparation and recovery. If disposal starts after preparation or
+native movement, it waits for the admitted durable projection and native validation to finish.
+Public operations remain closed during `Stopping`, including calls on existing item references.
 
 ## Unregister only for removal
 

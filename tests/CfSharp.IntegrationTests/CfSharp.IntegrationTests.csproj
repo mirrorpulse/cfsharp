@@ -23,4 +23,9 @@
     <ProjectReference Include="..\CfSharp.Storage.Sqlite.CrashHarness\CfSharp.Storage.Sqlite.CrashHarness.csproj"
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\CfSharp.Storage.Sqlite.Tests\PreviewThreeStateFixture.cs" Link="Persistence\PreviewThreeStateFixture.cs" />
+    <EmbeddedResource Include="..\CfSharp.Storage.Sqlite.Tests\Fixtures\preview3-state.zip" LogicalName="CfSharp.PreviewThreeStateFixture.zip" />
+  </ItemGroup>
 </Project>

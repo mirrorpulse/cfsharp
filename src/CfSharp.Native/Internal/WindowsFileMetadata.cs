@@ -32,6 +32,52 @@ internal static unsafe partial class WindowsFileMetadata
         return value;
     }
 
+    internal static string ReadFinalPath(nint handle)
+    {
+        char[] buffer = new char[260];
+        while (true)
+        {
+            uint length;
+            fixed (char* pointer = buffer)
+            {
+                // Normalized DOS spelling observes the current namespace through the existing
+                // object handle, including a case-only rename. Successful lengths exclude NUL;
+                // insufficient-buffer lengths include it. Never close a borrowed handle here.
+                // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
+                length = GetFinalPathNameByHandle(handle, pointer, (uint)buffer.Length, 0);
+            }
+
+            if (length == 0)
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+
+            if (length < buffer.Length)
+            {
+                string path = new(buffer, 0, (int)length);
+                if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+                {
+                    path = @"\\" + path[8..];
+                }
+                else if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
+                {
+                    path = path[4..];
+                }
+
+                return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+            }
+
+            // Bound repeated growth even if a concurrent external rename changes the required
+            // length between calls. This query never follows a final link opened as reparse data.
+            if (length > 32768 || buffer.Length == 32768)
+            {
+                throw new PathTooLongException("The native namespace path exceeds the Windows path limit.");
+            }
+
+            buffer = new char[Math.Min(32768, checked((int)length + 1))];
+        }
+    }
+
     [SupportedOSPlatform("windows10.0.16299")]
     internal static NativeFileMetadata Read(nint handle, nint protectedHandle = 0)
     {
@@ -122,6 +168,10 @@ internal static unsafe partial class WindowsFileMetadata
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvStdcall) })]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetFileInformationByHandleEx(nint handle, int informationClass, void* value, uint size);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true)]
+    [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static partial uint GetFinalPathNameByHandle(nint handle, char* path, uint capacity, uint flags);
 }
 
 internal sealed record NativeFileMetadata(WindowsFileMetadata.FileIdentity Identity, long Length,

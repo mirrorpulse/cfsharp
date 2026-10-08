@@ -69,7 +69,8 @@ public sealed class CloudItemCoordinationFailureTests
             Assert.Equal("CloudItem.Move", moveFailure.Operation);
             Assert.Equal(sourcePath, moveFailure.Path);
             Assert.Equal(movedPath, moveFailure.DestinationPath);
-            Assert.IsType<IOException>(moveFailure.InnerException);
+            IOException moveCommitFailure = Assert.IsType<IOException>(moveFailure.InnerException);
+            Assert.Equal("Injected commit failure.", moveCommitFailure.Message);
             Assert.False(Directory.Exists(sourcePath));
             Assert.True(
                 Directory.Exists(movedPath),
@@ -83,7 +84,8 @@ public sealed class CloudItemCoordinationFailureTests
             Assert.Equal("CloudItem.Delete", deleteFailure.Operation);
             Assert.Equal(deletePath, deleteFailure.Path);
             Assert.Null(deleteFailure.DestinationPath);
-            Assert.IsType<IOException>(deleteFailure.InnerException);
+            IOException deleteCommitFailure = Assert.IsType<IOException>(deleteFailure.InnerException);
+            Assert.Equal("Injected commit failure.", deleteCommitFailure.Message);
             Assert.False(File.Exists(deletePath));
         }
         finally
@@ -195,7 +197,7 @@ public sealed class CloudItemCoordinationFailureTests
 
             public ICloudItemStateRepository Items => this;
 
-            public ICloudCheckpointRepository Checkpoints => throw new NotSupportedException();
+            public ICloudCheckpointRepository Checkpoints { get; } = new EmptyCheckpoints();
 
             public ICloudOperationJournal Operations => throw new NotSupportedException();
 
@@ -293,6 +295,24 @@ public sealed class CloudItemCoordinationFailureTests
             }
 
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+            private sealed class EmptyCheckpoints : ICloudCheckpointRepository
+            {
+                public ValueTask<CloudStateCheckpoint?> GetAsync(string name, CancellationToken cancellationToken = default)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return ValueTask.FromResult<CloudStateCheckpoint?>(null);
+                }
+
+                // This fault fixture has no captured provenance. Reads must report absence;
+                // unexpected metadata writes still fail before the deliberate commit fault.
+                public ValueTask<IReadOnlyList<CloudStateCheckpoint>> ListAsync(string namePrefix, CancellationToken cancellationToken = default) =>
+                    throw new NotSupportedException();
+                public ValueTask UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken = default) =>
+                    throw new NotSupportedException();
+                public ValueTask RemoveAsync(string name, CancellationToken cancellationToken = default) =>
+                    throw new NotSupportedException();
+            }
         }
     }
 }

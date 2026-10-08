@@ -86,6 +86,21 @@ jobs:
       - name: Pack SQLite state provider
         run: dotnet pack src/CfSharp.Storage.Sqlite/CfSharp.Storage.Sqlite.csproj --configuration Release --no-build --output artifacts/packages -p:Version=0.0.0-ci.${{ github.run_number }} -p:PackageVersion=0.0.0-ci.${{ github.run_number }}
 
+      - name: Verify isolated package capabilities on x64
+        shell: pwsh
+        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities
+
+      - name: Upload x64 package capability evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-capabilities-x64
+          path: |
+            artifacts/package-capabilities/**/manifest.json
+            artifacts/package-capabilities/**/consumer-smoke/packages.lock.json
+            artifacts/package-capabilities/**/packages/*
+          if-no-files-found: ignore
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -146,6 +161,10 @@ jobs:
       - name: Test ARM64 solution
         run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
 
+      - name: Verify isolated package capabilities on ARM64
+        shell: pwsh
+        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities
+
       - name: Upload ARM64 test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -154,6 +173,9 @@ jobs:
           path: |
             **/TestResults/**
             artifacts/runtime-boundaries/**
+            artifacts/package-capabilities/**/manifest.json
+            artifacts/package-capabilities/**/consumer-smoke/packages.lock.json
+            artifacts/package-capabilities/**/packages/*
           if-no-files-found: error
 
   native-abi-x64:
