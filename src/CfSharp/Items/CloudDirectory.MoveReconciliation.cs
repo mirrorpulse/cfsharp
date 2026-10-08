@@ -11,7 +11,9 @@ public sealed partial class CloudDirectory
     /// 1709 and complete native IDs. This method never moves a directory, rewrites native identity,
     /// hydrates content, clears dirty state, or acknowledges journal entries. It authenticates the
     /// proof in the same durable store, protects parent paths and the target with metadata guards,
-    /// and validates native observations around one atomic path/receipt transaction. Such guards
+    /// and validates native observations around one atomic path/receipt transaction. The transaction
+    /// also refreshes retained live membership of source and destination ancestors once each;
+    /// their bindings and historical preparations and receipts remain unchanged. Such guards
     /// do not freeze content, identity, or descendant changes across processes. Retry a pending
     /// projection with the same proof; conflicts require reconciliation, not a guessed replacement.
     /// The result owns no protection lifetime. Concurrent calls are coordinated within this owner.

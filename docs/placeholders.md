@@ -31,8 +31,12 @@ After the external move, call `await originalDirectory.ReconcileMoveAsync(proof)
 source reference. Recovery never issues another native move. It validates the original stored
 preparation, complete native root/directory binding and opaque identity, actual namespace spelling,
 and known current membership. Source and destination paths and an immutable completion receipt
-commit together. Current revisions, local IDs, tombstones, and pending journal IDs/sequences/payloads
-are retained; a root already at the target is still a proven member. Unrelated target rows remain
+commit together. The same transaction refreshes retained live membership of source and destination
+ancestors once each, including the common parent of a renamed child. This allows a later external
+parent move to recover from its current membership; ancestor bindings and immutable historical
+preparations, manifests, and receipts remain unchanged. Current revisions, local IDs, tombstones,
+and pending journal IDs/sequences/payloads are retained; a root already at the target is still a
+proven member. Unrelated target rows remain
 untouched and cause a conflict. A historical receipt cannot regress later state.
 
 Inspect `Outcome`, `Stage`, `NativeMoveObserved`, `DurableProjectionCommitted`, and

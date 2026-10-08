@@ -92,11 +92,7 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
                 captured.Add(relativePath, provenance);
             }
 
-            string? parent = Path.GetDirectoryName(relativePath);
-            while (!string.IsNullOrEmpty(parent) && ancestors.Add(parent))
-            {
-                parent = Path.GetDirectoryName(parent);
-            }
+            AddAncestors(ancestors, relativePath);
         }
 
         // All item rows must already be written. Capture each new native binding first, then
@@ -107,15 +103,26 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
 
+        ancestors.ExceptWith(captured.Keys);
+        await RefreshAncestorsAsync(transaction, ancestors, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void AddAncestors(HashSet<string> ancestors, string relativePath)
+    {
+        string? parent = Path.GetDirectoryName(relativePath);
+        while (!string.IsNullOrEmpty(parent) && ancestors.Add(parent))
+        {
+            parent = Path.GetDirectoryName(parent);
+        }
+    }
+
+    private static async ValueTask RefreshAncestorsAsync(ICloudStateTransaction transaction,
+        IEnumerable<string> ancestors, CancellationToken cancellationToken)
+    {
         // Refresh existing bindings without traversing native subtrees or manufacturing new
-        // historical evidence. Shared ancestors of siblings use the same final row snapshot.
+        // historical evidence. Shared ancestors use the same final row snapshot once.
         foreach (string parent in ancestors)
         {
-            if (captured.ContainsKey(parent))
-            {
-                continue;
-            }
-
             CloudItemState? directory = await transaction.Items.GetByRelativePathAsync(parent, cancellationToken).ConfigureAwait(false);
             if (directory is { Kind: CloudItemKind.Directory, IsTombstone: false })
             {
@@ -202,6 +209,14 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
 
             await RetainMetadataAsync(transaction, provenance, cancellationToken).ConfigureAwait(false);
         }
+
+        // A child move changes membership outside the moved subtree as well. Refresh both
+        // ancestor chains from the final official rows in the projection/receipt transaction,
+        // retaining their native bindings and every immutable preparation and receipt.
+        HashSet<string> ancestors = new(StringComparer.OrdinalIgnoreCase);
+        AddAncestors(ancestors, proof.SourceRelativePath);
+        AddAncestors(ancestors, proof.DestinationRelativePath);
+        await RefreshAncestorsAsync(transaction, ancestors, cancellationToken).ConfigureAwait(false);
     }
 
     private static async ValueTask RetainMetadataAsync(ICloudStateTransaction transaction, CloudDirectoryProvenance provenance,
