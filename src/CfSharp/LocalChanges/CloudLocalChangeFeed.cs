@@ -121,9 +121,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <param name="cancellationToken">Token that cancels the read without acknowledging anything.</param>
     /// <returns>An ordered bounded batch. The batch is immutable and safe to retain.</returns>
     /// <remarks>
-    /// Loss received during the journal read withholds changes and requires full reconciliation,
-    /// even if the worker persists its marker before the read finishes. Reading does not clear
-    /// that marker or acknowledge any pending operation.
+    /// Loss pending before or received during the journal read withholds changes and requires
+    /// full reconciliation, even if the worker persists its marker before the read finishes.
+    /// Reading does not clear that marker or acknowledge any pending operation.
     /// </remarks>
     /// <exception cref="InvalidOperationException">The feed has not been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
@@ -134,7 +134,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         while (true)
         {
             ThrowIfFailed();
-            long generation = Volatile.Read(ref _lossGeneration);
+            long generation = Volatile.Read(ref _persistedLossGeneration);
             await using ICloudStateTransaction transaction = await _stateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -144,8 +144,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             ThrowIfFailed();
-            // Persistence can clear HasUnpersistedLoss after this snapshot was read. Retain
-            // the generation boundary so that handoff cannot expose the earlier backlog.
+            // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
+            // the durable boundary before reading so loss already pending at entry is also
+            // retained across that handoff, rather than mistaken for part of this snapshot.
             bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
                 generation != Volatile.Read(ref _lossGeneration);
             if (rescan && (creation || operations.Count != 0 ||

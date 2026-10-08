@@ -15,6 +15,8 @@ public sealed partial class CloudLocalChangeFeed
     /// the captured boundary. Call ReadPageAsync with zero initially; restarting requires a new
     /// scan. This Windows feed can have concurrent consumers; callers own their dispatch and ACK
     /// coordination. Capturing a scan does not wait for native notifications still being processed.
+    /// Loss pending before or received during capture requires reconciliation even if its marker
+    /// finishes persisting before the scan is returned.
     /// </remarks>
     /// <exception cref="NotSupportedException">The custom journal does not implement optional paging.</exception>
     /// <exception cref="InvalidOperationException">The feed is not started or its worker failed.</exception>
@@ -24,7 +26,9 @@ public sealed partial class CloudLocalChangeFeed
     {
         EnsureStarted();
         ThrowIfFailed();
-        long generation = Volatile.Read(ref _lossGeneration);
+        // Match the snapshot against loss known durable before acquisition. A pending marker
+        // can finish after rollback, clearing the transient flag without belonging to this scan.
+        long generation = Volatile.Read(ref _persistedLossGeneration);
         long acknowledgementGeneration = Volatile.Read(ref _rescanAcknowledgementGeneration);
         await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);

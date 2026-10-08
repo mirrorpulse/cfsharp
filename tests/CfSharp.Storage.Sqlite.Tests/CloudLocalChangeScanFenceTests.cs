@@ -1,5 +1,4 @@
 using System.Reflection;
-using System.Threading.Channels;
 
 namespace CfSharp.Storage.Sqlite.Tests;
 
@@ -68,18 +67,14 @@ public sealed partial class CloudLocalChangeFeedTests
         FakeSource source = new();
         await using CloudLocalChangeFeed feed = CreateFeed(raceStore, source);
         await feed.StartAsync();
-        Channel<bool> availability = (Channel<bool>)typeof(CloudLocalChangeFeed)
-            .GetField("_availability", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(feed)!;
-        Assert.False(availability.Reader.TryPeek(out _));
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
         raceStore.AfterRollback = async () =>
         {
             await source.EmitAsync(new(watcherError ? LocalChangeSourceAction.Error : LocalChangeSourceAction.Overflow,
                 string.Empty, watcherError ? 5 : 0));
-            // The production worker publishes availability only after both committing its loss
-            // marker and marking that generation persisted. Preserve the signal for empty reads,
-            // but hold this older snapshot until the vulnerable handoff is complete.
-            Assert.True(await availability.Reader.WaitToReadAsync(timeout.Token));
+            // Hold the older snapshot until the worker has completed the persistence handoff.
+            // Availability is a consumable notification, not an exclusive completion barrier.
+            await WaitForLossPersistenceAsync(feed, timeout.Token);
             await using ICloudStateTransaction persisted = await store.BeginTransactionAsync(timeout.Token);
             Assert.True(LocalChangeCheckpoint.Decode((await persisted.Checkpoints
                 .GetAsync(CloudLocalChangeFeed.CheckpointName, timeout.Token))!.Value).RequiresFullRescan);
@@ -140,6 +135,64 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.True((await feed.ReadBatchAsync()).RequiresFullRescan);
         await AcknowledgePersistedRescanAsync(feed);
         Assert.False((await feed.BeginScanAsync()).RequiresFullRescan);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task PendingLossBeforeReadCannotDisappearDuringSnapshotRelease(bool watcherError, bool scanRead)
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        CloudOperationJournalEntry[] rows = await SeedChangesAsync(store, 2);
+        RaceStore raceStore = new(store);
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(raceStore, source);
+        await feed.StartAsync();
+        TaskCompletionSource lossPending = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource releasePersistence = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
+        raceStore.BeforeBegin = async () =>
+        {
+            // MarkRescanRequired has recorded this loss generation, but cannot yet open its
+            // transaction. Let the reader acquire an older checkpoint before persistence.
+            lossPending.TrySetResult();
+            await releasePersistence.Task.WaitAsync(timeout.Token);
+        };
+        await source.EmitAsync(new(watcherError ? LocalChangeSourceAction.Error : LocalChangeSourceAction.Overflow,
+            string.Empty, watcherError ? 5 : 0));
+        try
+        {
+            await lossPending.Task.WaitAsync(timeout.Token);
+            raceStore.AfterRollback = async () =>
+            {
+                releasePersistence.TrySetResult();
+                await WaitForLossPersistenceAsync(feed, timeout.Token);
+            };
+            if (scanRead)
+            {
+                CloudLocalChangeScan scan = await feed.BeginScanAsync(timeout.Token);
+                Assert.True(scan.RequiresFullRescan);
+                Assert.Empty((await feed.ReadPageAsync(scan, 0, 2, timeout.Token)).Changes);
+            }
+            else
+            {
+                CloudLocalChangeBatch batch = await feed.ReadBatchAsync(timeout.Token);
+                Assert.True(batch.RequiresFullRescan);
+                Assert.Empty(batch.Changes);
+            }
+
+            await feed.AcknowledgeFullRescanAsync(timeout.Token);
+            CloudLocalChangePage recovered = await feed.ReadPageAsync(await feed.BeginScanAsync(timeout.Token), 0, 2, timeout.Token);
+            Assert.False(recovered.RequiresFullRescan);
+            Assert.Equal(rows.Select(row => row.OperationId), recovered.Changes.Select(change => change.OperationId));
+            Assert.Equal(rows.Select(row => row.Sequence), recovered.Changes.Select(change => change.Sequence));
+        }
+        finally
+        {
+            releasePersistence.TrySetResult();
+        }
     }
 
     [Fact]
@@ -205,6 +258,25 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.True(page.RequiresFullRescan);
     }
 
+    private static async Task WaitForLossPersistenceAsync(CloudLocalChangeFeed feed, CancellationToken cancellationToken)
+    {
+        // These private counters select the race boundary only; assertions exercise the public
+        // feed and real durable journal. No timing delay substitutes for the worker's commit.
+        FieldInfo loss = typeof(CloudLocalChangeFeed).GetField("_lossGeneration", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        FieldInfo persisted = typeof(CloudLocalChangeFeed).GetField("_persistedLossGeneration", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long generation = (long)loss.GetValue(feed)!;
+            if (generation != 0 && generation == (long)persisted.GetValue(feed)!)
+            {
+                return;
+            }
+
+            await Task.Delay(10, cancellationToken);
+        }
+    }
+
     private static async Task AcknowledgePersistedRescanAsync(CloudLocalChangeFeed feed)
     {
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
@@ -224,10 +296,20 @@ public sealed partial class CloudLocalChangeFeedTests
 
     private sealed class RaceStore(ICloudStateStore inner) : ICloudStateStore
     {
+        internal Func<ValueTask>? BeforeBegin { get; set; }
         internal Func<ValueTask>? AfterRollback { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
-        public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
-            new RaceTransaction(await inner.BeginTransactionAsync(cancellationToken), this);
+        public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+        {
+            Func<ValueTask>? hook = BeforeBegin;
+            BeforeBegin = null;
+            if (hook is not null)
+            {
+                await hook();
+            }
+
+            return new RaceTransaction(await inner.BeginTransactionAsync(cancellationToken), this);
+        }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
