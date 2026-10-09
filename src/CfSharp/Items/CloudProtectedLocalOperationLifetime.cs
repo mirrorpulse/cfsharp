@@ -62,10 +62,19 @@ internal sealed class CloudProtectedLocalOperationLifetime : IDisposable
     }
 
     internal CancellationToken Token => _callback.Token;
-    internal bool IsCancellationRequested => _callback.IsCancellationRequested;
+    internal bool IsCancellationRequested => _callback.IsCancellationRequested || _caller.IsCancellationRequested ||
+        _owner.IsCancellationRequested || _deadline.IsCancellationRequested;
     internal bool TimedOut => _deadline.IsCancellationRequested && !_caller.IsCancellationRequested && !_owner.IsCancellationRequested;
     internal bool BudgetExpired => _deadline.IsCancellationRequested;
     internal Exception? CancellationCallbackError { get; private set; }
+
+    internal void ThrowIfCancellationRequested()
+    {
+        _caller.ThrowIfCancellationRequested();
+        _owner.ThrowIfCancellationRequested();
+        _deadline.Token.ThrowIfCancellationRequested();
+        _callback.Token.ThrowIfCancellationRequested();
+    }
 
     private void RequestStop()
     {

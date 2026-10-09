@@ -82,6 +82,8 @@ never owns a SQLite transaction.
 
 Cancellation stops new scope work and requests cooperative callback termination. CfSharp awaits
 the callback's actual completion and admitted scope work before releasing native or store resources.
+Native mutation boundaries check original request and step cancellation signals directly, so
+delayed linked-token propagation cannot start a mutation after cancellation has been requested.
 An uncooperative callback or stalled native driver can delay return; there is no safe forced abort.
 External owner disposal rejects new public work and drains admitted operations before closing the
 state store. Keep callbacks short and local, without network, worker RPC or user interaction.

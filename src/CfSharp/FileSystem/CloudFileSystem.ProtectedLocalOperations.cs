@@ -37,10 +37,10 @@ public sealed partial class CloudFileSystem
                 throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.Unsupported,
                     "Use exclusive mode for one file or metadata-only mode for one directory; tree freezing is unavailable.");
             }
-            stop.ThrowIfCancellationRequested();
+            lifetime.ThrowIfCancellationRequested();
             stage = CloudProtectedLocalOperationStage.Open;
             using SafeFileHandle handle = CloudLocalAccessObject.Open(item.FullPath, directory);
-            context = new(this, item, operation.StateStore, handle, request, stop);
+            context = new(this, item, operation.StateStore, handle, request, lifetime);
             try
             {
                 await context.InspectAsync(stop).ConfigureAwait(false);
@@ -48,11 +48,11 @@ public sealed partial class CloudFileSystem
                 {
                     await context.ConvertToPlaceholderAsync(identity, stop).ConfigureAwait(false);
                 }
-                stop.ThrowIfCancellationRequested();
+                lifetime.ThrowIfCancellationRequested();
                 // Invoke application work away from the caller's synchronization context so
                 // external synchronous disposal can drain without blocking its continuation.
                 await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
-                stop.ThrowIfCancellationRequested();
+                lifetime.ThrowIfCancellationRequested();
                 s_protectedLocalContext.Value = context;
                 try
                 {
@@ -75,7 +75,7 @@ public sealed partial class CloudFileSystem
             {
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(context.Failure);
             }
-            stop.ThrowIfCancellationRequested();
+            lifetime.ThrowIfCancellationRequested();
         }
         catch (Exception error)
         {

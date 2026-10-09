@@ -3,6 +3,75 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Theory]
+    [InlineData("request")]
+    [InlineData("scope")]
+    [InlineData("step")]
+    public async Task ProtectedLocalCancellationRejectsNativeConversionBeforeLinkedTokensCatchUp(string origin)
+    {
+        FaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new FaultFactory(path));
+        await File.WriteAllTextAsync(fixture.File.FullPath, "original");
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        factory!.LimitFaultsToCurrentRequest();
+        using CancellationTokenSource requestStop = new();
+        using CancellationTokenSource stepStop = new();
+        using ManualResetEventSlim release = new(false);
+        TaskCompletionSource handlerEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration = default;
+        Task canceling = Task.CompletedTask;
+        try
+        {
+            CloudProtectedLocalOperationResult result = await fixture.File.RunProtectedLocalOperationAsync(new(binding), async (scope, stop) =>
+            {
+                factory.BeforeTransaction = async () =>
+                {
+                    Assert.False(File.GetAttributes(fixture.File.FullPath).HasFlag(FileAttributes.ReparsePoint));
+                    CancellationToken original = origin == "request" ? requestStop.Token : origin == "scope" ? stop : stepStop.Token;
+                    // Register after the scope's linked-token bridge so CancelAsync's LIFO
+                    // handlers deterministically delay propagation while the source is canceled.
+                    registration = original.Register(() =>
+                    {
+                        handlerEntered.TrySetResult();
+                        release.Wait();
+                    });
+                    if (origin == "scope")
+                    {
+                        requestStop.Cancel();
+                    }
+                    else
+                    {
+                        canceling = (origin == "request" ? requestStop : stepStop).CancelAsync();
+                    }
+                    await handlerEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    Assert.True(original.IsCancellationRequested);
+                };
+                try
+                {
+                    await Assert.ThrowsAnyAsync<OperationCanceledException>(() => scope.ConvertToPlaceholderAsync(
+                        CloudPlaceholderIdentity.Create("cancel-before-native"), origin == "step" ? stepStop.Token : stop).AsTask());
+                }
+                finally
+                {
+                    release.Set();
+                    await canceling;
+                }
+            }, requestStop.Token);
+            Assert.Equal(CloudProtectedLocalOperationOutcome.Canceled, result.Outcome);
+            Assert.False(result.NativeConverted);
+            Assert.False(result.DurableProjectionCommitted);
+            Assert.True(result.Drained);
+            Assert.False((await fixture.File.InspectAsync()).IsPlaceholder);
+            Assert.Equal("original", await File.ReadAllTextAsync(fixture.File.FullPath));
+            Assert.Equal(0, fixture.Provider.Fetches);
+        }
+        finally
+        {
+            release.Set();
+            registration.Dispose();
+        }
+    }
+
+    [Theory]
     [InlineData("caller")]
     [InlineData("deadline")]
     [InlineData("owner")]

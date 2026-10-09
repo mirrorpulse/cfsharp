@@ -86,6 +86,7 @@ public sealed partial class CloudProtectedLocalOperationContext
             }
             LocalAccessDescriptor access = new(_handle, directory);
             access.SetSecurityDescriptorBinaryForm(copy, AccessControlSections.Access);
+            ThrowIfCancellationRequested(cancellationToken);
             token.ThrowIfCancellationRequested();
             access.Apply(_handle);
             AccessDescriptorApplied = true;

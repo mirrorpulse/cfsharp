@@ -26,6 +26,7 @@ public sealed partial class CloudProtectedLocalOperationContext
     private readonly ICloudStateStore _store;
     private readonly SafeFileHandle _handle;
     private readonly CloudProtectedLocalOperationRequest _request;
+    private readonly CloudProtectedLocalOperationLifetime _lifetime;
     private readonly CancellationToken _stop;
     private bool _accepting = true;
     private int _active;
@@ -41,19 +42,20 @@ public sealed partial class CloudProtectedLocalOperationContext
 
     /// <summary>Gets whether cancellation or scope exit is rejecting new work while resources remain retained.</summary>
     /// <remarks>Cancellation never releases a handle still in use by the callback or an admitted scope step.</remarks>
-    public bool IsDraining => Volatile.Read(ref _released) == 0 && (_stop.IsCancellationRequested || !Volatile.Read(ref _accepting));
+    public bool IsDraining => Volatile.Read(ref _released) == 0 && (_lifetime.IsCancellationRequested || !Volatile.Read(ref _accepting));
 
     internal void MarkResourcesReleased() => Volatile.Write(ref _released, 1);
 
     internal CloudProtectedLocalOperationContext(CloudFileSystem owner, CloudItem item, ICloudStateStore store,
-        SafeFileHandle handle, CloudProtectedLocalOperationRequest request, CancellationToken stop)
+        SafeFileHandle handle, CloudProtectedLocalOperationRequest request, CloudProtectedLocalOperationLifetime lifetime)
     {
         _item = item;
         _owner = owner;
         _store = store;
         _handle = handle;
         _request = request;
-        _stop = stop;
+        _lifetime = lifetime;
+        _stop = lifetime.Token;
     }
 
     internal CloudItemSnapshot? LastSnapshot { get; private set; }
@@ -137,8 +139,7 @@ public sealed partial class CloudProtectedLocalOperationContext
         lock (_admission)
         {
             ObjectDisposedException.ThrowIf(!_accepting, this);
-            _stop.ThrowIfCancellationRequested();
-            token.ThrowIfCancellationRequested();
+            ThrowIfCancellationRequested(token);
             _active++;
         }
         bool entered = false;
@@ -147,6 +148,7 @@ public sealed partial class CloudProtectedLocalOperationContext
             using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(_stop, token);
             await _serial.WaitAsync(stop.Token).ConfigureAwait(false);
             entered = true;
+            ThrowIfCancellationRequested(token);
             stop.Token.ThrowIfCancellationRequested();
             return await work(stop.Token).ConfigureAwait(false);
         }
@@ -179,6 +181,15 @@ public sealed partial class CloudProtectedLocalOperationContext
                 }
             }
         }
+    }
+
+    private void ThrowIfCancellationRequested(CancellationToken stepToken)
+    {
+        // CancelAsync marks its source immediately but dispatches linked-token callbacks
+        // asynchronously. Read the original signals at mutation boundaries so delayed
+        // propagation cannot admit a native change after cancellation was requested.
+        _lifetime.ThrowIfCancellationRequested();
+        stepToken.ThrowIfCancellationRequested();
     }
 
     internal async ValueTask CloseAsync()

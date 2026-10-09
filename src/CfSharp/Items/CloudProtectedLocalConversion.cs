@@ -67,7 +67,7 @@ public sealed partial class CloudProtectedLocalOperationContext
         {
             throw new ArgumentException("Local preparation cannot introduce an accepted remote revision.", nameof(identity));
         }
-        return ExecuteAsync(token => PrepareIdentityCoreAsync(identity, token), cancellationToken);
+        return ExecuteAsync(token => PrepareIdentityCoreAsync(identity, token, cancellationToken), cancellationToken);
     }
 
     internal ValueTask<CloudPlaceholderMutationResult> ConvertItemAsync(CloudItem item, CloudPlaceholderIdentity identity,
@@ -87,7 +87,7 @@ public sealed partial class CloudProtectedLocalOperationContext
     }
 
     private async ValueTask<CloudPlaceholderMutationResult> PrepareIdentityCoreAsync(CloudPlaceholderIdentity identity,
-        CancellationToken token)
+        CancellationToken token, CancellationToken stepToken)
     {
         SetStage(CloudProtectedLocalOperationStage.NativePreparation);
         if (_item.Kind != CloudItemKind.File || _preparedIdentity is not null && !_preparedIdentity.Equals(identity))
@@ -105,6 +105,7 @@ public sealed partial class CloudProtectedLocalOperationContext
             throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.NotApplicable,
                 "An existing placeholder must carry the exact original local identity.");
         }
+        ThrowIfCancellationRequested(stepToken);
         token.ThrowIfCancellationRequested();
         if (!placeholder)
         {
