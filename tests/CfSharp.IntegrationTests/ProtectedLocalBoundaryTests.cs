@@ -144,7 +144,7 @@ public sealed partial class CloudContentConfirmationTests
         CloudProtectedLocalOperationResult reparse = await fixture.File.RunProtectedLocalOperationAsync(new(binding),
             (_, _) => throw new InvalidOperationException("Foreign reparse data cannot enter a protected callback."));
         Assert.False(reparse.CallbackStarted);
-        Assert.True(reparse.Outcome is CloudProtectedLocalOperationOutcome.LocalObjectMismatch or CloudProtectedLocalOperationOutcome.NotApplicable);
+        Assert.Equal(CloudProtectedLocalOperationOutcome.NotApplicable, reparse.Outcome);
         Assert.False(reparse.AccessDescriptorApplied);
         Assert.Equal("original", await File.ReadAllTextAsync(original));
         File.Delete(fixture.File.FullPath);

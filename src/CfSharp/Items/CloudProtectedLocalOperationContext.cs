@@ -84,6 +84,16 @@ public sealed partial class CloudProtectedLocalOperationContext
     internal NativeFileMetadata ValidateObject()
     {
         NativeFileMetadata facts = WindowsFileMetadata.Read(_handle.DangerousGetHandle());
+        // Reject unsupported native objects before asking CFAPI for their root association.
+        // Foreign reparse data is not a Cloud Files capability/query failure.
+        if (facts.Directory != (_item.Kind == CloudItemKind.Directory) || facts.DeletePending ||
+            !facts.Directory && facts.Links != 1 ||
+            (facts.Attributes & (uint)FileAttributes.ReparsePoint) != 0 &&
+            !facts.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder))
+        {
+            throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.NotApplicable,
+                "Protection requires a live supported object, without foreign reparse data or existing file aliases.");
+        }
         using SafeFileHandle root = WindowsFileMetadata.Open(_item.SyncRootPath);
         int actualResult = NativeSyncRoot.Query(_handle.DangerousGetHandle(), out NativeSyncRootInfo? actualRoot);
         int ownedResult = NativeSyncRoot.Query(root.DangerousGetHandle(), out NativeSyncRootInfo? ownedRoot);
@@ -102,14 +112,6 @@ public sealed partial class CloudProtectedLocalOperationContext
         {
             throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.LocalObjectMismatch,
                 "The original native object or its namespace no longer matches the request.");
-        }
-        if (facts.Directory != (_item.Kind == CloudItemKind.Directory) || facts.DeletePending ||
-            !facts.Directory && facts.Links != 1 ||
-            (facts.Attributes & (uint)FileAttributes.ReparsePoint) != 0 &&
-            !facts.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder))
-        {
-            throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.NotApplicable,
-                "Protection requires a live supported object, without foreign reparse data or existing file aliases.");
         }
         return facts;
     }
