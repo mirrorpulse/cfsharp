@@ -1,10 +1,9 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
-
-using CfSharp.Native;
 
 using Microsoft.Win32.SafeHandles;
 
@@ -30,13 +29,13 @@ public sealed partial class CloudContentConfirmationTests
             await File.WriteAllTextAsync(target, "replacement");
         }
 
-        using SafeFileHandle access = NativeLocalAccessOpen(fixture.File.FullPath, 0x00060083, 0);
-        Assert.False(access.IsInvalid, $"Access open error={Marshal.GetLastPInvokeError()}");
+        using SafeFileHandle access = CloudLocalAccessObject.Open(fixture.File.FullPath);
         using LocalCompetitor competitor = StartLocalCompetitor(fixture.File.FullPath, target, action);
         try
         {
             CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "local-unuploaded");
-            long usn = NativeLocalConvert(access.DangerousGetHandle(), identity.Encode());
+            long usn = CloudPlaceholderMutationPlatform.Convert(access.DangerousGetHandle(), fixture.File.FullPath,
+                identity.Encode(), CloudPlaceholderConversionOptions.Default);
             Assert.Equal(binding, CloudLocalFileBindingPlatform.Read(access.DangerousGetHandle(), fixture.Root));
             LocalAccessSecurity descriptor = new(access);
             Assert.Equal(originalDacl, descriptor.GetSecurityDescriptorBinaryForm());
@@ -50,6 +49,12 @@ public sealed partial class CloudContentConfirmationTests
                 $"Competitor completed inside protection: {competitor.ExitCode}");
 
             CloudItemSnapshot held = await fixture.File.InspectAsync();
+            LocalCloudItemInspection sameObject = CloudItemInspector.Inspect(access, fixture.File.FullPath,
+                fixture.File.Kind, fixture.Root);
+            Assert.Equal(held.LocalBinding, sameObject.LocalBinding);
+            Assert.Equal(held.Length, sameObject.Length);
+            Assert.Equal(held.CreationTime, sameObject.CreationTime);
+            Assert.Equal(held.PlaceholderIdentity.ToArray(), sameObject.PlaceholderIdentity);
             Assert.Equal(binding, held.LocalBinding);
             Assert.True(held.IsPlaceholder);
             Assert.Equal(content.Length, held.Length);
@@ -118,9 +123,7 @@ public sealed partial class CloudContentConfirmationTests
 
         CloudItemSnapshot before = await item.InspectAsync();
         CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(before.LocalBinding);
-        using SafeFileHandle access = NativeLocalAccessOpen(item.FullPath,
-            kind == "directory" ? 0x00060080u : 0x00060083u, kind == "directory" ? 3u : 0u);
-        Assert.False(access.IsInvalid, $"Access open error={Marshal.GetLastPInvokeError()}");
+        using SafeFileHandle access = CloudLocalAccessObject.Open(item.FullPath, kind == "directory");
         Assert.Equal(binding, CloudLocalFileBindingPlatform.Read(access.DangerousGetHandle(), fixture.Root));
         LocalAccessSecurity descriptor = new(access, kind == "directory");
         byte[] original = descriptor.GetSecurityDescriptorBinaryForm();
@@ -170,27 +173,10 @@ public sealed partial class CloudContentConfirmationTests
         {
             writer.Dispose();
         }
-        using SafeFileHandle access = NativeLocalAccessOpen(fixture.File.FullPath, 0x00060083, 0);
-        int error = Marshal.GetLastPInvokeError();
-        Assert.True(access.IsInvalid, "Writable section or writer admitted an exclusive object handle.");
-        Assert.Equal(32, error);
+        Win32Exception error = Assert.Throws<Win32Exception>(() => CloudLocalAccessObject.Open(fixture.File.FullPath));
+        Assert.Equal(32, error.NativeErrorCode);
         Assert.Equal(0, fixture.Provider.Fetches);
     }
-
-    private static unsafe long NativeLocalConvert(nint handle, byte[] identity)
-    {
-        fixed (byte* pointer = identity)
-        {
-            long usn = 0;
-            int result = CfApi.CfConvertToPlaceholder(handle, pointer, (uint)identity.Length, CfConvertFlags.None, &usn, null);
-            Assert.True(result >= 0, $"CfConvertToPlaceholder HRESULT=0x{result:X8}");
-            return usn;
-        }
-    }
-
-    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeFileHandle NativeLocalAccessOpen(string path, uint access = 0x00060080,
-        uint share = 3, nint security = 0, uint creation = 3, uint flags = 0x02200000, nint template = 0);
 
     private sealed class LocalAccessSecurity : NativeObjectSecurity
     {

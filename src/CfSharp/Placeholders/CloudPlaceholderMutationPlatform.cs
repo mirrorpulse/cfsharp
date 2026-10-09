@@ -22,11 +22,17 @@ internal static class CloudPlaceholderMutationPlatform
             "CloudItem.ConvertToPlaceholder.Open");
         using SafeCloudFilesProtectedHandle.CloudFilesHandleReference handle =
             protectedHandle.AcquireReference();
+        return Convert(handle.Win32Handle, path, encodedIdentity, options);
+    }
+
+    internal static unsafe long Convert(nint fileHandle, string path, byte[] encodedIdentity,
+        CloudPlaceholderConversionOptions options)
+    {
         fixed (byte* identityPointer = encodedIdentity)
         {
             long operationUsn;
             int result = CfApi.CfConvertToPlaceholder(
-                handle.Win32Handle,
+                fileHandle,
                 identityPointer,
                 checked((uint)encodedIdentity.Length),
                 CreateConvertFlags(options),

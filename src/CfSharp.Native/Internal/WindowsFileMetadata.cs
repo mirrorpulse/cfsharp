@@ -25,6 +25,38 @@ internal static unsafe partial class WindowsFileMetadata
         return handle;
     }
 
+    internal static SafeFileHandle OpenLocalAccess(string path, bool directory)
+    {
+        // A single file object owns both data exclusion and security access. A separate
+        // WRITE_DAC opener can break a CFAPI oplock and wait for our own referenced owner.
+        // READ/WRITE_DATA with share-none rejects existing writers and writable sections;
+        // metadata-only directory access pins its name without freezing its membership.
+        // OPEN_REPARSE_POINT prevents a final symbolic link from redirecting this access.
+        SafeFileHandle handle = CreateFile(path, directory ? 0x60080u : 0x60083u,
+            directory ? 3u : 0u, 0, 3, 0x02200000, 0);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+        return handle;
+    }
+
+    internal static FileBasicInfo ReadBasic(nint handle)
+    {
+        FileBasicInfo value;
+        Query(handle, 0, &value, (uint)sizeof(FileBasicInfo));
+        return value;
+    }
+
+    internal static long ReadLength(nint handle)
+    {
+        FileStandardInfo value;
+        Query(handle, 1, &value, (uint)sizeof(FileStandardInfo));
+        return value.EndOfFile;
+    }
+
     internal static FileIdentity ReadIdentity(nint handle)
     {
         FileIdentity value;
@@ -140,6 +172,16 @@ internal static unsafe partial class WindowsFileMetadata
     {
         internal ulong VolumeSerialNumber;
         internal Guid FileId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FileBasicInfo
+    {
+        internal long CreationTime;
+        internal long LastAccessTime;
+        internal long LastWriteTime;
+        internal long ChangeTime;
+        internal uint Attributes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
