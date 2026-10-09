@@ -15,6 +15,7 @@ working directly with `cfapi.h` and `CldApi.dll`.
 | Upload local changes | [Local change feed](local-change-feed.md) |
 | Apply remote metadata changes | [Remote change application](remote-change-application.md) |
 | Choose and protect durable state | [SQLite state](state-store-sqlite.md) |
+| Initialize one local object's identity and permissions | [Protected local operations](protected-local-operations.md) |
 | Check OS and architecture support | [Platform support](platform-support.md) |
 | Diagnose a failed operation | [Troubleshooting](troubleshooting.md) |
 | Understand branches and releases | [Release and branch model](releasing.md) |

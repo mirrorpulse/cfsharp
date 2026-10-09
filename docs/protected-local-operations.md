@@ -106,3 +106,24 @@ The immutable receipt records the observed binding/snapshot, last work stage, ca
 error and elapsed lifetime. It does not declare independently verified permissions, whole-tree
 readiness, remote acceptance, synchronization confirmation or journal ACK. The application owns
 its intent, original DACL, roles, namespace fence, permission verification and recovery policy.
+
+## Host initialization example
+
+The compiled [sample helper](https://github.com/mirrorpulse/cfsharp/blob/develop/samples/CfSharp.SampleProvider/ProtectedLocalInitialization.cs)
+uses only public APIs. It begins with an ordinary inspection request, captures the original DACL
+under protection, awaits the host's durable-originals delegate, then converts and applies the
+host's desired Access descriptor. This ordering records original evidence before any mutation.
+Persist intent and complete binding before beginning the scope; serialize descriptor bytes rather
+than retaining a mutable .NET object. Local evidence belongs outside the sync root and outside the
+official CfSharp state schema. The host verification delegate and its recovery ledger remain
+separate from the library receipt. Keep every delegate short and local.
+
+For an already prepared placeholder, a basic inspection request can perform Access-only work
+without replacing identity, including placeholders whose identity carries an accepted revision.
+Local conversion requests cannot introduce such a revision. A known ordinary item must retain
+its official ItemId and RemoteId when selecting a local identity; do not invent a replacement ID.
+
+The isolated NuGet consumer exercises conversion, DACL read/apply/readback, cold metadata and root
+directory mode through published package surfaces after trim and Native AOT compilation. Synthetic
+Windows x64/ARM64 library evidence does not close installed/MSIX, non-administrator, whole-tree or
+MirrorPulse product acceptance. Those checks remain the host application's responsibility.

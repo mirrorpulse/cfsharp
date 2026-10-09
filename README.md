@@ -30,6 +30,12 @@ without acknowledging a deferred head, and [verified directory move recovery](do
 that preserves subtree identities, current revisions, and pending journal operations. Applications
 retain their own dispatch policy and durable move intents.
 
+[Protected local operations](docs/protected-local-operations.md) retain one original native object
+across a short asynchronous callback, same-object local conversion and Access-only descriptor work.
+They preserve unuploaded bytes and pending state without marking in sync or acknowledging changes.
+The host owns original evidence, permission policy, verification and recovery; directory mode does
+not freeze tree membership.
+
 ## Quick start
 
 ### Requirements

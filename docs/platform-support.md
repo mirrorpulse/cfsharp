@@ -16,6 +16,7 @@ capabilities use additional build or Cloud Files integration thresholds:
 | Placeholder management policy | Integration 784 or later |
 | Full-restart hydration and force-convert flags | Integration 1280 or later |
 | Hydration range information | Integration 1536 or later |
+| Protected local callbacks and Access-only descriptors | Windows build 16299 or later; applicable native data/DACL access and verified same-object sharing |
 
 Callers should feature-detect optional capabilities and handle the reported unsupported result.
 
@@ -36,3 +37,11 @@ scripts before treating a local build as a supported result.
 The core API is Windows-only. Desktop Shell behavior, MSIX/Desktop Bridge packaging, Explorer
 visual evidence, and host registration are validated separately from the library's managed tests.
 The host application remains responsible for registration and removal UX.
+
+Protected local file operations reject existing writers, writable mappings and aliases. Local
+conversion or file DACL application requires the actual disallowed-placeholder-hardlink policy.
+Ordinary-file inspection does not provide hardlink freezing. Cold metadata and DACL work reads no
+source content. Directory metadata mode pins one namespace object while members remain free to
+change; it provides no tree freeze. Cancellation and short budgets stop new work, then drain actual
+callbacks before release. Native driver stalls and uncooperative callbacks can delay completion.
+See [Protected local operations](protected-local-operations.md) for receipts and recovery.
