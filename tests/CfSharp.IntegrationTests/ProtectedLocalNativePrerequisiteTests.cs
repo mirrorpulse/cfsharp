@@ -60,7 +60,7 @@ public sealed partial class CloudContentConfirmationTests
             Assert.Equal(content.Length, held.Length);
             Assert.Equal(CloudSynchronizationState.NotInSync, held.SynchronizationState);
             Assert.Equal(identity.Encode(), held.PlaceholderIdentity.ToArray());
-            Assert.Equal(originalDacl, new LocalAccessSecurity(access).GetSecurityDescriptorBinaryForm());
+            AssertSameAccessDacl(originalDacl, new LocalAccessSecurity(access).GetSecurityDescriptorBinaryForm());
             Assert.Equal(0, fixture.Provider.Fetches);
             output.WriteLine($"OS={Environment.OSVersion.Version}; Architecture={RuntimeInformation.ProcessArchitecture}; Action={action}; ConvertUsn={usn}; HeldExit={(competitor.HasExited ? competitor.ExitCode : null)}");
 
@@ -129,7 +129,7 @@ public sealed partial class CloudContentConfirmationTests
         byte[] original = descriptor.GetSecurityDescriptorBinaryForm();
         await Task.Delay(20);
         descriptor.Apply(access);
-        Assert.Equal(original, new LocalAccessSecurity(access, kind == "directory").GetSecurityDescriptorBinaryForm());
+        AssertSameAccessDacl(original, new LocalAccessSecurity(access, kind == "directory").GetSecurityDescriptorBinaryForm());
         Assert.Equal(binding, (await item.InspectAsync()).LocalBinding);
         Assert.Equal(0, fixture.Provider.Fetches);
         if (kind == "cold")
@@ -176,6 +176,24 @@ public sealed partial class CloudContentConfirmationTests
         Win32Exception error = Assert.Throws<Win32Exception>(() => CloudLocalAccessObject.Open(fixture.File.FullPath));
         Assert.Equal(32, error.NativeErrorCode);
         Assert.Equal(0, fixture.Provider.Fetches);
+    }
+
+    private static void AssertSameAccessDacl(byte[] expected, byte[] actual)
+    {
+        // SetSecurityInfo may normalize SE_DACL_AUTO_INHERITED and returned owner/group
+        // fields. Compare the complete ordered ACL and its protection bit, rather than
+        // unrelated descriptor offsets or the kernel's automatic-inheritance bookkeeping.
+        RawSecurityDescriptor before = new(expected, 0);
+        RawSecurityDescriptor after = new(actual, 0);
+        Assert.Equal(before.ControlFlags & ControlFlags.DiscretionaryAclProtected,
+            after.ControlFlags & ControlFlags.DiscretionaryAclProtected);
+        RawAcl original = Assert.IsType<RawAcl>(before.DiscretionaryAcl);
+        RawAcl observed = Assert.IsType<RawAcl>(after.DiscretionaryAcl);
+        byte[] originalBytes = new byte[original.BinaryLength];
+        byte[] observedBytes = new byte[observed.BinaryLength];
+        original.GetBinaryForm(originalBytes, 0);
+        observed.GetBinaryForm(observedBytes, 0);
+        Assert.Equal(originalBytes, observedBytes);
     }
 
     private sealed class LocalAccessSecurity : NativeObjectSecurity
