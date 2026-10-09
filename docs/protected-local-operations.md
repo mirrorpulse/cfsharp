@@ -56,6 +56,8 @@ returns `NativeAppliedProjectionPending` and prevents a preparation-gated callba
 Keep the original binding and identity, then retry a new request after recovery or restart. A
 matching already prepared object needs no second conversion; a replacement is rejected. A
 transaction-disposal error after commit retains the true committed fact and its original error.
+If application code handles a scoped conversion's projection failure, later file DACL application
+in that same scope is still rejected until the required projection has recovered.
 
 Inside the callback, `ReadAccessDescriptorAsync` returns an independent `FileSecurity` or
 `DirectorySecurity`. `ApplyAccessDescriptorAsync` snapshots the input, applies only
@@ -127,3 +129,8 @@ The isolated NuGet consumer exercises conversion, DACL read/apply/readback, cold
 directory mode through published package surfaces after trim and Native AOT compilation. Synthetic
 Windows x64/ARM64 library evidence does not close installed/MSIX, non-administrator, whole-tree or
 MirrorPulse product acceptance. Those checks remain the host application's responsibility.
+
+Direct native mutation and sync-root re-registration must participate in the host's coordination.
+The scope protects normal conflicting file opens; it does not provide administrator resistance or
+exclusive access to all metadata writers. Retain original evidence and inspect again before later
+operations after release, including after Windows converts an edited placeholder back to a file.

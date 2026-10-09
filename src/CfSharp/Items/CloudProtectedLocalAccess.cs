@@ -43,8 +43,9 @@ public sealed partial class CloudProtectedLocalOperationContext
     /// Copies the input at admission so later caller changes do not affect the queued application.
     /// The caller must synchronize concurrent input edits while this copy is taken. Files must be
     /// placeholders under the actual disallowed-hardlink root policy, with no existing aliases.
-    /// Use a preparation request to convert an ordinary file before callback entry. Directory mode
-    /// provides metadata access only: Windows inheritance may affect descendants; membership and
+    /// Use a preparation request to convert an ordinary file before callback entry. A failed
+    /// required identity projection must recover before any later file DACL application.
+    /// Directory mode provides metadata access only: Windows inheritance may affect descendants; membership and
     /// their data are not frozen. No owner, group or SACL is written. The receipt records application
     /// separately from readback; a readback is not independent permission verification or product
     /// readiness. The application owns original DACL evidence, policy, verification and recovery.
@@ -71,6 +72,11 @@ public sealed partial class CloudProtectedLocalOperationContext
             NativeFileMetadata before = ValidateObject();
             if (!directory)
             {
+                if ((NativeConverted || NativeIdentityPrepared) && !DurableProjectionCommitted)
+                {
+                    throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.NativeAppliedProjectionPending,
+                        "Recover the required official identity projection before applying file permissions.");
+                }
                 RequireHardlinkPolicy();
                 if (!before.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder))
                 {

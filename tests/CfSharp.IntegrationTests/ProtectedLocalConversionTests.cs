@@ -5,6 +5,35 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     private static readonly string[] LocalProtectionCompetitors = ["overwrite", "link"];
+
+    [Fact]
+    public async Task ProtectedLocalConversionDoesNotApplyDaclAfterHandledProjectionFailure()
+    {
+        FaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new FaultFactory(path));
+        await File.WriteAllTextAsync(fixture.File.FullPath, "original");
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
+        byte[] original = new FileInfo(fixture.File.FullPath).GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorBinaryForm();
+        ProjectionFault fault = new();
+        CloudProtectedLocalOperationResult result = await fixture.File.RunProtectedLocalOperationAsync(new(binding), async (scope, stop) =>
+        {
+            FileSystemSecurity descriptor = await scope.ReadAccessDescriptorAsync(stop);
+            factory!.NextCommitFault = fault;
+            Assert.Same(fault, await Record.ExceptionAsync(() => scope.ConvertToPlaceholderAsync(
+                CloudPlaceholderIdentity.Create("local-uncommitted"), stop).AsTask()));
+            Assert.NotNull(await Record.ExceptionAsync(() => scope.ApplyAccessDescriptorAsync(descriptor, stop).AsTask()));
+        });
+        Assert.Equal(CloudProtectedLocalOperationOutcome.NativeAppliedProjectionPending, result.Outcome);
+        Assert.Equal(CloudProtectedLocalOperationStage.Projection, result.Stage);
+        Assert.Same(fault, result.Error);
+        Assert.True(result.CallbackCompleted);
+        Assert.True(result.NativeConverted);
+        Assert.False(result.DurableProjectionCommitted);
+        Assert.False(result.AccessDescriptorApplied);
+        Assert.False(result.AccessDescriptorReadBack);
+        Assert.Equal(original, new FileInfo(fixture.File.FullPath).GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorBinaryForm());
+        Assert.Equal("original", await File.ReadAllTextAsync(fixture.File.FullPath));
+    }
     [Theory]
     [InlineData(false, 0)]
     [InlineData(false, 19)]
