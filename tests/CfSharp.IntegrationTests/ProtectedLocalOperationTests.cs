@@ -171,7 +171,7 @@ public sealed partial class CloudContentConfirmationTests
         {
             release.TrySetResult();
         }
-        Assert.Equal(CloudProtectedLocalOperationOutcome.Completed, (await pending).Outcome);
+        Assert.Equal(CloudProtectedLocalOperationOutcome.Canceled, (await pending).Outcome);
         await shutdown.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(CloudFileSystemLifecycleState.Disposed, fixture.System.LifecycleState);
     }

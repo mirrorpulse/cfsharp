@@ -32,6 +32,18 @@ public sealed partial class CloudProtectedLocalOperationContext
     private int _stage;
     private Exception? _failure;
     private CloudProtectedLocalOperationStage? _failureStage;
+    private int _released;
+
+    /// <summary>Gets the current phase, including observable draining and final native release.</summary>
+    /// <remarks>Safe for concurrent reads, including from an observer outside the callback.</remarks>
+    public CloudProtectedLocalOperationStage CurrentStage => Volatile.Read(ref _released) != 0
+        ? CloudProtectedLocalOperationStage.Released : IsDraining ? CloudProtectedLocalOperationStage.Draining : Stage;
+
+    /// <summary>Gets whether cancellation or scope exit is rejecting new work while resources remain retained.</summary>
+    /// <remarks>Cancellation never releases a handle still in use by the callback or an admitted scope step.</remarks>
+    public bool IsDraining => Volatile.Read(ref _released) == 0 && (_stop.IsCancellationRequested || !Volatile.Read(ref _accepting));
+
+    internal void MarkResourcesReleased() => Volatile.Write(ref _released, 1);
 
     internal CloudProtectedLocalOperationContext(CloudFileSystem owner, CloudItem item, ICloudStateStore store,
         SafeFileHandle handle, CloudProtectedLocalOperationRequest request, CancellationToken stop)

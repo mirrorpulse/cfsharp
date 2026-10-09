@@ -84,6 +84,20 @@ An uncooperative callback or stalled native driver can delay return; there is no
 External owner disposal rejects new public work and drains admitted operations before closing the
 state store. Keep callbacks short and local, without network, worker RPC or user interaction.
 
+Requests have a ten-second cooperative budget, including path admission. `WithBudget` returns an
+immutable copy with a positive duration of at most one minute. Callback and context tokens combine
+caller cancellation, owner shutdown and budget expiry. `scope.CurrentStage` and `scope.IsDraining`
+are safe to observe from another thread: cancellation shows `Draining` while actual work retains
+the native object, then `Released` after cleanup. Neither expiry nor cancellation forcibly aborts
+arbitrary application work. The returned receipt separates cancellation and budget-expiry facts
+from native mutation, durable commit and descriptor application. A delayed callback can return
+after the budget without weakening protection.
+
+Application cancellation handlers run away from the owner's lifecycle lock and are also drained
+before native release. A throwing handler is reported as `CancellationCallbackError`; it does not
+throw through owner shutdown or erase the original work outcome. Such handlers must also be short
+and must not wait for owner disposal. No additional transaction spans the callback or its handlers.
+
 An admitted scope-method failure remains in the receipt even if application code handles its
 exception. Callback-origin errors remain the original exceptions, distinct from translated native
 failures. The first failed scope phase is retained while other already admitted calls drain.

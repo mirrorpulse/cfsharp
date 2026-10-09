@@ -104,7 +104,7 @@ public sealed partial class CloudProtectedLocalOperationResult
     internal CloudProtectedLocalOperationResult(CloudProtectedLocalOperationOutcome outcome,
         CloudProtectedLocalOperationStage stage, CloudLocalFileBinding expected,
         CloudItemSnapshot? snapshot, bool callbackStarted, bool callbackCompleted,
-        TimeSpan elapsed, Exception? error, CloudProtectedLocalOperationContext? context)
+        TimeSpan elapsed, Exception? error, CloudProtectedLocalOperationContext? context, CloudProtectedLocalOperationLifetime lifetime)
     {
         Outcome = outcome;
         Stage = stage;
@@ -121,6 +121,9 @@ public sealed partial class CloudProtectedLocalOperationResult
         PreparationUsn = context?.PreparationUsn;
         AccessDescriptorApplied = context?.AccessDescriptorApplied ?? false;
         AccessDescriptorReadBack = context?.AccessDescriptorReadBack ?? false;
+        CancellationRequested = lifetime.IsCancellationRequested;
+        BudgetExpired = lifetime.BudgetExpired;
+        CancellationCallbackError = lifetime.CancellationCallbackError;
     }
 
     /// <summary>Gets the outcome without any synchronization or product-readiness claim.</summary>
@@ -156,6 +159,13 @@ public sealed partial class CloudProtectedLocalOperationResult
     /// <summary>Gets whether native readback completed after a DACL application.</summary>
     /// <remarks>This is a library readback fact, not independent policy verification or product readiness.</remarks>
     public bool AccessDescriptorReadBack { get; }
+    /// <summary>Gets whether the caller, owner or budget signaled cancellation of this operation.</summary>
+    public bool CancellationRequested { get; }
+    /// <summary>Gets whether the cooperative budget elapsed, independently of the work outcome.</summary>
+    public bool BudgetExpired { get; }
+    /// <summary>Gets a failure from application cancellation registrations, separately from work errors.</summary>
+    /// <remarks>Such handlers are drained without throwing through owner shutdown or erasing native receipts.</remarks>
+    public Exception? CancellationCallbackError { get; }
     /// <summary>Gets whether all admitted work drained before native and facade resources were released.</summary>
     public bool Drained { get; } = true;
 }

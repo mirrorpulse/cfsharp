@@ -8,6 +8,7 @@ namespace CfSharp;
 public sealed partial class CloudFileSystem
 {
     private static readonly AsyncLocal<CloudProtectedLocalOperationContext?> s_protectedLocalContext = new();
+    private readonly CancellationToken _protectedLocalStopping;
 
     internal async ValueTask<CloudProtectedLocalOperationResult> RunProtectedLocalOperationAsync(
         CloudItem item, CloudProtectedLocalOperationRequest request,
@@ -18,6 +19,8 @@ public sealed partial class CloudFileSystem
         RejectProtectedLocalReentry();
         EnsureStarted();
         long started = Stopwatch.GetTimestamp();
+        using CloudProtectedLocalOperationLifetime lifetime = new(request, started, token, _protectedLocalStopping);
+        CancellationToken stop = lifetime.Token;
         CloudProtectedLocalOperationStage stage = CloudProtectedLocalOperationStage.Admission;
         CloudProtectedLocalOperationContext? context = null;
         bool invoked = false;
@@ -27,34 +30,35 @@ public sealed partial class CloudFileSystem
         try
         {
             using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
-                [CloudItemOperationScope.Exact(item.FullPath)], token).ConfigureAwait(false);
+                [CloudItemOperationScope.Exact(item.FullPath)], stop).ConfigureAwait(false);
             bool directory = item.Kind == CloudItemKind.Directory;
             if (directory != (request.Mode == CloudProtectedLocalOperationMode.DirectoryMetadata))
             {
                 throw new CloudProtectedLocalRejectedException(CloudProtectedLocalOperationOutcome.Unsupported,
                     "Use exclusive mode for one file or metadata-only mode for one directory; tree freezing is unavailable.");
             }
-            token.ThrowIfCancellationRequested();
+            stop.ThrowIfCancellationRequested();
             stage = CloudProtectedLocalOperationStage.Open;
             using SafeFileHandle handle = CloudLocalAccessObject.Open(item.FullPath, directory);
-            context = new(this, item, operation.StateStore, handle, request, token);
+            context = new(this, item, operation.StateStore, handle, request, stop);
             try
             {
-                await context.InspectAsync(token).ConfigureAwait(false);
+                await context.InspectAsync(stop).ConfigureAwait(false);
                 if (request.PreparationIdentity is { } identity)
                 {
-                    await context.ConvertToPlaceholderAsync(identity, token).ConfigureAwait(false);
+                    await context.ConvertToPlaceholderAsync(identity, stop).ConfigureAwait(false);
                 }
-                token.ThrowIfCancellationRequested();
+                stop.ThrowIfCancellationRequested();
                 // Invoke application work away from the caller's synchronization context so
                 // external synchronous disposal can drain without blocking its continuation.
                 await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
+                stop.ThrowIfCancellationRequested();
                 s_protectedLocalContext.Value = context;
                 try
                 {
                     context.SetStage(CloudProtectedLocalOperationStage.Callback);
                     invoked = true;
-                    await callback(context, token).ConfigureAwait(false);
+                    await callback(context, stop).ConfigureAwait(false);
                     completed = true;
                 }
                 finally
@@ -65,12 +69,13 @@ public sealed partial class CloudFileSystem
             finally
             {
                 await context.CloseAsync().ConfigureAwait(false);
+                await lifetime.SealAndDrainCancellationAsync().ConfigureAwait(false);
             }
             if (context.Failure is not null)
             {
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(context.Failure);
             }
-            token.ThrowIfCancellationRequested();
+            stop.ThrowIfCancellationRequested();
         }
         catch (Exception error)
         {
@@ -82,15 +87,22 @@ public sealed partial class CloudFileSystem
             {
                 _ when context is { NativeIdentityPrepared: true, DurableProjectionCommitted: false } => CloudProtectedLocalOperationOutcome.NativeAppliedProjectionPending,
                 CloudProtectedLocalRejectedException rejected => rejected.Outcome,
-                OperationCanceledException when !callbackFault || token.IsCancellationRequested => CloudProtectedLocalOperationOutcome.Canceled,
+                OperationCanceledException when !callbackFault || lifetime.IsCancellationRequested => lifetime.TimedOut
+                    ? CloudProtectedLocalOperationOutcome.DeadlineExceeded : CloudProtectedLocalOperationOutcome.Canceled,
                 _ when !callbackFault && stage == CloudProtectedLocalOperationStage.Open && failure is CloudFilesException { Win32ErrorCode: 32 or 33 } => CloudProtectedLocalOperationOutcome.Busy,
                 _ when !callbackFault && failure is CloudFilesException { Win32ErrorCode: 6 } => CloudProtectedLocalOperationOutcome.ProtectionLost,
                 _ when invoked && !completed => CloudProtectedLocalOperationOutcome.CallbackFailed,
                 _ => CloudProtectedLocalOperationOutcome.Failed,
             };
+            if (outcome == CloudProtectedLocalOperationOutcome.DeadlineExceeded)
+            {
+                failure = new TimeoutException("The protected local operation budget expired; admitted work has drained.", failure);
+            }
         }
+        await lifetime.SealAndDrainCancellationAsync().ConfigureAwait(false);
+        context?.MarkResourcesReleased();
         return new(outcome, failure is not null ? stage : context?.Stage ?? stage, request.ExpectedBinding, context?.LastSnapshot,
-            invoked, completed, Stopwatch.GetElapsedTime(started), failure, context);
+            invoked, completed, Stopwatch.GetElapsedTime(started), failure, context, lifetime);
     }
 
     private static void RejectProtectedLocalReentry()

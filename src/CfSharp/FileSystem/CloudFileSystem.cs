@@ -66,6 +66,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         _registration = registration;
         _contentProvider = contentProvider;
         _runtime = runtime;
+        _protectedLocalStopping = _contentConfirmationStopping.Token;
     }
 
     /// <summary>Gets the normalized absolute path of the managed sync root.</summary>
