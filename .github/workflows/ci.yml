@@ -49,7 +49,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dependency-audit
-          path: artifacts/dependency-audit/**
+          path: artifacts/dependency-audit/*.json
           if-no-files-found: error
 
       - name: Verify formatting
@@ -71,7 +71,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runtime-boundaries
-          path: artifacts/runtime-boundaries/**
+          path: artifacts/runtime-boundaries/*/publish.log
           if-no-files-found: error
 
       - name: Test
@@ -96,9 +96,15 @@ jobs:
         with:
           name: package-capabilities-x64
           path: |
-            artifacts/package-capabilities/**/manifest.json
-            artifacts/package-capabilities/**/consumer-smoke/packages.lock.json
-            artifacts/package-capabilities/**/packages/*
+            artifacts/package-capabilities/*/manifest.json
+            artifacts/package-capabilities/*/sbom.spdx.json
+            artifacts/package-capabilities/*/release-notes.md
+            artifacts/package-capabilities/*/support-matrix.md
+            artifacts/package-capabilities/*/consumer-smoke/PreviewConsumer.csproj
+            artifacts/package-capabilities/*/consumer-smoke/Program.cs
+            artifacts/package-capabilities/*/consumer-smoke/packages.lock.json
+            artifacts/package-capabilities/*/packages/*.nupkg
+            artifacts/package-capabilities/*/packages/*.snupkg
           if-no-files-found: ignore
 
       - name: Upload test results
@@ -106,14 +112,18 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-results
-          path: "**/TestResults/**"
+          path: |
+            **/TestResults/**/*.trx
+            **/TestResults/**/*.xml
           if-no-files-found: ignore
 
       - name: Upload packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages
-          path: artifacts/packages/*
+          path: |
+            artifacts/packages/*.nupkg
+            artifacts/packages/*.snupkg
 
   test-arm64:
     runs-on: windows-11-arm
@@ -171,11 +181,17 @@ jobs:
         with:
           name: test-results-arm64
           path: |
-            **/TestResults/**
-            artifacts/runtime-boundaries/**
-            artifacts/package-capabilities/**/manifest.json
-            artifacts/package-capabilities/**/consumer-smoke/packages.lock.json
-            artifacts/package-capabilities/**/packages/*
+            **/TestResults/**/*.trx
+            artifacts/runtime-boundaries/*/publish.log
+            artifacts/package-capabilities/*/manifest.json
+            artifacts/package-capabilities/*/sbom.spdx.json
+            artifacts/package-capabilities/*/release-notes.md
+            artifacts/package-capabilities/*/support-matrix.md
+            artifacts/package-capabilities/*/consumer-smoke/PreviewConsumer.csproj
+            artifacts/package-capabilities/*/consumer-smoke/Program.cs
+            artifacts/package-capabilities/*/consumer-smoke/packages.lock.json
+            artifacts/package-capabilities/*/packages/*.nupkg
+            artifacts/package-capabilities/*/packages/*.snupkg
           if-no-files-found: error
 
   native-abi-x64:
@@ -231,7 +247,7 @@ jobs:
           name: native-abi-x64
           path: |
             artifacts/abi-probe/x64.json
-            tests/CfSharp.Native.Tests/TestResults/**
+            tests/CfSharp.Native.Tests/TestResults/**/*.trx
           if-no-files-found: error
 
   long-soak:
@@ -269,5 +285,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: long-soak-evidence-${{ matrix.architecture }}
-          path: artifacts/soak/**
+          path: |
+            artifacts/soak/*.json
+            artifacts/soak/*.trx
+            artifacts/soak/*.log
           if-no-files-found: error
