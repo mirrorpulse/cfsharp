@@ -163,6 +163,8 @@ public sealed partial class CloudContentConfirmationTests
         CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await fixture.File.InspectAsync()).LocalBinding);
         CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Create("local-cancel");
         using CancellationTokenSource cancellation = new();
+        factory!.LimitFaultsToCurrentRequest();
+        bool canceledBeforeNative = false;
         if (afterNative)
         {
             factory!.BeforeCommit = () =>
@@ -177,15 +179,35 @@ public sealed partial class CloudContentConfirmationTests
             {
                 factory.BeforeTransaction = () =>
                 {
-                    factory.AfterTransactionDispose = cancellation.Cancel;
+                    factory.AfterTransactionDispose = () =>
+                    {
+                        canceledBeforeNative = !File.GetAttributes(fixture.File.FullPath).HasFlag(FileAttributes.ReparsePoint);
+                        cancellation.Cancel();
+                    };
                     return ValueTask.CompletedTask;
                 };
                 return ValueTask.CompletedTask;
             };
         }
+        Task unrelated;
+        using (ExecutionContext.SuppressFlow())
+        {
+            unrelated = Task.Run(async () =>
+            {
+                for (int index = 0; index < 2; index++)
+                {
+                    await using ICloudStateTransaction transaction = await factory.Store.BeginTransactionAsync();
+                    Assert.Empty(await transaction.Operations.ListAsync(1));
+                }
+            });
+        }
+        await unrelated;
+        Assert.False(cancellation.IsCancellationRequested);
         CloudProtectedLocalOperationResult result = await fixture.File.RunProtectedLocalOperationAsync(
             CloudProtectedLocalOperationRequest.ForLocalConversion(binding, identity), (_, _) => ValueTask.CompletedTask, cancellation.Token);
         Assert.Equal(CloudProtectedLocalOperationOutcome.Canceled, result.Outcome);
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.Equal(!afterNative, canceledBeforeNative);
         Assert.Equal(afterNative, result.NativeConverted);
         Assert.Equal(afterNative, result.DurableProjectionCommitted);
         Assert.False(result.CallbackStarted);
