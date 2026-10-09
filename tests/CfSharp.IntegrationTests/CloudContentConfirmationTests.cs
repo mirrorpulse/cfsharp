@@ -186,7 +186,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
         private ICloudStateStoreFactory? _restartFactory;
 
         internal static async Task<Fixture> StartAsync(Func<string, ICloudStateStoreFactory>? createStore = null,
-            CloudInSyncPolicy inSyncPolicy = CloudInSyncPolicy.None)
+            CloudInSyncPolicy inSyncPolicy = CloudInSyncPolicy.None, bool allowHardLinks = false)
         {
             // This acceptance fixture fails on unavailable Windows capabilities; it never
             // silently returns success when native confirmation has not actually executed.
@@ -199,7 +199,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             ICloudStateStoreFactory factory = createStore?.Invoke(databasePath) ?? new SqliteCloudStateStoreFactory(databasePath);
             SyncRootRegistrationOptions registration = SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
                 .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
-                .WithInSyncPolicy(inSyncPolicy).Build();
+                .WithInSyncPolicy(inSyncPolicy).AllowHardLinks(allowHardLinks).Build();
             CloudFileSystem system = CloudFileSystem.CreateBuilder(root)
                 .WithStateStore(factory)
                 .WithRegistration(registration)
