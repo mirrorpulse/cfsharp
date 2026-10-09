@@ -41,6 +41,10 @@ public sealed partial class CloudFileSystem
             try
             {
                 await context.InspectAsync(token).ConfigureAwait(false);
+                if (request.PreparationIdentity is { } identity)
+                {
+                    await context.ConvertToPlaceholderAsync(identity, token).ConfigureAwait(false);
+                }
                 token.ThrowIfCancellationRequested();
                 // Invoke application work away from the caller's synchronization context so
                 // external synchronous disposal can drain without blocking its continuation.
@@ -76,6 +80,7 @@ public sealed partial class CloudFileSystem
             failure = callbackFault ? error : TranslateProtectedLocalError(error, item.FullPath, stage);
             outcome = error switch
             {
+                _ when context is { NativeIdentityPrepared: true, DurableProjectionCommitted: false } => CloudProtectedLocalOperationOutcome.NativeAppliedProjectionPending,
                 CloudProtectedLocalRejectedException rejected => rejected.Outcome,
                 OperationCanceledException when !callbackFault || token.IsCancellationRequested => CloudProtectedLocalOperationOutcome.Canceled,
                 _ when !callbackFault && stage == CloudProtectedLocalOperationStage.Open && failure is CloudFilesException { Win32ErrorCode: 32 or 33 } => CloudProtectedLocalOperationOutcome.Busy,
@@ -85,7 +90,7 @@ public sealed partial class CloudFileSystem
             };
         }
         return new(outcome, failure is not null ? stage : context?.Stage ?? stage, request.ExpectedBinding, context?.LastSnapshot,
-            invoked, completed, Stopwatch.GetElapsedTime(started), failure);
+            invoked, completed, Stopwatch.GetElapsedTime(started), failure, context);
     }
 
     private static void RejectProtectedLocalReentry()

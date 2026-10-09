@@ -100,10 +100,11 @@ public sealed partial class CloudProtectedLocalOperationRequest
 /// </remarks>
 public sealed partial class CloudProtectedLocalOperationResult
 {
+    [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.16299")]
     internal CloudProtectedLocalOperationResult(CloudProtectedLocalOperationOutcome outcome,
         CloudProtectedLocalOperationStage stage, CloudLocalFileBinding expected,
         CloudItemSnapshot? snapshot, bool callbackStarted, bool callbackCompleted,
-        TimeSpan elapsed, Exception? error)
+        TimeSpan elapsed, Exception? error, CloudProtectedLocalOperationContext? context)
     {
         Outcome = outcome;
         Stage = stage;
@@ -113,6 +114,11 @@ public sealed partial class CloudProtectedLocalOperationResult
         CallbackCompleted = callbackCompleted;
         Elapsed = elapsed;
         Error = error;
+        NativeIdentityPrepared = context?.NativeIdentityPrepared ?? false;
+        NativeConverted = context?.NativeConverted ?? false;
+        DurableProjectionCommitted = context?.DurableProjectionCommitted ?? false;
+        PreparationHResult = context?.PreparationHResult;
+        PreparationUsn = context?.PreparationUsn;
     }
 
     /// <summary>Gets the outcome without any synchronization or product-readiness claim.</summary>
@@ -132,6 +138,17 @@ public sealed partial class CloudProtectedLocalOperationResult
     public TimeSpan Elapsed { get; }
     /// <summary>Gets the original callback error or a translated native error preserving its HRESULT.</summary>
     public Exception? Error { get; }
+    /// <summary>Gets whether the exact native identity was observed under protection.</summary>
+    /// <remarks>This includes retry of an already prepared native object, and implies no content acceptance.</remarks>
+    public bool NativeIdentityPrepared { get; }
+    /// <summary>Gets whether this operation performed native conversion; false on an already prepared retry.</summary>
+    public bool NativeConverted { get; }
+    /// <summary>Gets whether required official identity projection actually committed, independently of later errors.</summary>
+    public bool DurableProjectionCommitted { get; }
+    /// <summary>Gets the conversion HRESULT, or null when no conversion call completed successfully.</summary>
+    public int? PreparationHResult { get; }
+    /// <summary>Gets the USN returned by this operation's native conversion, or null when it did not convert.</summary>
+    public long? PreparationUsn { get; }
     /// <summary>Gets whether all admitted work drained before native and facade resources were released.</summary>
     public bool Drained { get; } = true;
 }

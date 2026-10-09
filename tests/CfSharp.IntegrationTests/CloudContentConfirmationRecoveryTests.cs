@@ -307,6 +307,7 @@ public sealed partial class CloudContentConfirmationTests
         internal Exception? NextDisposeFault { get; set; }
         internal Func<ValueTask>? BeforeTransaction { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
+        internal Action? AfterTransactionDispose { get; set; }
         internal ICloudStateStore Store { get; private set; } = null!;
 
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context,
@@ -358,6 +359,11 @@ public sealed partial class CloudContentConfirmationTests
             public async ValueTask DisposeAsync()
             {
                 await inner.DisposeAsync();
+                if (faults.AfterTransactionDispose is { } after)
+                {
+                    faults.AfterTransactionDispose = null;
+                    after();
+                }
                 if (faults.NextDisposeFault is { } exception)
                 {
                     faults.NextDisposeFault = null;

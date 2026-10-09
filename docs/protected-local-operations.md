@@ -36,6 +36,27 @@ its members, descendant content and enumeration can change. Exclusive mode on a 
 `Unsupported`. Neither mode provides whole-tree freezing. Ordinary files have no hardlink-freeze
 claim: placeholder registration policy cannot protect ordinary-file aliases.
 
+For a permission initialization that requires placeholder hardlink exclusion, use
+`CloudProtectedLocalOperationRequest.ForLocalConversion(binding, localIdentity)`. It checks the
+actual root's disallowed-hardlink policy, rejects existing aliases, prepares the exact local
+identity and commits its official projection before invoking the callback. The identity must not
+contain an accepted remote revision. The native conversion uses the same exclusive file object,
+preserving bytes, binding and DACL without marking in sync or dehydrating content.
+
+`scope.ConvertToPlaceholderAsync` provides the same preparation within a callback. An exact-item
+`file.ConvertToPlaceholderAsync` call also reuses the scope, with only content-preserving defaults.
+Existing placeholder identities must match exactly; this API cannot replace identity or rekey
+known pending work. It preserves prior acknowledged revision and local ID fields, journal rows,
+conflicts and checkpoints. No source content is read, including when inspecting a cold placeholder.
+
+The receipt distinguishes `NativeConverted`, `NativeIdentityPrepared` and
+`DurableProjectionCommitted`, retaining the conversion HRESULT and USN when available. After
+native success, required projection completes even if cancellation arrives. A failed projection
+returns `NativeAppliedProjectionPending` and prevents a preparation-gated callback from starting.
+Keep the original binding and identity, then retry a new request after recovery or restart. A
+matching already prepared object needs no second conversion; a replacement is rejected. A
+transaction-disposal error after commit retains the true committed fact and its original error.
+
 Use scope methods for protected work. Exact-item `InspectAsync` calls reuse the context.
 Other nested facade work, another protected callback and owner disposal from the callback fail
 immediately instead of waiting for the admission already held by that callback. Scope methods

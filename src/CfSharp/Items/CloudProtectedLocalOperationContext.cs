@@ -113,6 +113,7 @@ public sealed partial class CloudProtectedLocalOperationContext
         {
             throw new InvalidDataException("The official item row has a different object kind.");
         }
+        _lastDurableState = durable;
         LastSnapshot = CloudFileSystem.CreateSnapshot(_item, local, durable);
         return LastSnapshot;
     }
