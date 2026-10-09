@@ -12,6 +12,8 @@
       href: sync-root-lifecycle.md
     - name: Placeholders and hydration
       href: placeholders.md
+    - name: Protected local operations
+      href: protected-local-operations.md
     - name: Local change feed
       href: local-change-feed.md
     - name: Remote change application

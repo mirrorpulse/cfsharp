@@ -339,6 +339,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// </exception>
     public async ValueTask DisposeAsync()
     {
+        RejectProtectedLocalReentry();
         // Serialize disposal attempts independently of admission. The feed must acquire the
         // lifecycle gate while draining accepted renames, including after public admission stops.
         await _disposalGate.WaitAsync().ConfigureAwait(false);
@@ -399,6 +400,10 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         CloudItem item,
         CancellationToken cancellationToken)
     {
+        if (s_protectedLocalContext.Value is { } protectedContext)
+        {
+            return await protectedContext.InspectItemAsync(item, cancellationToken).ConfigureAwait(false);
+        }
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
             [CloudItemOperationScope.Exact(item.FullPath)],
             cancellationToken).ConfigureAwait(false);
@@ -419,6 +424,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         bool allowLocalChangeDrain = false,
         CancellationToken cancellationToken = default)
     {
+        RejectProtectedLocalReentry();
         ArgumentNullException.ThrowIfNull(scopes);
         IReadOnlyList<CloudItemOperationScope> requestedScopes = scopes.ToArray();
         ICloudStateStore stateStore;
@@ -525,7 +531,11 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 $"{item.Kind.ToString().ToLowerInvariant()}.");
         }
 
-        return new CloudItemSnapshot(
+        return CreateSnapshot(item, local, durableState);
+    }
+
+    internal static CloudItemSnapshot CreateSnapshot(CloudItem item, LocalCloudItemInspection local, CloudItemState? durableState) =>
+        new(
             item.Kind,
             local.Exists,
             local.Attributes,
@@ -547,7 +557,6 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
             durableState,
             DateTimeOffset.UtcNow,
             local.LocalBinding);
-    }
 
     private void EnsureStarted()
     {
