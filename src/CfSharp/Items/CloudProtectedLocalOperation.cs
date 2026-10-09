@@ -119,6 +119,8 @@ public sealed partial class CloudProtectedLocalOperationResult
         DurableProjectionCommitted = context?.DurableProjectionCommitted ?? false;
         PreparationHResult = context?.PreparationHResult;
         PreparationUsn = context?.PreparationUsn;
+        AccessDescriptorApplied = context?.AccessDescriptorApplied ?? false;
+        AccessDescriptorReadBack = context?.AccessDescriptorReadBack ?? false;
     }
 
     /// <summary>Gets the outcome without any synchronization or product-readiness claim.</summary>
@@ -149,6 +151,11 @@ public sealed partial class CloudProtectedLocalOperationResult
     public int? PreparationHResult { get; }
     /// <summary>Gets the USN returned by this operation's native conversion, or null when it did not convert.</summary>
     public long? PreparationUsn { get; }
+    /// <summary>Gets whether a DACL application succeeded on the original native object, independently of later failures.</summary>
+    public bool AccessDescriptorApplied { get; }
+    /// <summary>Gets whether native readback completed after a DACL application.</summary>
+    /// <remarks>This is a library readback fact, not independent policy verification or product readiness.</remarks>
+    public bool AccessDescriptorReadBack { get; }
     /// <summary>Gets whether all admitted work drained before native and facade resources were released.</summary>
     public bool Drained { get; } = true;
 }

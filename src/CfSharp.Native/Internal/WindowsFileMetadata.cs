@@ -30,9 +30,11 @@ internal static unsafe partial class WindowsFileMetadata
         // A single file object owns both data exclusion and security access. A separate
         // WRITE_DAC opener can break a CFAPI oplock and wait for our own referenced owner.
         // READ/WRITE_DATA with share-none rejects existing writers and writable sections;
-        // metadata-only directory access pins its name without freezing its membership.
+        // FILE_LIST_DIRECTORY makes no-delete directory sharing effective on Windows,
+        // unlike an attribute/security-only open. It performs no enumeration or hydration.
+        // Directory members remain free to change.
         // OPEN_REPARSE_POINT prevents a final symbolic link from redirecting this access.
-        SafeFileHandle handle = CreateFile(path, directory ? 0x60080u : 0x60083u,
+        SafeFileHandle handle = CreateFile(path, directory ? 0x60081u : 0x60083u,
             directory ? 3u : 0u, 0, 3, 0x02200000, 0);
         if (handle.IsInvalid)
         {

@@ -57,6 +57,20 @@ Keep the original binding and identity, then retry a new request after recovery 
 matching already prepared object needs no second conversion; a replacement is rejected. A
 transaction-disposal error after commit retains the true committed fact and its original error.
 
+Inside the callback, `ReadAccessDescriptorAsync` returns an independent `FileSecurity` or
+`DirectorySecurity`. `ApplyAccessDescriptorAsync` snapshots the input, applies only
+`AccessControlSections.Access` on the original native file object, then returns a fresh readback.
+Owner, group and audit sections are never written, even if supplied. Files require an actual
+placeholder under disallowed hardlink policy before application; ordinary-file reads are allowed.
+No original handle is exposed, attached to a stream or transferred to application code. Caller
+descriptor edits must be synchronized while the input copy is taken.
+
+`AccessDescriptorApplied` and `AccessDescriptorReadBack` record separate actual facts. An exception
+after application does not erase the application receipt or imply rollback. Persist the original
+DACL before starting and independently compare the readback against the host's policy. Directory
+inheritance may affect descendants; this scope does not freeze those descendants or their membership.
+No role SIDs, permission policy, original DACL or credentials are stored in the official database.
+
 Use scope methods for protected work. Exact-item `InspectAsync` calls reuse the context.
 Other nested facade work, another protected callback and owner disposal from the callback fail
 immediately instead of waiting for the admission already held by that callback. Scope methods
