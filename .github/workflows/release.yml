@@ -104,10 +104,17 @@ jobs:
         with:
           name: stable-${{ steps.version.outputs.version }}
           path: |
-            artifacts/preview/${{ steps.version.outputs.version }}/**
-            artifacts/stable-version.json
-            artifacts/abi-probe/**
-            **/TestResults/**
+            artifacts/preview/${{ steps.version.outputs.version }}/packages/*.nupkg
+            artifacts/preview/${{ steps.version.outputs.version }}/packages/*.snupkg
+            artifacts/preview/${{ steps.version.outputs.version }}/manifest.json
+            artifacts/preview/${{ steps.version.outputs.version }}/sbom.spdx.json
+            artifacts/preview/${{ steps.version.outputs.version }}/release-notes.md
+            artifacts/preview/${{ steps.version.outputs.version }}/support-matrix.md
+            artifacts/preview/${{ steps.version.outputs.version }}/consumer-smoke/PreviewConsumer.csproj
+            artifacts/preview/${{ steps.version.outputs.version }}/consumer-smoke/Program.cs
+            artifacts/preview/${{ steps.version.outputs.version }}/consumer-smoke/packages.lock.json
+            artifacts/abi-probe/x64.json
+            **/TestResults/**/*.trx
           if-no-files-found: error
           retention-days: 365
 
