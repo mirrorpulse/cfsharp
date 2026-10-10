@@ -92,6 +92,8 @@ try {
       href: articles/remote-change-application.md
     - name: SQLite state store
       href: articles/state-store-sqlite.md
+    - name: Protected local operations
+      href: articles/protected-local-operations.md
     - name: CfSharp Sample
       href: articles/sample-provider.md
     - name: Platform support

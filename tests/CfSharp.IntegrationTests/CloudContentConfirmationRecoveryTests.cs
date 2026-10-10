@@ -303,11 +303,24 @@ public sealed partial class CloudContentConfirmationTests
     private sealed class FaultFactory(string path) : ICloudStateStoreFactory
     {
         private readonly SqliteCloudStateStoreFactory _inner = new(path);
+        private readonly AsyncLocal<bool> _requestFlow = new();
+        private volatile bool _requestFaultsOnly;
         internal Exception? NextCommitFault { get; set; }
         internal Exception? NextDisposeFault { get; set; }
         internal Func<ValueTask>? BeforeTransaction { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
+        internal Action? AfterTransactionDispose { get; set; }
         internal ICloudStateStore Store { get; private set; } = null!;
+
+        internal void LimitFaultsToCurrentRequest()
+        {
+            // Native completion workers can use this same store concurrently. Request-bound
+            // fault hooks must not be consumed by their unrelated transactions or disposal.
+            _requestFaultsOnly = true;
+            _requestFlow.Value = true;
+        }
+
+        private bool FaultsEnabled => !_requestFaultsOnly || _requestFlow.Value;
 
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context,
             CancellationToken cancellationToken = default) =>
@@ -317,18 +330,19 @@ public sealed partial class CloudContentConfirmationTests
         {
             public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
             {
-                if (faults.BeforeTransaction is { } before)
+                bool applyFaults = faults.FaultsEnabled;
+                if (applyFaults && faults.BeforeTransaction is { } before)
                 {
                     faults.BeforeTransaction = null;
                     await before();
                 }
 
-                return new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), faults);
+                return new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), faults, applyFaults);
             }
             public ValueTask DisposeAsync() => inner.DisposeAsync();
         }
 
-        private sealed class FaultTransaction(ICloudStateTransaction inner, FaultFactory faults) : ICloudStateTransaction
+        private sealed class FaultTransaction(ICloudStateTransaction inner, FaultFactory faults, bool applyFaults) : ICloudStateTransaction
         {
             public ICloudItemStateRepository Items => inner.Items;
             public ICloudCheckpointRepository Checkpoints => inner.Checkpoints;
@@ -339,13 +353,13 @@ public sealed partial class CloudContentConfirmationTests
 
             public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
             {
-                if (faults.BeforeCommit is { } before)
+                if (applyFaults && faults.BeforeCommit is { } before)
                 {
                     faults.BeforeCommit = null;
                     await before();
                 }
 
-                if (faults.NextCommitFault is { } exception)
+                if (applyFaults && faults.NextCommitFault is { } exception)
                 {
                     faults.NextCommitFault = null;
                     throw exception;
@@ -358,7 +372,12 @@ public sealed partial class CloudContentConfirmationTests
             public async ValueTask DisposeAsync()
             {
                 await inner.DisposeAsync();
-                if (faults.NextDisposeFault is { } exception)
+                if (applyFaults && faults.AfterTransactionDispose is { } after)
+                {
+                    faults.AfterTransactionDispose = null;
+                    after();
+                }
+                if (applyFaults && faults.NextDisposeFault is { } exception)
                 {
                     faults.NextDisposeFault = null;
                     throw exception;

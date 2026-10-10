@@ -8,6 +8,10 @@ public sealed partial class CloudFileSystem
         CloudPlaceholderConversionOptions options,
         CancellationToken cancellationToken)
     {
+        if (s_protectedLocalContext.Value is { } protectedContext)
+        {
+            return await protectedContext.ConvertItemAsync(item, identity, options, cancellationToken).ConfigureAwait(false);
+        }
         ValidateConversionOptions(item, options);
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
             [CloudItemOperationScope.Exact(item.FullPath)],
@@ -223,7 +227,9 @@ public sealed partial class CloudFileSystem
         CloudPlaceholderIdentity identity,
         CancellationToken cancellationToken,
         Action? validateBeforeCommit = null,
-        Action? onCommitted = null)
+        Action? onCommitted = null,
+        bool preserveExistingState = false,
+        long? observedLocalFileId = null)
     {
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
@@ -231,6 +237,10 @@ public sealed partial class CloudFileSystem
         CloudItemState? existing = await transaction.Items
             .GetByRelativePathAsync(item.RelativePath, cancellationToken)
             .ConfigureAwait(false);
+        if (preserveExistingState)
+        {
+            await ValidateProtectedLocalIdentityAsync(transaction, item, identity, cancellationToken).ConfigureAwait(false);
+        }
         if (existing is not null && existing.ItemId != identity.ItemId)
         {
             await transaction.Items.RemoveAsync(existing.ItemId, cancellationToken)
@@ -243,8 +253,8 @@ public sealed partial class CloudFileSystem
                 identity.RemoteId,
                 item.RelativePath,
                 item.Kind,
-                identity.RemoteRevision,
-                localFileId: null,
+                preserveExistingState ? existing?.RemoteRevision : identity.RemoteRevision,
+                localFileId: preserveExistingState ? existing?.LocalFileId ?? observedLocalFileId : null,
                 isTombstone: false,
                 DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);

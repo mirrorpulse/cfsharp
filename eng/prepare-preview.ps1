@@ -182,6 +182,7 @@ $consumerNuGetConfig = Join-Path $smokeRoot 'NuGet.config'
 "@ | Set-Content -LiteralPath $consumerProject -Encoding utf8
 @'
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 
 using CfSharp;
 using CfSharp.Storage.Sqlite;
@@ -247,12 +248,13 @@ internal static class Smoke
         bool registered = false;
         try
         {
+            EmptyProvider demand = new();
             await using CloudFileSystem system = CloudFileSystem.CreateBuilder(root)
                 .WithStateStore(new SqliteCloudStateStoreFactory(Path.Combine(area, "state.db")))
                 .WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Package Smoke", "1.0-test")
                     .WithProviderId(provider).WithSyncRootIdentity(provider.ToByteArray())
                     .WithHydrationPolicy(CloudHydrationPolicy.Progressive).WithPopulationPolicy(CloudPopulationPolicy.Partial)
-                    .WithRootMarkedInSync().Build()).WithContentProvider(new EmptyProvider()).Build();
+                    .WithRootMarkedInSync().Build()).WithContentProvider(demand).Build();
             await system.StartAsync();
             registered = true;
             await system.Root.CreatePlaceholderAsync(CloudDirectoryPlaceholderSpec.CreateBuilder("Docs", "directory")
@@ -305,6 +307,8 @@ internal static class Smoke
                     await Task.Delay(20, timeout.Token);
                 }
             }
+            await feed.DisposeAsync();
+            await VerifyProtectedLocalAsync(system, area, demand);
         }
         finally
         {
@@ -317,10 +321,103 @@ internal static class Smoke
         }
     }
 
+    [SupportedOSPlatform("windows10.0.16299")]
+    private static async Task VerifyProtectedLocalAsync(CloudFileSystem system, string area, EmptyProvider demand)
+    {
+        CloudFile file = system.GetFile("protected-local.txt");
+        await File.WriteAllTextAsync(file.FullPath, "unuploaded-local");
+        CloudItemSnapshot original = await file.InspectAsync();
+        CloudLocalFileBinding binding = original.LocalBinding ?? throw new InvalidOperationException("Complete native IDs are missing.");
+        byte[] originalAccess = new FileInfo(file.FullPath).GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorBinaryForm();
+        // Synthetic host evidence is durable and outside the managed root, never in the library store.
+        using (FileStream evidence = new(Path.Combine(area, "local-originals.bin"), FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        using (BinaryWriter write = new(evidence))
+        {
+            write.Write(binding.VolumeSerialNumber);
+            write.Write(binding.SyncRootFileId.ToByteArray());
+            write.Write(binding.LocalFileId.ToByteArray());
+            write.Write(originalAccess.Length);
+            write.Write(originalAccess);
+            write.Flush();
+            evidence.Flush(flushToDisk: true);
+        }
+        CloudProtectedLocalOperationResult receipt = await file.RunProtectedLocalOperationAsync(
+            CloudProtectedLocalOperationRequest.ForLocalConversion(binding, CloudPlaceholderIdentity.Create("local-unuploaded")),
+            async (scope, stop) =>
+            {
+                FileSystemSecurity access = await scope.ReadAccessDescriptorAsync(stop);
+                FileSystemSecurity observed = await scope.ApplyAccessDescriptorAsync(access, stop);
+                if (!SameDacl(originalAccess, observed.GetSecurityDescriptorBinaryForm()))
+                {
+                    throw new InvalidOperationException("Package same-object Access readback changed the original DACL.");
+                }
+                try
+                {
+                    await File.WriteAllTextAsync(file.FullPath, "conflicting-write", stop);
+                    throw new InvalidOperationException("Package exclusive scope admitted a competing overwrite.");
+                }
+                catch (IOException error) when ((error.HResult & 0xffff) == 32) { }
+                await Task.Yield();
+                CloudItemSnapshot current = await file.InspectAsync(stop);
+                if (current.LocalBinding != binding || !current.IsPlaceholder || current.RemoteRevision is not null ||
+                    current.SynchronizationState == CloudSynchronizationState.InSync)
+                {
+                    throw new InvalidOperationException("Package preparation lost the original unaccepted local object.");
+                }
+            });
+        if (receipt.Outcome != CloudProtectedLocalOperationOutcome.Completed || !receipt.NativeConverted ||
+            !receipt.DurableProjectionCommitted || !receipt.AccessDescriptorApplied || !receipt.AccessDescriptorReadBack ||
+            !receipt.Drained || await File.ReadAllTextAsync(file.FullPath) != "unuploaded-local")
+        {
+            throw new InvalidOperationException("Package protected initialization failed.", receipt.Error);
+        }
+        await system.Root.CreatePlaceholderAsync(CloudFilePlaceholderSpec.CreateBuilder("protected-cold.bin", "cold-local", 4096).Build());
+        CloudFile cold = system.GetFile("protected-cold.bin");
+        CloudLocalFileBinding coldBinding = (await cold.InspectAsync()).LocalBinding!;
+        CloudProtectedLocalOperationResult coldReceipt = await cold.RunProtectedLocalOperationAsync(new(coldBinding), async (scope, stop) =>
+        {
+            await scope.ApplyAccessDescriptorAsync(await scope.ReadAccessDescriptorAsync(stop), stop);
+            if ((await scope.InspectAsync(stop)).ContentAvailability != CloudContentAvailability.OnlineOnly)
+            {
+                throw new InvalidOperationException("Cold package metadata access hydrated content.");
+            }
+        });
+        CloudDirectory directory = system.Root;
+        CloudLocalFileBinding rootBinding = (await directory.InspectAsync()).LocalBinding!;
+        CloudProtectedLocalOperationResult rootReceipt = await directory.RunProtectedLocalOperationAsync(
+            new(rootBinding, CloudProtectedLocalOperationMode.DirectoryMetadata), async (scope, stop) =>
+                await scope.ApplyAccessDescriptorAsync(await scope.ReadAccessDescriptorAsync(stop), stop));
+        if (coldReceipt.Outcome != CloudProtectedLocalOperationOutcome.Completed || rootReceipt.Outcome != CloudProtectedLocalOperationOutcome.Completed || demand.Fetches != 0)
+        {
+            throw new InvalidOperationException("Package cold/directory Access-only protection failed or read source content.", coldReceipt.Error ?? rootReceipt.Error);
+        }
+        Console.WriteLine("Protected local package smoke passed: same-object conversion, DACL, cold metadata, source reads=0.");
+    }
+
+    private static bool SameDacl(byte[] expected, byte[] actual)
+    {
+        RawSecurityDescriptor before = new(expected, 0);
+        RawSecurityDescriptor after = new(actual, 0);
+        if ((before.ControlFlags & ControlFlags.DiscretionaryAclProtected) != (after.ControlFlags & ControlFlags.DiscretionaryAclProtected) ||
+            before.DiscretionaryAcl is not { } first || after.DiscretionaryAcl is not { } second)
+        {
+            return false;
+        }
+        byte[] firstBytes = new byte[first.BinaryLength];
+        byte[] secondBytes = new byte[second.BinaryLength];
+        first.GetBinaryForm(firstBytes, 0);
+        second.GetBinaryForm(secondBytes, 0);
+        return firstBytes.AsSpan().SequenceEqual(secondBytes);
+    }
+
     private sealed class EmptyProvider : ICloudFileContentProvider
     {
-        public ValueTask<Stream> OpenReadAsync(CloudFileFetchRequest request, CancellationToken cancellationToken) =>
-            ValueTask.FromResult<Stream>(new MemoryStream());
+        internal int Fetches { get; private set; }
+        public ValueTask<Stream> OpenReadAsync(CloudFileFetchRequest request, CancellationToken cancellationToken)
+        {
+            Fetches++;
+            return ValueTask.FromResult<Stream>(new MemoryStream());
+        }
     }
 }
 '@ | Set-Content -LiteralPath $consumerProgram -Encoding utf8
@@ -484,6 +581,7 @@ $publicationChecks
 | x86 | Not supported |
 | Native component | CfSharp.Native exposes the complete Cloud Files ABI surface |
 | Durable state | CfSharp.Storage.Sqlite requires a caller-supplied database path outside the managed sync root |
+| Protected local operations | Short same-object callbacks, local conversion and Access-only descriptors; files require native access and alias protection; directories provide metadata only |
 
 $(if ($isPreview) {
     'This preview is not a stable 1.0.0 compatibility promise. API, native ABI, and behavior changes remain subject to the compatibility policy before stable release.'

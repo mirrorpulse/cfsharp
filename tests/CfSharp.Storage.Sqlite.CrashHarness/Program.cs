@@ -1,6 +1,11 @@
 using CfSharp;
 using CfSharp.Storage.Sqlite;
 
+if (args.Length == 4 && args[2].StartsWith("protected-local-", StringComparison.Ordinal))
+{
+    return ProtectedLocalCompetitor.Run(args[0], args[1], args[2]["protected-local-".Length..], args[3]);
+}
+
 if (args.Length == 5 && args[4] == "namespace-consumer")
 {
     return NamespaceConsumer.Run(args[0], args[1], args[2], args[3]);

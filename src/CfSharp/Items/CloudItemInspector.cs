@@ -103,6 +103,14 @@ internal static partial class CloudItemInspector
                 Marshal.GetHRForLastWin32Error());
         }
 
+        return Inspect(handle, path, expectedKind, syncRootPath);
+    }
+
+    // The caller retains the same owned file object throughout this synchronous query.
+    // No pathname stat or reopen is allowed on a protected local operation's item.
+    internal static unsafe LocalCloudItemInspection Inspect(
+        SafeFileHandle handle, string path, CloudItemKind expectedKind, string? syncRootPath = null)
+    {
         FileAttributeTagInfo attributeTagInfo;
         if (!GetFileInformationByHandleEx(
                 handle,
@@ -139,11 +147,8 @@ internal static partial class CloudItemInspector
             throw CloudFilesException.FromHResult("CloudItem.Inspect.State", path, hresult);
         }
 
-        FileSystemInfo fileSystemInfo = actualKind == CloudItemKind.Directory
-            ? new DirectoryInfo(path)
-            : new FileInfo(path);
-        fileSystemInfo.Refresh();
-        long? length = actualKind == CloudItemKind.File ? ((FileInfo)fileSystemInfo).Length : null;
+        WindowsFileMetadata.FileBasicInfo basic = WindowsFileMetadata.ReadBasic(handle.DangerousGetHandle());
+        long? length = actualKind == CloudItemKind.File ? WindowsFileMetadata.ReadLength(handle.DangerousGetHandle()) : null;
         PlaceholderInformation? placeholder = nativeState.HasFlag(CfPlaceholderState.Placeholder)
             ? ReadPlaceholderInformation(handle, path)
             : null;
@@ -154,9 +159,9 @@ internal static partial class CloudItemInspector
             Kind = actualKind,
             Attributes = attributes,
             Length = length,
-            CreationTime = ToDateTimeOffset(fileSystemInfo.CreationTimeUtc),
-            LastWriteTime = ToDateTimeOffset(fileSystemInfo.LastWriteTimeUtc),
-            LastAccessTime = ToDateTimeOffset(fileSystemInfo.LastAccessTimeUtc),
+            CreationTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.CreationTime)),
+            LastWriteTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.LastWriteTime)),
+            LastAccessTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.LastAccessTime)),
             PlaceholderState = placeholderState,
             ContentAvailability = GetContentAvailability(
                 actualKind,
