@@ -25,6 +25,59 @@ internal static unsafe partial class WindowsFileMetadata
         return handle;
     }
 
+    internal static SafeFileHandle OpenForRename(string path)
+    {
+        // DELETE addresses rename permission; no data access is requested, so an online-only
+        // placeholder stays unhydrated. Denying delete sharing excludes competing rename/delete
+        // owners while this handle itself retains DELETE access for the inspected-object rename.
+        SafeFileHandle handle = CreateFile(path, 0x10080, 3, 0, 3, 0x02200000, 0);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenDirectoryGuard(string path)
+    {
+        // FILE_LIST_DIRECTORY makes no-delete sharing effective for a directory. An
+        // attribute-only directory opener does not prevent all ancestor rename races.
+        // Opening this access performs no enumeration and never requests file content.
+        SafeFileHandle handle = CreateFile(path, 0x81, 3, 0, 3, 0x02200000, 0);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+
+        return handle;
+    }
+
+    internal static void Rename(nint handle, string destination)
+    {
+        // FILE_RENAME_INFO has a DWORD-sized union, a naturally aligned HANDLE, a byte
+        // length, and trailing UTF-16 characters. RootDirectory and replacement stay zero.
+        // Use the ABI field offset, not sizeof(header), which includes trailing padding.
+        // https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-file_rename_info
+        FileRenameInformation layout = default;
+        int offset = checked((int)((byte*)&layout.FileName - (byte*)&layout));
+        int nameBytes = checked(destination.Length * sizeof(char));
+        byte[] buffer = new byte[checked(offset + nameBytes + sizeof(char))];
+        fixed (byte* pointer = buffer)
+        {
+            ((FileRenameInformation*)pointer)->FileNameLength = checked((uint)nameBytes);
+            destination.AsSpan().CopyTo(new Span<char>(pointer + offset, destination.Length));
+            if (!SetFileInformationByHandle(handle, 3, pointer, checked((uint)buffer.Length)))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+        }
+    }
+
     internal static SafeFileHandle OpenLocalAccess(string path, bool directory)
     {
         // A single file object owns both data exclusion and security access. A separate
@@ -123,6 +176,7 @@ internal static unsafe partial class WindowsFileMetadata
             attributes.Attributes, attributes.ReparseTag);
         byte[] identity = [];
         long onDisk = 0;
+        long modified = 0;
         bool inSync = false;
         if (state != CfPlaceholderState.Invalid && state.HasFlag(CfPlaceholderState.Placeholder))
         {
@@ -150,13 +204,14 @@ internal static unsafe partial class WindowsFileMetadata
 
                 identity = new ReadOnlySpan<byte>(info->FileIdentity, (int)info->FileIdentityLength).ToArray();
                 onDisk = info->OnDiskDataSize;
+                modified = info->ModifiedDataSize;
                 inSync = info->InSyncState == CfInSyncState.InSync;
             }
         }
 
         return new NativeFileMetadata(ReadIdentity(handle), standard.EndOfFile,
             standard.NumberOfLinks, standard.DeletePending != 0, standard.Directory != 0,
-            attributes.Attributes, attributes.ReparseTag, state, onDisk, inSync, identity);
+            attributes.Attributes, attributes.ReparseTag, state, onDisk, inSync, identity, modified);
     }
 
     private static void Query(nint handle, int informationClass, void* value, uint size)
@@ -203,6 +258,15 @@ internal static unsafe partial class WindowsFileMetadata
         internal uint ReparseTag;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FileRenameInformation
+    {
+        internal uint Flags;
+        internal nint RootDirectory;
+        internal uint FileNameLength;
+        internal char FileName;
+    }
+
     [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvStdcall) })]
     private static partial SafeFileHandle CreateFile(string path, uint access, uint share,
@@ -213,6 +277,11 @@ internal static unsafe partial class WindowsFileMetadata
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetFileInformationByHandleEx(nint handle, int informationClass, void* value, uint size);
 
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvStdcall) })]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(nint handle, int informationClass, void* value, uint size);
+
     [LibraryImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true)]
     [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvStdcall) })]
     private static partial uint GetFinalPathNameByHandle(nint handle, char* path, uint capacity, uint flags);
@@ -220,7 +289,7 @@ internal static unsafe partial class WindowsFileMetadata
 
 internal sealed record NativeFileMetadata(WindowsFileMetadata.FileIdentity Identity, long Length,
     uint Links, bool DeletePending, bool Directory, uint Attributes, uint ReparseTag,
-    CfPlaceholderState PlaceholderState, long OnDiskDataSize, bool InSync, byte[] PlaceholderIdentity);
+    CfPlaceholderState PlaceholderState, long OnDiskDataSize, bool InSync, byte[] PlaceholderIdentity, long ModifiedDataSize);
 
 internal sealed class NativeFileException : IOException
 {

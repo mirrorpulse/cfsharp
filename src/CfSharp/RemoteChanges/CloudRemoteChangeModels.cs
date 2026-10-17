@@ -655,7 +655,11 @@ public sealed class CloudRemoteApplyResult
     /// <summary>Gets whether the caller should retry or resume the batch.</summary>
     public bool RequiresRetry { get; }
 
-    /// <summary>Gets the number of entries durably applied or already applied.</summary>
+    /// <summary>
+    /// Gets the committed entry prefix, including durable conflict outcomes. An applied batch
+    /// may contain conflicts; inspect entry outcomes and conflict identifiers before treating
+    /// every remote mutation as successful.
+    /// </summary>
     public int AppliedEntryCount { get; }
 
     /// <summary>Gets durable conflict identifiers created or reused by this call.</summary>

@@ -260,7 +260,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
     /// <exception cref="InvalidOperationException">
-    /// A creation remains pending, a loss signal is not yet durable, or new loss raced this acknowledgement.
+    /// A remote creation or file move remains pending, a loss signal is not yet durable, or new
+    /// loss raced this acknowledgement.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
     public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
@@ -271,9 +272,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
-        if (creations.Any(value => !RemoteCreationIntent.Decode(value.Value).Committed))
+        if (creations.Any(value => !RemoteCreationIntent.Decode(value.Value).Committed) ||
+            (await transaction.Checkpoints.ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0)
         {
-            throw new InvalidOperationException("Replay pending remote creations before acknowledging reconciliation.");
+            throw new InvalidOperationException("Replay pending remote creations and moves before acknowledging reconciliation.");
         }
 
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
@@ -752,16 +754,23 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         bool pendingCreation = creations.Select(value => RemoteCreationIntent.Decode(value.Value)).Any(intent =>
             !intent.Committed && (string.Equals(intent.RelativePath, path.RelativePath, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(intent.RelativePath, previousPath?.RelativePath, StringComparison.OrdinalIgnoreCase)));
-        if (pendingCreation)
+        IReadOnlyList<CloudStateCheckpoint> moves = await transaction.Checkpoints
+            .ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false);
+        bool pendingMove = moves.Select(value => RemoteMoveIntent.Decode(value.Value)).Any(intent =>
+            CloudDirectoryStateProjection.SamePath(intent.Object.RelativePath, path.RelativePath) ||
+            CloudDirectoryStateProjection.SamePath(intent.TargetRelativePath, path.RelativePath) ||
+            (previousPath is not null && (CloudDirectoryStateProjection.SamePath(intent.Object.RelativePath, previousPath.Value.RelativePath) ||
+                CloudDirectoryStateProjection.SamePath(intent.TargetRelativePath, previousPath.Value.RelativePath))));
+        if (pendingCreation || pendingMove)
         {
             long generation = SignalLoss();
-            // Do not assign a local identity while native creation is uncommitted. Retain
+            // Do not assign or relocate a local identity while native remote work is pending. Retain
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
                 Directory.Exists(path.FullPath), observedAt);
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
-                RemoteCreationIntent.ObservationsPrefix + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
+                (pendingMove ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
