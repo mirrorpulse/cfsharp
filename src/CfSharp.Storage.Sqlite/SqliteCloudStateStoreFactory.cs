@@ -777,7 +777,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
 
 internal static class SqliteSchema
 {
-    internal const int CurrentVersion = 6;
+    internal const int CurrentVersion = 7;
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
     internal static async Task InitializeAsync(
@@ -876,6 +876,16 @@ internal static class SqliteSchema
                 // No table, existing checkpoint, item field, or journal sequence is rewritten.
                 await using SqliteCommand upgrade = connection.CreateCommand();
                 upgrade.CommandText = "UPDATE cfsharp_schema SET version = 6 WHERE singleton = 1;";
+                await upgrade.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (version < 7)
+            {
+                // File-move preparations bridge native rename, item projection, and original
+                // batch outcome commits using checkpoints. Fence older runtimes before they
+                // can ignore pending evidence or deliver its observations as local uploads.
+                await using SqliteCommand upgrade = connection.CreateCommand();
+                upgrade.CommandText = "UPDATE cfsharp_schema SET version = 7 WHERE singleton = 1;";
                 await upgrade.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 

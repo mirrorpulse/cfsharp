@@ -44,6 +44,10 @@ public sealed class AbiProbeComparisonTests
         AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoDeleteOffset", "DeletePending");
         AssertOffset<WindowsFileMetadata.FileStandardInfo>(probe, "fileStandardInfoDirectoryOffset", "Directory");
         AssertProbe(probe, "fileAttributeTagInfoSize", Marshal.SizeOf<WindowsFileMetadata.FileAttributeTagInfo>());
+        AssertProbe(probe, "fileRenameInfoSize", Marshal.SizeOf<WindowsFileMetadata.FileRenameInformation>());
+        AssertOffset<WindowsFileMetadata.FileRenameInformation>(probe, "fileRenameInfoRootOffset", "RootDirectory");
+        AssertOffset<WindowsFileMetadata.FileRenameInformation>(probe, "fileRenameInfoLengthOffset", "FileNameLength");
+        AssertOffset<WindowsFileMetadata.FileRenameInformation>(probe, "fileRenameInfoNameOffset", "FileName");
         AssertProbe(probe, "readFileUsnDataSize", Marshal.SizeOf<WindowsFileUsn.ReadFileUsnData>());
         AssertOffset<WindowsFileUsn.ReadFileUsnData>(probe, "readFileUsnDataMaxMajorVersionOffset", "MaxMajorVersion");
         AssertProbe(probe, "usnRecordV2UsnOffset", WindowsFileUsn.Version2UsnOffset);

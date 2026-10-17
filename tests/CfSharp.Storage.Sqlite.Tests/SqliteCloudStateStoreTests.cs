@@ -375,7 +375,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            6L,
+            7L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -387,7 +387,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     }
 
     [Fact]
-    public async Task VersionOneRemoteBatchSchemaMigratesToVersionSix()
+    public async Task VersionOneRemoteBatchSchemaMigratesToVersionSeven()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -402,7 +402,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            6L,
+            7L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -415,7 +415,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     }
 
     [Fact]
-    public async Task VersionTwoEchoSuppressionSchemaMigratesToVersionSix()
+    public async Task VersionTwoEchoSuppressionSchemaMigratesToVersionSeven()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -430,7 +430,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            6L,
+            7L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -459,12 +459,14 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             Assert.Equal(new byte[] { 7 }, (await transaction.Checkpoints.GetAsync("existing/checkpoint"))!.Value.ToArray());
         }
 
-        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(7L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
-    [Fact]
-    public async Task VersionFiveUpgradePreservesCoordinationRowsAndSequenceAllocation()
+    [Theory]
+    [InlineData(5)]
+    [InlineData(6)]
+    public async Task PreviousProtocolUpgradePreservesCoordinationRowsAndSequenceAllocation(int previousVersion)
     {
         Guid itemId = Guid.NewGuid();
         Guid operationId = Guid.NewGuid();
@@ -488,7 +490,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             await write.CommitAsync();
         }
 
-        await ExecuteSqlAsync(_databasePath, "UPDATE cfsharp_schema SET version = 5 WHERE singleton = 1;");
+        await ExecuteSqlAsync(_databasePath, $"UPDATE cfsharp_schema SET version = {previousVersion} WHERE singleton = 1;");
         await using (ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext()))
         await using (ICloudStateTransaction verify = await reopened.BeginTransactionAsync())
         {
@@ -522,12 +524,12 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             await verify.CommitAsync();
         }
 
-        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(7L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
     [Fact]
-    public async Task VersionSixFenceSurvivesProcessExitBeforeApplicationCommit()
+    public async Task VersionSevenFenceSurvivesProcessExitBeforeApplicationCommit()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
@@ -540,7 +542,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         (int exitCode, _) = await RunCrashHarnessAsync("before-commit", _databasePath, _syncRootPath);
         Assert.NotEqual(0, exitCode);
         Assert.True(File.Exists(_databasePath + ".before-commit.started"));
-        Assert.Equal(6L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(7L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
         await using ICloudStateStore recovered = await CreateFactory().OpenAsync(CreateContext());
         await using ICloudStateTransaction verify = await recovered.BeginTransactionAsync();
@@ -558,7 +560,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
                 singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             );
-            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 7);
+            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 8);
             """);
 
         SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<

@@ -24,6 +24,9 @@ public sealed partial class CloudFileSystem
     /// </returns>
     /// <exception cref="ArgumentNullException">The batch is null.</exception>
     /// <exception cref="ArgumentException">The batch conflicts with existing durable progress.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A retained file-move preparation is corrupt or belongs to another policy, store, or root.
+    /// </exception>
     /// <exception cref="InvalidOperationException">The file system has not started.</exception>
     /// <exception cref="CloudFilesException">Windows rejects a requested namespace mutation.</exception>
     /// <exception cref="OperationCanceledException">Cancellation was observed at a safe boundary.</exception>
@@ -32,6 +35,20 @@ public sealed partial class CloudFileSystem
     /// metadata, identity, and revision while leaving hydration to the configured provider. A
     /// durable batch record is written after each entry, so a process restart resumes from the
     /// last committed entry without publishing an unsafe cursor.
+    /// File moves retain versioned original object, ancestry, batch, and apply-policy evidence
+    /// before native mutation. Replay authenticates that evidence before checking previous
+    /// revisions, including when both revisions are equal. Successful recovery reports
+    /// <see cref="CloudRemoteApplyEntryStatus.Applied"/> after durable outcome publication;
+    /// completed batch prefixes report <see cref="CloudRemoteApplyEntryStatus.AlreadyApplied"/>.
+    /// Changed objects, ancestry, or local work leave the entry failed and retryable with its
+    /// preparation retained. Mismatched policy or preparation is rejected before progress changes.
+    /// Storage failures during preparation reads or outcome publication propagate to the
+    /// caller; replay rereads durable state, including when a commit completed before throwing.
+    /// Cancellation after native success finishes item projection without cancellation and may
+    /// leave outcome publication for replay. This protocol covers file moves submitted through
+    /// this method; it cannot authenticate historical file moves without original evidence or
+    /// settle a directory move's missing remote-batch outcome. Use one active file-system owner
+    /// per root/store; calls on that owner serialize and disposal drains admitted work.
     /// </remarks>
     public async ValueTask<CloudRemoteApplyResult> ApplyRemoteChangesAsync(
         CloudRemoteChangeBatch batch,
@@ -73,6 +90,7 @@ public sealed partial class CloudFileSystem
 
         CloudRemoteBatchState progress = await ReadOrInitializeRemoteBatchAsync(
                 batch,
+                selectedOptions,
                 cancellationToken)
             .ConfigureAwait(false);
         List<CloudRemoteApplyEntryResult> results = [];
@@ -103,13 +121,21 @@ public sealed partial class CloudFileSystem
             cancellationToken.ThrowIfCancellationRequested();
             int index = progress.AppliedEntryCount;
             CloudRemoteChange change = batch.Changes[index];
+            RemoteMoveRequest moveRequest = new(batch, index, selectedOptions);
+            // Reject a mismatched pending preparation before changing any batch progress.
+            RemoteMoveIntent? pendingMove = change.Kind == CloudRemoteChangeKind.Move && change.ItemKind == CloudItemKind.File
+                ? await ReadRemoteMoveIntentAsync(moveRequest, cancellationToken).ConfigureAwait(false)
+                : null;
             RemoteEntryOutcome outcome;
             try
             {
-                outcome = await ApplyRemoteEntryAsync(
+                outcome = pendingMove is not null
+                    ? await CompleteRemoteFileMoveAsync(change, pendingMove, cancellationToken).ConfigureAwait(false)
+                    : await ApplyRemoteEntryAsync(
                         change,
                         selectedOptions,
-                        cancellationToken)
+                        cancellationToken,
+                        moveRequest)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -286,6 +312,7 @@ public sealed partial class CloudFileSystem
 
     private async ValueTask<CloudRemoteBatchState> ReadOrInitializeRemoteBatchAsync(
         CloudRemoteChangeBatch batch,
+        CloudRemoteApplyOptions options,
         CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
@@ -309,6 +336,13 @@ public sealed partial class CloudFileSystem
             {
                 throw new InvalidOperationException(
                     $"Remote batch '{batch.BatchId}' has invalid durable progress.");
+            }
+
+            if (existing.AppliedEntryCount < batch.Changes.Count &&
+                batch.Changes[existing.AppliedEntryCount] is { Kind: CloudRemoteChangeKind.Move, ItemKind: CloudItemKind.File })
+            {
+                await ReadRemoteMoveIntentCoreAsync(transaction, new(batch, existing.AppliedEntryCount, options), cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             if (existing.Status is CloudRemoteBatchStatus.Applied)
@@ -380,9 +414,10 @@ public sealed partial class CloudFileSystem
     private async ValueTask<RemoteEntryOutcome> ApplyRemoteEntryAsync(
         CloudRemoteChange change,
         CloudRemoteApplyOptions options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RemoteMoveRequest? moveRequest = null)
     {
-        RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(change, options, cancellationToken)
+        RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(change, options, cancellationToken, moveRequest)
             .ConfigureAwait(false);
         if (outcome.Conflict is null || options.ConflictResolver is null)
         {
@@ -416,14 +451,16 @@ public sealed partial class CloudFileSystem
                     PreserveUnsynchronizedLocalContent = false,
                     ConflictResolver = null,
                 },
-                cancellationToken)
+                cancellationToken,
+                moveRequest)
             .ConfigureAwait(false);
     }
 
     private async ValueTask<RemoteEntryOutcome> ApplyRemoteEntryCoreAsync(
         CloudRemoteChange change,
         CloudRemoteApplyOptions options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RemoteMoveRequest? moveRequest = null)
     {
         if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
         {
@@ -440,7 +477,7 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         if (change.Kind is CloudRemoteChangeKind.Move)
         {
-            return await ApplyRemoteMoveAsync(change, context, options, cancellationToken)
+            return await ApplyRemoteMoveAsync(change, context, options, moveRequest, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -616,6 +653,7 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         RemoteEntryContext context,
         CloudRemoteApplyOptions options,
+        RemoteMoveRequest? moveRequest,
         CancellationToken cancellationToken)
     {
         CloudItemState? localState = context.LocalState;
@@ -696,6 +734,13 @@ public sealed partial class CloudFileSystem
         string destinationParentPath = Path.GetDirectoryName(change.RelativePath) ?? string.Empty;
         CloudDirectory destination = GetDirectory(destinationParentPath);
         string destinationName = Path.GetFileName(change.RelativePath);
+        if (moveRequest is not null && change.ItemKind == CloudItemKind.File)
+        {
+            RemoteMoveIntent intent = await PrepareRemoteFileMoveAsync(change, localState, options, moveRequest,
+                cancellationToken).ConfigureAwait(false);
+            return await CompleteRemoteFileMoveAsync(change, intent, cancellationToken).ConfigureAwait(false);
+        }
+
         Guid? suppressionId = null;
         if (options.SuppressLocalEcho)
         {
@@ -1201,6 +1246,8 @@ public sealed partial class CloudFileSystem
             change.ChangeId);
         await transaction.RemoteBatches.UpsertAsync(next, cancellationToken).ConfigureAwait(false);
         await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(change), cancellationToken)
+            .ConfigureAwait(false);
+        await transaction.Checkpoints.RemoveAsync(RemoteMoveIntent.Name(batch.BatchId, appliedEntryCount - 1), cancellationToken)
             .ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return next;

@@ -280,23 +280,46 @@ public sealed partial class CloudLocalChangeFeedTests
         }
     }
 
-    [Fact]
-    public async Task CreationIntentAndRetainedObservationFenceScansUntilExplicitRecovery()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RemoteIntentAndRetainedObservationFenceScansUntilExplicitRecovery(bool move)
     {
         await using ICloudStateStore store = await OpenStoreAsync();
         await SeedChangesAsync(store, 2);
-        await using CloudLocalChangeFeed feed = CreateFeed(store, new FakeSource());
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(store, source);
         await feed.StartAsync();
         CloudLocalChangeScan original = await feed.BeginScanAsync();
-        string intentName = RemoteCreationIntent.Prefix + "/test";
-        string observationName = RemoteCreationIntent.ObservationsPrefix + "/test";
+        string intentName = move ? RemoteMoveIntent.Name("batch", 0) : RemoteCreationIntent.Prefix + "/test";
+        string observationName = (move ? CloudLocalChangeFeed.NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/test";
         await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
         {
             RemoteCreationIntent intent = new("pending", CloudItemKind.Directory,
                 new CloudPlaceholderIdentity(Guid.NewGuid(), "pending-remote"), new byte[32], false);
-            await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint(intentName, intent.Encode(), DateTimeOffset.UtcNow));
+            byte[] evidence = intent.Encode();
+            if (move)
+            {
+                CloudLocalFileBinding binding = new(1, Guid.NewGuid(), Guid.NewGuid());
+                CloudItemState originalItem = new(intent.Identity.ItemId, "pending-remote", "source.bin",
+                    CloudItemKind.File, "v1", null, false, DateTimeOffset.UtcNow);
+                RemoteMoveObject item = new(originalItem.RelativePath, binding, intent.Identity.Encode(), 10, 20, 512);
+                RemoteMoveIntent preparation = new(Guid.NewGuid(), _syncRootPath, "batch", 0, new byte[32], "target.bin",
+                    true, true, TimeSpan.FromMinutes(2).Ticks, 4, originalItem, item, [new(string.Empty, binding, [], 5, 6, 0)],
+                    null, true, RemoteMoveIntent.FingerprintOperations([]), null);
+                evidence = preparation.Encode();
+            }
+
+            await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint(intentName, evidence, DateTimeOffset.UtcNow));
             await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint(observationName, [1], DateTimeOffset.UtcNow));
             await write.CommitAsync();
+        }
+
+        if (move)
+        {
+            await source.EmitAsync(new(LocalChangeSourceAction.Modified, "target.bin"));
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
+            await WaitForLossPersistenceAsync(feed, timeout.Token);
         }
 
         Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
@@ -308,7 +331,7 @@ public sealed partial class CloudLocalChangeFeedTests
             await recover.CommitAsync();
         }
 
-        // Removing a completed creation intent does not implicitly accept its uncertain observations.
+        // Removing a completed intent does not implicitly accept its uncertain observations.
         Assert.True((await feed.ReadPageAsync(original, 0, 1)).RequiresFullRescan);
         await feed.AcknowledgeFullRescanAsync();
         Assert.True((await feed.ReadPageAsync(original, 0, 1)).RequiresFullRescan);
