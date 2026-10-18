@@ -34,6 +34,10 @@ else
 The feed normalizes paths relative to the sync root, pairs renames, and persists the ordered
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
 only after the application has accepted the batch.
+Path normalization tolerates a file or ancestor disappearing between its existence and link
+queries, as can happen when a queued notification names the old side of a rename. It does not
+turn that transient absence into a stopped feed or invent native mutation success. Existing
+link-boundary checks and native object/ancestry guards remain authoritative.
 Background notification processing does not require pumping the synchronization context that
 started the feed; loss persistence and shutdown drain continue independently of that context.
 
