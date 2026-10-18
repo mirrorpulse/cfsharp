@@ -175,9 +175,13 @@ Deletion requires exclusive data access. Existing readers, including readers tha
 defer the operation before native mutation; close those handles and replay the unchanged batch.
 This prevents a reader from leaving the object delete-pending after the SDK closes its handle.
 
-After deletion and observed disappearance, a native-completion receipt commits first. The exact
-item tombstone and its projection receipt then commit atomically. Finally, the original batch
-outcome, safe prefix/cursor and receipt consumption commit in one transaction. A failed or
+After Windows accepts deletion on the authenticated native object, an acceptance receipt commits
+before reopening the path. Attribute-only query handles can delay disappearance despite exclusive
+data access. While such a handle remains open, the original entry and local-scan fence stay pending
+with their durable receipt; close the handle and replay the unchanged batch, including after restart.
+Only observed disappearance permits the exact item tombstone and its projection receipt to commit
+atomically. Finally, the original batch outcome, safe prefix/cursor and receipt consumption commit
+in one transaction. A failed or
 ambiguous commit retains the original durable state for re-reading; an exception does not prove
 rollback. Neither preparation nor a matching current tombstone alone proves native completion.
 
@@ -186,7 +190,8 @@ rollback. Neither preparation nor a matching current tombstone alone proves nati
 | Preparation not committed | Validate and prepare before any native mutation |
 | Preparation committed; original object still present | Revalidate the original object, parents, native USN and local work |
 | Original absent; no committed native-completion receipt | Explicit unresolved entry; no success cursor |
-| Native receipt committed; tombstone transaction lost | Repair only the original projection after state validation |
+| Native acceptance committed; object still delete-pending | Retain proof and retry absence verification without deleting again |
+| Native receipt committed; tombstone transaction lost | Repair only the original projection after state and absence validation |
 | Tombstone/receipt committed; batch outcome lost | Complete the original entry without deleting again or producing a stale conflict |
 | Outcome committed; response lost | Return the durable prefix as `AlreadyApplied` without further deletion |
 

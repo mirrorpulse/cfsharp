@@ -45,8 +45,8 @@ internal static unsafe partial class WindowsFileMetadata
     {
         // DELETE mutates this inspected object, rather than reopening a mutable path.
         // READ_DATA/LIST_DIRECTORY with no sharing excludes competing readers, writers,
-        // renames and deletion. Even a reader sharing DELETE can keep a successfully deleted
-        // object delete-pending after our handle closes, preventing a completion receipt.
+        // renames and deletion. Attribute-only access is exempt from data-sharing exclusion;
+        // its remaining handles can still delay namespace disappearance after disposition.
         // Access permission alone performs no content read or hydration.
         SafeFileHandle handle = CreateFile(path, 0x10081, 0, 0, 3, 0x02200000, 0);
         if (handle.IsInvalid)
@@ -62,8 +62,8 @@ internal static unsafe partial class WindowsFileMetadata
     internal static void Delete(nint handle)
     {
         // FILE_DISPOSITION_INFO contains one native BOOLEAN, not a four-byte Win32 BOOL.
-        // Success marks the object delete-pending; the owner must close the handle and
-        // verify namespace disappearance before recording a completed native deletion.
+        // Success marks the object delete-pending. The owner can durably record acceptance,
+        // but must verify namespace disappearance separately before projecting a tombstone.
         FileDispositionInformation value = new() { DeleteFile = 1 };
         if (!SetFileInformationByHandle(handle, 4, &value, (uint)sizeof(FileDispositionInformation)))
         {

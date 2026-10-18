@@ -7,6 +7,37 @@ namespace CfSharp.Native.Tests;
 
 public sealed class WindowsFileMetadataTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.16299")]
+    public void AttributeOnlyHandleCanDelayAnAcceptedDeletion(bool directory)
+    {
+        string area = Path.Combine(Path.GetTempPath(), "CfSharp-delete-attributes", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(area);
+        string path = Path.Combine(area, "original");
+        try
+        {
+            if (directory) { Directory.CreateDirectory(path); }
+            else { File.WriteAllText(path, "original"); }
+            using (var query = WindowsFileMetadata.Open(path))
+            {
+                using (var deletion = WindowsFileMetadata.OpenForDelete(path))
+                {
+                    WindowsFileMetadata.Delete(deletion.DangerousGetHandle());
+                }
+
+                Assert.True(WindowsFileMetadata.Read(query.DangerousGetHandle()).DeletePending);
+                Assert.Equal(5, Assert.Throws<Win32Exception>(() => WindowsFileMetadata.Open(path)).NativeErrorCode);
+            }
+            Assert.False(File.Exists(path) || Directory.Exists(path));
+        }
+        finally
+        {
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
     [Fact]
     public void DeleteGuardRejectsReadersEvenWhenTheyShareDelete()
     {

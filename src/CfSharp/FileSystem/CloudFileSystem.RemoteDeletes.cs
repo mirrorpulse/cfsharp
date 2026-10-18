@@ -283,22 +283,19 @@ public sealed partial class CloudFileSystem
                 }
 
                 handle.Dispose();
-                // File.Exists suppresses access errors; opening instead distinguishes absence
-                // from inaccessible/delete-pending state. It also catches a replacement without
-                // issuing any second deletion against that replacement.
-                using SafeFileHandle? remaining = TryOpenRemoteNamespaceObject(fullPath);
-                if (remaining is not null)
-                {
-                    throw DeleteUnresolved(request, "native delete pending or replacement present");
-                }
-
+                // Windows accepted disposition on this authenticated object. Attribute-only
+                // handles are exempt from data sharing and can delay disappearance even after
+                // our exclusive handle closes. Persist acceptance before any path reopen: an
+                // access error must not discard this proof and force an unprovable second delete.
                 member = member with { DeletedAtTicks = DateTimeOffset.UtcNow.UtcTicks };
                 intent = ReplaceDeleteMember(intent, index, member);
                 await SaveRemoteDeleteIntentAsync(native, intent, CancellationToken.None).ConfigureAwait(false);
                 await native.CommitAsync(CancellationToken.None).ConfigureAwait(false);
             }
 
-            // This separate durable native receipt permits repair of a failed projection.
+            // Acceptance is not proof of disappearance. A delayed delete, inaccessible path or
+            // replacement leaves this receipt intact, without repeating the native mutation.
+            // Only observed absence permits the tombstone and its projection receipt below.
             // Projection and its completed-stage receipt still commit together. Neither stage
             // advances the original batch, and a lost commit result is reread on the next call.
             await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);

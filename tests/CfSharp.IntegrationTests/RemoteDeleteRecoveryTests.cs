@@ -1,16 +1,74 @@
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.Principal;
 using CfSharp.Storage.Sqlite;
+using Microsoft.Win32.SafeHandles;
 using Xunit.Abstractions;
 
 namespace CfSharp.IntegrationTests;
 
 [SupportedOSPlatform("windows10.0.16299")]
-public sealed class RemoteDeleteRecoveryTests
+public sealed partial class RemoteDeleteRecoveryTests
 {
     private readonly ITestOutputHelper _output;
 
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task AttributeQueryHandleRetainsNativeAcceptanceUntilNamespaceDisappears(bool directory, bool afterPreparation)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        if (afterPreparation)
+        {
+            root.Factory.Boundary = "prepare-after";
+            root.Factory.FailuresRemaining = 1;
+            Assert.True((await root.ApplyAsync()).RequiresRetry);
+            await root.RestartAsync();
+        }
+
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        using (SafeFileHandle query = OpenAttributeQuery(path))
+        {
+            Assert.False(query.IsInvalid);
+            CloudRemoteApplyResult pending = await root.ApplyAsync();
+            Assert.True(pending.RequiresRetry);
+            Assert.Equal(0, pending.AppliedEntryCount);
+            Assert.Empty(pending.ConflictIds);
+            using (SafeFileHandle pendingOpen = OpenAttributeQuery(path))
+            {
+                Assert.True(pendingOpen.IsInvalid);
+                Assert.Equal(5, Marshal.GetLastPInvokeError());
+            }
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                Assert.NotNull(intent.Members[0].DeletedAtTicks);
+                Assert.Null(intent.Members[0].ProjectedAtTicks);
+                Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+            }
+
+            // Restart while the independent attribute-only handle still delays disappearance.
+            await root.RestartAsync();
+            Assert.True((await root.ApplyAsync()).RequiresRetry);
+            await using CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
+            await feed.StartAsync();
+            Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        }
+
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Equal(1, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await completed.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
 
     [Theory]
     [InlineData(false, "none", false)]
@@ -839,6 +897,12 @@ public sealed class RemoteDeleteRecoveryTests
 
         Assert.Equal(0, root.Provider.Reads);
     }
+
+    // Attribute-only access is intentionally outside Windows data-sharing exclusion.
+    private static SafeFileHandle OpenAttributeQuery(string path) => CreateFile(path, 0x80, 7, 0, 3, 0x02200000, 0);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial SafeFileHandle CreateFile(string path, uint access, uint share, nint security, uint disposition, uint flags, nint template);
 
     private sealed class DeleteRoot(string area, CloudFileSystem fileSystem, DeleteFactory factory,
         RejectingProvider provider, CloudPlaceholderIdentity identity, CloudRemoteChangeBatch batch, string target) : IAsyncDisposable

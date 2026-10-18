@@ -215,5 +215,7 @@ internal sealed record RemoteDeleteIntent(
     }
 }
 
+// DeletedAtTicks authenticates accepted native disposition, including delete-pending objects;
+// ProjectedAtTicks additionally certifies observed absence and the exact committed tombstone.
 internal sealed record RemoteDeleteMember(CloudItemKind Kind, RemoteNamespaceObject Object,
     CloudItemState? Original, byte[] OperationsFingerprint, long? DeletedAtTicks, long? ProjectedAtTicks, long? Usn = null);
