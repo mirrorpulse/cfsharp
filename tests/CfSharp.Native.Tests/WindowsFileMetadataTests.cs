@@ -7,6 +7,31 @@ namespace CfSharp.Native.Tests;
 
 public sealed class WindowsFileMetadataTests
 {
+    [Fact]
+    public void DeleteGuardRejectsReadersEvenWhenTheyShareDelete()
+    {
+        string area = Path.Combine(Path.GetTempPath(), "CfSharp-delete-reader", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(area);
+        string path = Path.Combine(area, "original");
+        File.WriteAllText(path, "original");
+        try
+        {
+            using (FileStream reader = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                Win32Exception failure = Assert.Throws<Win32Exception>(() => WindowsFileMetadata.OpenForDelete(path));
+                Assert.Equal(32, failure.NativeErrorCode);
+                Assert.Equal("original", File.ReadAllText(path));
+            }
+
+            using var guard = WindowsFileMetadata.OpenForDelete(path);
+            Assert.Throws<IOException>(() => File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        }
+        finally
+        {
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

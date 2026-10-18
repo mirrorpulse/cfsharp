@@ -44,9 +44,11 @@ internal static unsafe partial class WindowsFileMetadata
     internal static SafeFileHandle OpenForDelete(string path)
     {
         // DELETE mutates this inspected object, rather than reopening a mutable path.
-        // READ_DATA/LIST_DIRECTORY with no write/delete sharing excludes competing writers,
-        // renames and deletion. Access permission alone performs no content read or hydration.
-        SafeFileHandle handle = CreateFile(path, 0x10081, 1, 0, 3, 0x02200000, 0);
+        // READ_DATA/LIST_DIRECTORY with no sharing excludes competing readers, writers,
+        // renames and deletion. Even a reader sharing DELETE can keep a successfully deleted
+        // object delete-pending after our handle closes, preventing a completion receipt.
+        // Access permission alone performs no content read or hydration.
+        SafeFileHandle handle = CreateFile(path, 0x10081, 0, 0, 3, 0x02200000, 0);
         if (handle.IsInvalid)
         {
             int error = Marshal.GetLastPInvokeError();

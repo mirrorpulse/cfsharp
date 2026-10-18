@@ -169,6 +169,10 @@ timestamps cannot silently reuse old authorization. Native deletion targets the 
 it never reopens a mutable path for deletion. Handles exclude competing file writers/deleters,
 parent guards prevent ancestor replacement, and metadata queries do not hydrate content.
 
+Deletion requires exclusive data access. Existing readers, including readers that share deletion,
+defer the operation before native mutation; close those handles and replay the unchanged batch.
+This prevents a reader from leaving the object delete-pending after the SDK closes its handle.
+
 After deletion and observed disappearance, a native-completion receipt commits first. The exact
 item tombstone and its projection receipt then commit atomically. Finally, the original batch
 outcome, safe prefix/cursor and receipt consumption commit in one transaction. A failed or

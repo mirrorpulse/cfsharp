@@ -227,6 +227,24 @@ public sealed partial class CloudFileSystem
             ValidateRemoteDeleteParents(request, intent, parents.Parents);
             if (!member.DeletedAtTicks.HasValue)
             {
+                // Enumeration needs its own LIST_DIRECTORY handle, which the exclusive delete
+                // handle would reject. The native disposition still rejects any new child
+                // created after this check, and the opened object's binding is verified below.
+                if (member.Kind == CloudItemKind.Directory)
+                {
+                    try
+                    {
+                        if (Directory.EnumerateFileSystemEntries(fullPath).Any())
+                        {
+                            throw DeleteUnresolved(request, "new or unresolved children outside completed original inventory");
+                        }
+                    }
+                    catch (DirectoryNotFoundException)
+                    {
+                        throw DeleteUnresolved(request, "unproven native deletion before completion receipt");
+                    }
+                }
+
                 using SafeFileHandle? handle = TryOpenRemoteDeleteObject(fullPath);
                 if (handle is null)
                 {
@@ -239,11 +257,6 @@ public sealed partial class CloudFileSystem
                 if (!SameDeleteObject(member, observed) || (member.Usn.HasValue && WindowsFileUsn.Read(fullPath, expectedDirectory: false) != member.Usn))
                 {
                     throw DeleteUnresolved(request, "changed original native object");
-                }
-
-                if (member.Kind == CloudItemKind.Directory && Directory.EnumerateFileSystemEntries(fullPath).Any())
-                {
-                    throw DeleteUnresolved(request, "new or unresolved children outside completed original inventory");
                 }
 
                 // Exclude transactional projections across the same-object native mutation.
