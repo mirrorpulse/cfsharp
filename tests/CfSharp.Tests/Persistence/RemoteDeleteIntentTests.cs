@@ -2,6 +2,19 @@ namespace CfSharp.Tests.Persistence;
 
 public sealed class RemoteDeleteIntentTests
 {
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(0x00000426u)]
+    [InlineData(0xffffffffu)]
+    public void InventoryRetainsTheExactNativeAttributeSnapshot(uint attributes)
+    {
+        (RemoteDeleteIntent intent, _) = Create();
+        intent = intent with { Members = [intent.Members[0] with { Attributes = attributes }] };
+        RemoteDeleteIntent decoded = RemoteDeleteIntent.Decode(intent.Encode());
+        Assert.Equal(attributes, decoded.Members[0].Attributes);
+        Assert.Equal(intent.Encode(), decoded.Encode());
+    }
+
     [Fact]
     public void DirectoryInventoryRetainsItsIndependentMetadataUsn()
     {
@@ -129,7 +142,9 @@ public sealed class RemoteDeleteIntentTests
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value.Concat(new byte[] { 0 }).ToArray()));
         value[0] = 1;
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value));
-        value[0] = 3;
+        value[0] = 2;
+        Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value));
+        value[0] = 4;
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value));
     }
 
@@ -165,6 +180,7 @@ public sealed class RemoteDeleteIntentTests
         RemoteNamespaceObject root = new(string.Empty, binding, [], 50, 60, 0);
         return (new(Guid.NewGuid(), "C:\\root", batch.BatchId, 0, batch.Fingerprint.ToArray(), true, true,
             true, CloudRemoteApplyOptions.Default.EchoSuppressionLifetime.Ticks, CloudRemoteApplyOptions.Default.EchoSuppressionObservationCount,
-            [root], [new(CloudItemKind.File, item, state, RemoteNamespaceEvidence.FingerprintOperations([]), null, null)]), batch);
+            [root], [new(CloudItemKind.File, item, state, RemoteNamespaceEvidence.FingerprintOperations([]), null, null, null,
+                (uint)FileAttributes.Archive)]), batch);
     }
 }

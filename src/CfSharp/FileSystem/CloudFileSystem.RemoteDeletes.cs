@@ -148,7 +148,7 @@ public sealed partial class CloudFileSystem
             cancellationToken.ThrowIfCancellationRequested();
             using SafeFileHandle guard = WindowsFileMetadata.OpenForDelete(entry.FullPath);
             RemoteNamespaceObject observed = ObserveRemoteDeleteObject(guard, entry.Kind, effectiveOptions.PreserveUnsynchronizedLocalContent, request,
-                out bool placeholder);
+                out bool placeholder, out uint attributes);
             CloudItemState? state = await transaction.Items.GetByRelativePathAsync(entry.RelativePath, cancellationToken).ConfigureAwait(false);
             if (state is not null && (state.IsTombstone || state.Kind != entry.Kind))
             {
@@ -175,7 +175,7 @@ public sealed partial class CloudFileSystem
             }
 
             members.Add(new(entry.Kind, observed, state, RemoteNamespaceEvidence.FingerprintOperations(operations), null, null,
-                WindowsFileUsn.Read(entry.FullPath, expectedDirectory: entry.Kind == CloudItemKind.Directory)));
+                WindowsFileUsn.Read(entry.FullPath, expectedDirectory: entry.Kind == CloudItemKind.Directory), attributes));
         }
 
         if (!SameRemoteItemState(members[^1].Original, original))
@@ -274,8 +274,8 @@ public sealed partial class CloudFileSystem
                 // during any awaited store operation. Observe native state only after all
                 // transaction/journal waits, with no further await before disposition.
                 // These queries are not an atomic compare-and-delete or an attribute lock.
-                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation, request, out _);
-                if (!SameDeleteObject(member, observed) || (member.Usn.HasValue &&
+                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation, request, out _, out uint attributes);
+                if (!SameDeleteObject(member, observed) || member.Attributes != attributes || (member.Usn.HasValue &&
                     WindowsFileUsn.Read(fullPath, expectedDirectory: member.Kind == CloudItemKind.Directory) != member.Usn))
                 {
                     throw DeleteUnresolved(request, "changed original native object");
@@ -419,7 +419,7 @@ public sealed partial class CloudFileSystem
         transaction.Checkpoints.UpsertAsync(new(RemoteDeleteIntent.Name(intent.BatchId, intent.EntryIndex), intent.Encode(), DateTimeOffset.UtcNow), cancellationToken);
 
     private RemoteNamespaceObject ObserveRemoteDeleteObject(SafeFileHandle handle, CloudItemKind kind, bool preserve, RemoteChangeRequest request,
-        out bool placeholder)
+        out bool placeholder, out uint attributes)
     {
         NativeFileMetadata metadata = WindowsFileMetadata.Read(handle.DangerousGetHandle());
         placeholder = metadata.PlaceholderState != CfPlaceholderState.Invalid && metadata.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder);
@@ -436,6 +436,9 @@ public sealed partial class CloudFileSystem
         }
 
         WindowsFileMetadata.FileBasicInfo basic = WindowsFileMetadata.ReadBasic(handle.DangerousGetHandle());
+        // NTFS can merge repeated BASIC_INFO_CHANGE reasons while a writer remains open.
+        // InSync and USN can therefore stay unchanged across different actual attributes.
+        attributes = basic.Attributes;
         return new(Path.GetRelativePath(SyncRootPath, path), CloudLocalFileBindingPlatform.Read(handle.DangerousGetHandle(), SyncRootPath),
             metadata.PlaceholderIdentity, basic.CreationTime, basic.LastWriteTime, metadata.Length);
     }

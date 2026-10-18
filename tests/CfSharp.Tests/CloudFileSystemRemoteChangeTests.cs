@@ -67,7 +67,7 @@ public sealed class CloudFileSystemRemoteChangeTests
                 RemoteDeleteIntent intent = new(scope, rootPath, batch.BatchId, 0, batch.Fingerprint.ToArray(), true, true, true,
                     CloudRemoteApplyOptions.Default.EchoSuppressionLifetime.Ticks, CloudRemoteApplyOptions.Default.EchoSuppressionObservationCount,
                     [root], [new(CloudItemKind.File, item, original, RemoteNamespaceEvidence.FingerprintOperations([]),
-                        completionTime.UtcTicks, completionTime.UtcTicks)]);
+                        completionTime.UtcTicks, completionTime.UtcTicks, null, (uint)FileAttributes.Archive)]);
                 await seed.Items.UpsertAsync(new(original.ItemId, original.RemoteId, original.RelativePath, original.Kind,
                     "v2", original.LocalFileId, true, completionTime));
                 await seed.Checkpoints.UpsertAsync(new(RemoteDeleteIntent.Name(batch.BatchId, 0), intent.Encode(), completionTime));

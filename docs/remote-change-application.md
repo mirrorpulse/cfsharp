@@ -219,6 +219,13 @@ later local metadata change, including one followed by an explicit in-sync reset
 directory prepared by an older draft without its own USN remains unresolved. Bindings, original
 local operations, completion receipts and the empty-directory native check are also revalidated.
 
+Preparation also stores every member's exact native file-attribute bits and compares them before
+disposition, independently of USN and InSync. NTFS may combine repeated attribute changes into one
+USN while a write-attribute handle stays open; a later Hidden/System change is still protected even
+when that USN and the placeholder's InSync state remain unchanged. Evidence payload version 3
+retains these snapshots. Older draft payloads without them remain fenced and unresolved rather
+than inferring an attribute snapshot from the current object.
+
 Final native validation follows transaction acquisition and all asynchronous official-state and
 journal reads, immediately before native disposition. This detects metadata changes made while
 waiting for the store. Windows exempts attribute-only writers from data-sharing exclusion, however;

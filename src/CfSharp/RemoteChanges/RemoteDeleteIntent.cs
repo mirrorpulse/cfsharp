@@ -14,8 +14,8 @@ internal sealed record RemoteDeleteIntent(
     internal const int MaximumMembers = 4096;
     internal const int MaximumBytes = 8 * 1024 * 1024;
     // Keep the checkpoint namespace stable so older pending scopes remain fenced.
-    // Version 2 retains the official path independently of the native namespace spelling.
-    private const int PayloadVersion = 2;
+    // Version 3 additionally binds actual attributes; a coalesced USN is not their snapshot.
+    private const int PayloadVersion = 3;
 
     internal static string Name(string batchId, int index) =>
         Prefix + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(batchId))) + "/" +
@@ -85,6 +85,7 @@ internal sealed record RemoteDeleteIntent(
             }
 
             writer.Write(member.OperationsFingerprint);
+            writer.Write(member.Attributes);
             writer.Write(member.Usn.HasValue);
             if (member.Usn is long usn)
             {
@@ -178,6 +179,7 @@ internal sealed record RemoteDeleteIntent(
                 }
 
                 byte[] operations = reader.ReadBytes(32);
+                uint attributes = reader.ReadUInt32();
                 long? usn = reader.ReadBoolean() ? reader.ReadInt64() : null;
                 long? deleted = reader.ReadBoolean() ? reader.ReadInt64() : null;
                 long? projected = reader.ReadBoolean() ? reader.ReadInt64() : null;
@@ -188,7 +190,7 @@ internal sealed record RemoteDeleteIntent(
                     throw new InvalidDataException("The remote Delete member is malformed.");
                 }
 
-                members.Add(new(kind, item, original, operations, deleted, projected, usn));
+                members.Add(new(kind, item, original, operations, deleted, projected, usn, attributes));
             }
 
             if (stream.Position != stream.Length || scope == Guid.Empty || !Path.IsPathFullyQualified(root) ||
@@ -218,4 +220,5 @@ internal sealed record RemoteDeleteIntent(
 // DeletedAtTicks authenticates accepted native disposition, including delete-pending objects;
 // ProjectedAtTicks additionally certifies observed absence and the exact committed tombstone.
 internal sealed record RemoteDeleteMember(CloudItemKind Kind, RemoteNamespaceObject Object,
-    CloudItemState? Original, byte[] OperationsFingerprint, long? DeletedAtTicks, long? ProjectedAtTicks, long? Usn = null);
+    CloudItemState? Original, byte[] OperationsFingerprint, long? DeletedAtTicks, long? ProjectedAtTicks, long? Usn,
+    uint Attributes);

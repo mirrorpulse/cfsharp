@@ -346,7 +346,8 @@ public sealed partial class CloudLocalChangeFeedTests
                     null, true, RemoteNamespaceEvidence.FingerprintOperations([]), null);
                 evidence = delete ? new RemoteDeleteIntent(Guid.NewGuid(), _syncRootPath, "batch", 0, new byte[32],
                     true, true, true, TimeSpan.FromMinutes(2).Ticks, 4, preparation.Parents,
-                    [new(CloudItemKind.File, item, originalItem, RemoteNamespaceEvidence.FingerprintOperations([]), null, null)]).Encode() : preparation.Encode();
+                    [new(CloudItemKind.File, item, originalItem, RemoteNamespaceEvidence.FingerprintOperations([]), null, null, null,
+                        (uint)FileAttributes.Archive)]).Encode() : preparation.Encode();
             }
 
             await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint(intentName, evidence, DateTimeOffset.UtcNow));

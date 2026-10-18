@@ -15,6 +15,60 @@ public sealed partial class RemoteDeleteRecoveryTests
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
 
     [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task ReplayPreservesChangedAttributesWhenAnOpenWriterCoalescesTheUsn(bool directory, bool force)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        CloudRemoteApplyOptions options = new() { PreserveUnsynchronizedLocalContent = !force };
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        using (SafeFileHandle writer = CreateFile(path, 0x180, 7, 0, 3, 0x02200000, 0))
+        {
+            Assert.False(writer.IsInvalid);
+            SetNativeAttributes(writer, File.GetAttributes(path) | FileAttributes.Hidden);
+            root.Factory.Boundary = "prepare-after";
+            root.Factory.FailuresRemaining = 1;
+            Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options)).RequiresRetry);
+            Assert.Equal(1, root.Factory.FailuresObserved);
+            await root.RestartAsync();
+            RemoteDeleteIntent prepared;
+            await using (ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                prepared = RemoteDeleteIntent.Decode(Assert.Single(await capture.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            }
+            Assert.Equal((uint)File.GetAttributes(path), prepared.Members[0].Attributes);
+
+            SetNativeAttributes(writer, File.GetAttributes(path) | FileAttributes.System);
+            Assert.Equal(prepared.Members[0].Usn, ReadNativeUsn(writer));
+            CloudItemSnapshot snapshot = directory ? await root.FileSystem.GetDirectory(root.Target).InspectAsync() :
+                await root.FileSystem.GetFile(root.Target).InspectAsync();
+            Assert.Equal(CloudSynchronizationState.InSync, snapshot.SynchronizationState);
+            CloudRemoteApplyResult replay = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options);
+            Assert.True(replay.RequiresRetry);
+            Assert.Equal(0, replay.AppliedEntryCount);
+            Assert.Empty(replay.ConflictIds);
+            Assert.IsType<CloudRemoteDeleteRecoveryException>(Assert.Single(replay.Entries).Error);
+            Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+            await using ICloudStateTransaction retained = await root.Factory.Store!.BeginTransactionAsync();
+            Assert.Equal(prepared.Encode(), Assert.Single(await retained.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value.ToArray());
+            Assert.False((await retained.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+            Assert.Equal(0, (await retained.RemoteBatches.GetAsync(root.Batch.BatchId))!.AppliedEntryCount);
+        }
+
+        // Closing the writer must not complete an incorrectly accepted delete or allow the
+        // next replay to manufacture progress from the object's delayed disappearance.
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+        await root.RestartAsync();
+        CloudRemoteApplyResult afterClose = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options);
+        Assert.True(afterClose.RequiresRetry);
+        Assert.Equal(0, afterClose.AppliedEntryCount);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
     [InlineData("none")]
     [InlineData("prepare-after")]
     [InlineData("projection")]
@@ -1099,6 +1153,50 @@ public sealed partial class RemoteDeleteRecoveryTests
 
     // Attribute-only access is intentionally outside Windows data-sharing exclusion.
     private static SafeFileHandle OpenAttributeQuery(string path) => CreateFile(path, 0x80, 7, 0, 3, 0x02200000, 0);
+
+    private static void SetNativeAttributes(SafeFileHandle handle, FileAttributes attributes)
+    {
+        DeleteTestBasicInfo basic = new() { Attributes = (uint)attributes };
+        Assert.Equal(40, Marshal.SizeOf<DeleteTestBasicInfo>());
+        Assert.True(SetFileInformationByHandle(handle, 0, ref basic, 40), new System.ComponentModel.Win32Exception(Marshal.GetLastPInvokeError()).Message);
+    }
+
+    private static unsafe long ReadNativeUsn(SafeFileHandle handle)
+    {
+        uint versions = 0x00030002;
+        byte[] record = new byte[4096];
+        fixed (byte* buffer = record)
+        {
+            Assert.True(DeviceIoControl(handle, 0x000900eb, &versions, sizeof(uint), buffer, (uint)record.Length, out uint returned, 0));
+            Assert.InRange(returned, 60u, (uint)record.Length);
+        }
+        int offset = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(4)) switch
+        {
+            2 => 24,
+            3 => 40,
+            _ => throw new InvalidDataException("Unexpected native USN record version."),
+        };
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(offset));
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DeleteTestBasicInfo
+    {
+        internal long CreationTime;
+        internal long LastAccessTime;
+        internal long LastWriteTime;
+        internal long ChangeTime;
+        internal uint Attributes;
+    }
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref DeleteTestBasicInfo value, uint size);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static unsafe partial bool DeviceIoControl(SafeFileHandle handle, uint code, void* input, uint inputSize,
+        void* output, uint outputSize, out uint returned, nint overlapped);
 
     [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     private static partial SafeFileHandle CreateFile(string path, uint access, uint share, nint security, uint disposition, uint flags, nint template);
