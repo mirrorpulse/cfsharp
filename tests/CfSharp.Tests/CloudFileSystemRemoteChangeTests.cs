@@ -8,6 +8,95 @@ namespace CfSharp.Tests;
 public sealed class CloudFileSystemRemoteChangeTests
 {
     [Fact]
+    public async Task FailureStateCommitErrorPreservesTheOriginalDeleteErrorAndSafePrefix()
+    {
+        string rootPath = CreateRoot();
+        FailureStateFactory factory = new(InMemoryCloudStateStoreContractTests.CreateFactoryForTesting());
+        try
+        {
+            await using CloudFileSystem system = CloudFileSystem.CreateBuilder(rootPath, new TestRuntime()).WithStateStore(factory).Build();
+            await system.StartAsync();
+            Guid item = Guid.NewGuid();
+            await using (ICloudStateTransaction seed = await factory.Store!.BeginTransactionAsync())
+            {
+                await seed.Items.UpsertAsync(new(item, "remote", "gone.txt", CloudItemKind.File, "v1", null, true, DateTimeOffset.UtcNow));
+                await seed.CommitAsync();
+            }
+
+            CloudRemoteChange change = new("delete", CloudRemoteChangeKind.Delete, "remote", "v2", CloudItemKind.File,
+                "gone.txt", item, previousRemoteRevision: "v1");
+            CloudRemoteChangeBatch batch = new("failure-batch", new byte[] { 1 }, [change], new byte[] { 9 });
+            AggregateException failure = await Assert.ThrowsAsync<AggregateException>(() => system.ApplyRemoteChangesAsync(batch).AsTask());
+            Assert.IsType<CloudRemoteDeleteRecoveryException>(failure.InnerExceptions[0]);
+            Assert.Same(factory.Error, failure.InnerExceptions[1]);
+            await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
+            CloudRemoteBatchState progress = (await verify.RemoteBatches.GetAsync(batch.BatchId))!;
+            Assert.Equal(0, progress.AppliedEntryCount);
+            Assert.Equal(new byte[] { 1 }, progress.Cursor.ToArray());
+            Assert.True((await verify.Items.GetByItemIdAsync(item))!.IsTombstone);
+        }
+        finally
+        {
+            DeleteRoot(rootPath);
+        }
+    }
+
+    [Fact]
+    public async Task CompletedDeleteReceiptUsesTheSameProtocolWithAnIndependentTransactionalStore()
+    {
+        string rootPath = CreateRoot();
+        ICloudStateStoreFactory factory = InMemoryCloudStateStoreContractTests.CreateFactoryForTesting();
+        try
+        {
+            CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "remote", "v1");
+            CloudRemoteChange delete = new("delete", CloudRemoteChangeKind.Delete, "remote", "v2", CloudItemKind.File,
+                "gone.txt", identity.ItemId, previousRemoteRevision: "v1");
+            CloudRemoteChangeBatch batch = new("original-delete", new byte[] { 1 }, [delete], new byte[] { 9 });
+            DateTimeOffset originalTime = DateTimeOffset.UtcNow.AddSeconds(-5);
+            DateTimeOffset completionTime = DateTimeOffset.UtcNow;
+            CloudItemState original = new(identity.ItemId, "remote", "gone.txt", CloudItemKind.File, "v1", 123, false, originalTime);
+            await using (ICloudStateStore store = await factory.OpenAsync(new(rootPath)))
+            await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+            {
+                Guid scope = await CloudDirectoryMoveEvidence.GetScopeAsync(seed, true, CancellationToken.None);
+                LocalCloudItemInspection nativeRoot = CloudItemInspector.Inspect(rootPath, CloudItemKind.Directory, rootPath);
+                CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(nativeRoot.LocalBinding);
+                RemoteNamespaceObject item = new("gone.txt", binding, identity.Encode(), 100, 200, 512);
+                RemoteNamespaceObject root = new(string.Empty, binding, nativeRoot.PlaceholderIdentity.ToArray(),
+                    nativeRoot.CreationTime!.Value.UtcDateTime.ToFileTimeUtc(), 60, 0);
+                RemoteDeleteIntent intent = new(scope, rootPath, batch.BatchId, 0, batch.Fingerprint.ToArray(), true, true, true,
+                    CloudRemoteApplyOptions.Default.EchoSuppressionLifetime.Ticks, CloudRemoteApplyOptions.Default.EchoSuppressionObservationCount,
+                    [root], [new(CloudItemKind.File, item, original, RemoteNamespaceEvidence.FingerprintOperations([]),
+                        completionTime.UtcTicks, completionTime.UtcTicks)]);
+                await seed.Items.UpsertAsync(new(original.ItemId, original.RemoteId, original.RelativePath, original.Kind,
+                    "v2", original.LocalFileId, true, completionTime));
+                await seed.Checkpoints.UpsertAsync(new(RemoteDeleteIntent.Name(batch.BatchId, 0), intent.Encode(), completionTime));
+                await seed.RemoteBatches.UpsertAsync(new(batch.BatchId, batch.InitialCursor.Span, 0, 1, CloudRemoteBatchStatus.Applying,
+                    [], completionTime, batch.Fingerprint));
+                await seed.CommitAsync();
+            }
+
+            await using (CloudFileSystem fileSystem = CloudFileSystem.CreateBuilder(rootPath, new TestRuntime()).WithStateStore(factory).Build())
+            {
+                await fileSystem.StartAsync();
+                CloudRemoteApplyResult replay = await fileSystem.ApplyRemoteChangesAsync(batch);
+                Assert.False(replay.RequiresRetry);
+                Assert.Empty(replay.ConflictIds);
+                Assert.Equal(CloudRemoteApplyEntryStatus.Applied, replay.Entries[0].Status);
+                Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+            }
+
+            await using CloudFileSystem reopened = CloudFileSystem.CreateBuilder(rootPath, new TestRuntime()).WithStateStore(factory).Build();
+            await reopened.StartAsync();
+            Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, (await reopened.ApplyRemoteChangesAsync(batch)).Entries[0].Status);
+        }
+        finally
+        {
+            DeleteRoot(rootPath);
+        }
+    }
+
+    [Fact]
     public async Task EmptyRemoteBatchPublishesFinalCursorAndReplaysIdempotently()
     {
         string rootPath = CreateRoot();
@@ -473,6 +562,43 @@ public sealed class CloudFileSystemRemoteChangeTests
         if (Directory.Exists(path))
         {
             Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private sealed class FailureStateFactory(ICloudStateStoreFactory inner) : ICloudStateStoreFactory
+    {
+        internal ICloudStateStore? Store { get; private set; }
+        internal IOException Error { get; } = new("Synthetic failure-state commit interruption.");
+
+        public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context, CancellationToken cancellationToken = default) =>
+            Store = new WrappedStore(await inner.OpenAsync(context, cancellationToken), this);
+
+        private sealed class WrappedStore(ICloudStateStore inner, FailureStateFactory owner) : ICloudStateStore
+        {
+            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
+                new Transaction(await inner.BeginTransactionAsync(cancellationToken), owner);
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
+
+        private sealed class Transaction(ICloudStateTransaction inner, FailureStateFactory owner) : ICloudStateTransaction
+        {
+            public ICloudItemStateRepository Items => inner.Items;
+            public ICloudCheckpointRepository Checkpoints => inner.Checkpoints;
+            public ICloudOperationJournal Operations => inner.Operations;
+            public ICloudConflictRepository Conflicts => inner.Conflicts;
+            public ICloudRemoteBatchRepository RemoteBatches => inner.RemoteBatches;
+            public ICloudEchoSuppressionRepository EchoSuppressions => inner.EchoSuppressions;
+
+            public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
+            {
+                if ((await RemoteBatches.GetAsync("failure-batch", cancellationToken))?.Status == CloudRemoteBatchStatus.Failed)
+                {
+                    throw owner.Error;
+                }
+                await inner.CommitAsync(cancellationToken);
+            }
+            public ValueTask RollbackAsync(CancellationToken cancellationToken = default) => inner.RollbackAsync(cancellationToken);
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
         }
     }
 

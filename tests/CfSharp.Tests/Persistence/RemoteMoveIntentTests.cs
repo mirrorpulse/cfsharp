@@ -52,10 +52,10 @@ public sealed class RemoteMoveIntentTests
         Guid item = Guid.NewGuid();
         CloudOperationJournalEntry first = new(Guid.NewGuid(), CloudStateOperationKind.ContentUpdate, item, [1], now, sequence: 1);
         CloudOperationJournalEntry second = new(Guid.NewGuid(), CloudStateOperationKind.MetadataUpdate, item, [2], now, sequence: 2);
-        Assert.Equal(RemoteMoveIntent.FingerprintOperations([first, second]), RemoteMoveIntent.FingerprintOperations([second, first]));
+        Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations([first, second]), RemoteNamespaceEvidence.FingerprintOperations([second, first]));
         CloudOperationJournalEntry edited = new(first.OperationId, first.Kind, item, [3], now, sequence: 1);
-        Assert.NotEqual(RemoteMoveIntent.FingerprintOperations([first]), RemoteMoveIntent.FingerprintOperations([edited]));
-        Assert.NotEqual(RemoteMoveIntent.FingerprintOperations([first]), RemoteMoveIntent.FingerprintOperations([]));
+        Assert.NotEqual(RemoteNamespaceEvidence.FingerprintOperations([first]), RemoteNamespaceEvidence.FingerprintOperations([edited]));
+        Assert.NotEqual(RemoteNamespaceEvidence.FingerprintOperations([first]), RemoteNamespaceEvidence.FingerprintOperations([]));
     }
 
     private static (RemoteMoveIntent, CloudRemoteChangeBatch) CreateIntent()
@@ -66,10 +66,10 @@ public sealed class RemoteMoveIntentTests
         CloudRemoteChangeBatch batch = new("batch", ReadOnlyMemory<byte>.Empty, [move], new byte[] { 1 });
         CloudLocalFileBinding binding = new(123, Guid.NewGuid(), Guid.NewGuid());
         CloudItemState original = new(identity.ItemId, "remote", move.PreviousRelativePath!, CloudItemKind.File, "v1", 23, false, DateTimeOffset.UtcNow);
-        RemoteMoveObject file = new(original.RelativePath, binding, identity.Encode(), 100, 200, 512);
-        RemoteMoveObject root = new(string.Empty, binding, [], 50, 60, 0);
+        RemoteNamespaceObject file = new(original.RelativePath, binding, identity.Encode(), 100, 200, 512);
+        RemoteNamespaceObject root = new(string.Empty, binding, [], 50, 60, 0);
         return (new(Guid.NewGuid(), "C:\\root", batch.BatchId, 0, batch.Fingerprint.ToArray(), move.RelativePath,
             true, true, TimeSpan.FromMinutes(2).Ticks, 4, original, file, [root], null, true,
-            RemoteMoveIntent.FingerprintOperations([]), null), batch);
+            RemoteNamespaceEvidence.FingerprintOperations([]), null), batch);
     }
 }

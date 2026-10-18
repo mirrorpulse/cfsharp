@@ -125,7 +125,7 @@ to settle a move after later edits instead of clearing or overwriting them.
 
 ### Compatibility and limits
 
-The official SQLite provider upgrades schemas 0–6 in place to **schema 7**, retaining existing
+The official SQLite provider upgrades schemas 0–7 in place to **schema 8**, retaining existing
 repositories and enforcing foreign keys. Older providers reject that version before ignoring
 pending file-move evidence. Use matching core/provider packages; never downgrade the schema marker.
 Custom stores use the existing public repositories and must atomically isolate transactions across
@@ -152,6 +152,104 @@ preparation/projection/outcome interruptions, ambiguous commits, repeated recove
 replacement/parent changes, dirty state, and pending edits. In-process exceptions followed by
 normal disposal are distinct from power loss or hard process termination. Architecture/ordinary-user
 results and remaining acceptance-matrix cases must be reported with their actual executed evidence.
+
+## Recovering original remote deletions (CF-008)
+
+Submit the unchanged original batch again through `ApplyRemoteChangesAsync`, including its
+initial/final cursors, change IDs, entry order, opaque revisions and paths. Recovery also binds
+the preservation and echo policies; only the per-call entry limit may change. No application
+preparation token, private SQL, revision rewrite or automatic conflict decision is required.
+Revisions remain opaque: an omitted previous revision or equal previous/incoming revisions do
+not weaken identity or operation-ownership checks.
+
+Before native work, CfSharp commits a versioned preparation containing the original item/native
+identity, root/store scope, guarded parent bindings, local-operation fingerprints and the complete
+authorized inventory. File evidence includes a native USN so equal-length writes with restored
+timestamps cannot silently reuse old authorization. Native deletion targets the inspected handle;
+it never reopens a mutable path for deletion. Handles exclude competing file writers/deleters,
+parent guards prevent ancestor replacement, and metadata queries do not hydrate content.
+
+After deletion and observed disappearance, a native-completion receipt commits first. The exact
+item tombstone and its projection receipt then commit atomically. Finally, the original batch
+outcome, safe prefix/cursor and receipt consumption commit in one transaction. A failed or
+ambiguous commit retains the original durable state for re-reading; an exception does not prove
+rollback. Neither preparation nor a matching current tombstone alone proves native completion.
+
+| Interruption | Unchanged original replay |
+|---|---|
+| Preparation not committed | Validate and prepare before any native mutation |
+| Preparation committed; original object still present | Revalidate the original object, parents, native USN and local work |
+| Original absent; no committed native-completion receipt | Explicit unresolved entry; no success cursor |
+| Native receipt committed; tombstone transaction lost | Repair only the original projection after state validation |
+| Tombstone/receipt committed; batch outcome lost | Complete the original entry without deleting again or producing a stale conflict |
+| Outcome committed; response lost | Return the durable prefix as `AlreadyApplied` without further deletion |
+
+An unprovable or changed recovery is returned as `Failed` with `RequiresRetry`, retaining the
+safe prefix and stopping the suffix. `CloudRemoteDeleteRecoveryException` identifies reconciliation
+that cannot safely be inferred automatically and exposes the original batch ID, change ID and entry
+ordinal. Other native/storage failures retain their error types and native details. If recording
+the failure itself fails, both errors are preserved in an aggregate exception. Real pre-application
+stale/local conflicts retain ordinary durable conflict semantics. Batch-level `Applied` can include
+conflict entries; it does not certify successful deletion of every entry.
+
+### Recursive authorization and replacements
+
+The inventory is sealed before the first mutation, with at most **4096 members** and **8 MiB** of
+encoded evidence per operation. Enumeration stops at the member budget and performs no deletion
+if sealing fails. Preparation is one bounded transaction; each member uses separate short native
+receipt and projection transactions. Children precede their parent. Retries retain that same
+inventory and the completed descendant tombstones; they never sweep newly created children into
+the old authorization. A remaining/nonempty directory, dirty file, link, pending operation, identity
+change or replaced parent stops incomplete work without representing it as an intact-tree conflict.
+Directory timestamps can change as authorized children are removed; they do not substitute for
+the per-member bindings, receipts and empty-directory native check.
+
+A new ordinary file or placeholder at a completed path is never deleted by replay. Its pending
+scope remains unresolved until that replacement generation is reconciled, preventing delayed local
+observations from reusing the tombstoned identity. A later official generation that prevents exact
+projection validation also leaves the original entry unresolved.
+The explicit force policy can authorize existing ordinary descendants and existing pending local
+work, retaining their original journal rows. It still fixes the original inventory and rejects
+replacement objects, later work and newly added children. Lower-level native capabilities remain
+available; recovery never silently changes preservation policy.
+
+Pending Delete scopes fence local-feed observations and scans until original remote recovery
+finishes. Observations remain durable and require a full rescan; rescan acknowledgement cannot
+discard a pending Delete. Replay, reconcile the actual namespace including replacement generations,
+then acknowledge reconciliation. Echo suppression is separate: expiring echoes cannot remove
+unfinished preparation, inventory or receipts. Terminal batch state retains idempotency after
+completed evidence is consumed.
+Later create/update observations at a tombstoned path also require reconciliation after terminal
+completion, rather than resurrecting the historical item ID for the replacement generation.
+
+### Store, lifetime and legacy limits
+
+Use matching core and SQLite packages. Schema **8** atomically fences older runtimes without
+rewriting existing items, operations, conflicts or batches. Custom stores must provide the same
+atomic isolation across all public transactional repositories and preserve opaque checkpoints and
+prefix listing. No stronger distributed lock is implied: one active owner must control a store/root.
+Calls serialize under the remote-apply gate and root operation lease; disposal drains admitted work.
+Cancellation before mutation can stop safely. After native effects, required receipt/projection
+bookkeeping uses the admitted lifetime; cancellation may still interrupt outcome publication, whose
+original evidence remains available after complete shutdown and reopening.
+
+Preview.6 gaps have no authenticated Delete preparation. Their absent objects or existing
+tombstones are reported as unresolved without advancing a new success cursor. Existing conflicts
+are retained and not silently dismissed during migration. Preserve the unchanged batch and
+application evidence for operator reconciliation. If original proof cannot be recovered, reconcile
+the remote namespace and local work explicitly, then rebuild a new caller-selected store through
+supported APIs when necessary. Never edit private checkpoints/tombstones, manufacture
+`AlreadyApplied`, or advance the application's separate Adapter/catalog cursor to bypass this state.
+
+Native deletion and SQLite are not a single atomic resource. In particular, hard termination after
+deletion but before a durable native receipt can remain unresolved. Native file/empty-directory
+tests distinguish injected transaction failures from actual subprocess termination at preparation,
+native receipt, projection and outcome boundaries. A new preview and downstream product settlement
+require their own exact package/source, architecture and execution-role acceptance evidence; passing
+these library tests alone does not establish installed/default-Host product acceptance.
+The x64 and ARM64 CI jobs additionally execute the fourteen file/empty-directory receipt cases
+under a newly created ordinary local user, retaining the original TRX and verified SID/role/OS
+evidence. The account-creation harness runs only on disposable GitHub Actions runners.
 
 
 

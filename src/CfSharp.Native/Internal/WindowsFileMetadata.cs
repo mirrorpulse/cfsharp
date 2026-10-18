@@ -41,6 +41,40 @@ internal static unsafe partial class WindowsFileMetadata
         return handle;
     }
 
+    internal static SafeFileHandle OpenForDelete(string path)
+    {
+        // DELETE mutates this inspected object, rather than reopening a mutable path.
+        // READ_DATA/LIST_DIRECTORY with no write/delete sharing excludes competing writers,
+        // renames and deletion. Access permission alone performs no content read or hydration.
+        SafeFileHandle handle = CreateFile(path, 0x10081, 1, 0, 3, 0x02200000, 0);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+
+        return handle;
+    }
+
+    internal static void Delete(nint handle)
+    {
+        // FILE_DISPOSITION_INFO contains one native BOOLEAN, not a four-byte Win32 BOOL.
+        // Success marks the object delete-pending; the owner must close the handle and
+        // verify namespace disappearance before recording a completed native deletion.
+        FileDispositionInformation value = new() { DeleteFile = 1 };
+        if (!SetFileInformationByHandle(handle, 4, &value, (uint)sizeof(FileDispositionInformation)))
+        {
+            throw new Win32Exception(Marshal.GetLastPInvokeError());
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FileDispositionInformation
+    {
+        internal byte DeleteFile;
+    }
+
     internal static SafeFileHandle OpenDirectoryGuard(string path)
     {
         // FILE_LIST_DIRECTORY makes no-delete sharing effective for a directory. An
