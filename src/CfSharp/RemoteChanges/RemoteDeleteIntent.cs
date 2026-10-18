@@ -13,6 +13,9 @@ internal sealed record RemoteDeleteIntent(
     internal const string Prefix = "cfsharp/remote-delete/v1/";
     internal const int MaximumMembers = 4096;
     internal const int MaximumBytes = 8 * 1024 * 1024;
+    // Keep the checkpoint namespace stable so older pending scopes remain fenced.
+    // Version 2 retains the official path independently of the native namespace spelling.
+    private const int PayloadVersion = 2;
 
     internal static string Name(string batchId, int index) =>
         Prefix + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(batchId))) + "/" +
@@ -38,7 +41,7 @@ internal sealed record RemoteDeleteIntent(
             (member.ProjectedAtTicks.HasValue ? 0 : sizeof(long)));
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, CloudDirectoryEvidenceCodec.Utf8, leaveOpen: true);
-        writer.Write(1);
+        writer.Write(PayloadVersion);
         writer.Write(StoreScope.ToByteArray());
         CloudDirectoryEvidenceCodec.WriteText(writer, RootPath);
         CloudDirectoryEvidenceCodec.WriteText(writer, BatchId);
@@ -65,6 +68,7 @@ internal sealed record RemoteDeleteIntent(
             {
                 writer.Write(original.ItemId.ToByteArray());
                 CloudDirectoryEvidenceCodec.WriteText(writer, original.RemoteId);
+                CloudDirectoryEvidenceCodec.WriteText(writer, original.RelativePath);
                 writer.Write(original.RemoteRevision is not null);
                 if (original.RemoteRevision is not null)
                 {
@@ -123,7 +127,7 @@ internal sealed record RemoteDeleteIntent(
         {
             using MemoryStream stream = new(value.ToArray(), writable: false);
             using BinaryReader reader = new(stream, CloudDirectoryEvidenceCodec.Utf8);
-            if (reader.ReadInt32() != 1)
+            if (reader.ReadInt32() != PayloadVersion)
             {
                 throw new InvalidDataException("The remote Delete preparation version is unsupported.");
             }
@@ -166,9 +170,10 @@ internal sealed record RemoteDeleteIntent(
                 {
                     Guid id = CloudDirectoryEvidenceCodec.ReadGuid(reader);
                     string remote = CloudDirectoryEvidenceCodec.ReadText(reader);
+                    string originalPath = CloudDirectoryEvidenceCodec.ReadText(reader);
                     string? revision = reader.ReadBoolean() ? CloudDirectoryEvidenceCodec.ReadText(reader) : null;
                     long? localId = reader.ReadBoolean() ? reader.ReadInt64() : null;
-                    original = new(id, remote, item.RelativePath, kind, revision, localId, false,
+                    original = new(id, remote, originalPath, kind, revision, localId, false,
                         new DateTimeOffset(reader.ReadInt64(), TimeSpan.Zero));
                 }
 
@@ -177,7 +182,8 @@ internal sealed record RemoteDeleteIntent(
                 long? deleted = reader.ReadBoolean() ? reader.ReadInt64() : null;
                 long? projected = reader.ReadBoolean() ? reader.ReadInt64() : null;
                 if (!Enum.IsDefined(kind) || item.RelativePath.Length == 0 || operations.Length != 32 ||
-                    (projected.HasValue && !deleted.HasValue))
+                    (projected.HasValue && !deleted.HasValue) ||
+                    (original is not null && !CloudDirectoryStateProjection.SamePath(original.RelativePath, item.RelativePath)))
                 {
                     throw new InvalidDataException("The remote Delete member is malformed.");
                 }

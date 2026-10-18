@@ -164,7 +164,9 @@ not weaken identity or operation-ownership checks.
 
 Before native work, CfSharp commits a versioned preparation containing the original item/native
 identity, root/store scope, guarded parent bindings, local-operation fingerprints and the complete
-authorized inventory. File evidence includes a native USN so equal-length writes with restored
+authorized inventory. The exact original official path is stored separately from the native
+path spelling, preserving durable state when Windows reports different path casing.
+File evidence includes a native USN so equal-length writes with restored
 timestamps cannot silently reuse old authorization. Native deletion targets the inspected handle;
 it never reopens a mutable path for deletion. Handles exclude competing file writers/deleters,
 parent guards prevent ancestor replacement, and metadata queries do not hydrate content.

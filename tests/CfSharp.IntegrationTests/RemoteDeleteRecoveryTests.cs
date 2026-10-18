@@ -13,6 +13,52 @@ public sealed class RemoteDeleteRecoveryTests
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
 
     [Theory]
+    [InlineData(false, "none")]
+    [InlineData(true, "none")]
+    [InlineData(false, "prepare-after")]
+    [InlineData(true, "prepare-after")]
+    [InlineData(false, "outcome")]
+    [InlineData(true, "outcome")]
+    public async Task OriginalDurablePathCasingSurvivesNativeDeletionAndRecovery(bool directory, string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, alternateCasing: true);
+        if (boundary != "none")
+        {
+            root.Factory.Boundary = boundary;
+            root.Factory.FailuresRemaining = 1;
+            if (boundary == "prepare-after")
+            {
+                Assert.True((await root.ApplyAsync()).RequiresRetry);
+            }
+            else
+            {
+                await Assert.ThrowsAsync<IOException>(root.ApplyAsync);
+            }
+
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                Assert.Equal(root.Target, intent.Members[^1].Original!.RelativePath);
+                Assert.StartsWith("Docs\\", intent.Members[^1].Object.RelativePath, StringComparison.Ordinal);
+            }
+            await root.RestartAsync();
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Equal(1, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        Assert.Empty(replay.ConflictIds);
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)) || Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState state = (await completed.Items.GetByItemIdAsync(root.ItemId))!;
+        Assert.Equal(root.Target, state.RelativePath);
+        Assert.True(state.IsTombstone);
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task SharedReaderDefersDeletionUntilItClosesWithoutLosingOriginalRecovery(bool prepared)
@@ -671,7 +717,7 @@ public sealed class RemoteDeleteRecoveryTests
         }
 
         internal static async Task<DeleteRoot> OpenAsync(bool directory, bool equalRevisions = false, bool omitPrevious = false,
-            bool children = false, bool preserveInSync = true, bool hydrated = false)
+            bool children = false, bool preserveInSync = true, bool hydrated = false, bool alternateCasing = false)
         {
             string area = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "CfSharp-remote-delete", Guid.NewGuid().ToString("N"));
             string root = System.IO.Path.Combine(area, "root");
@@ -690,10 +736,11 @@ public sealed class RemoteDeleteRecoveryTests
                 registered = true;
                 Directory.CreateDirectory(System.IO.Path.Combine(root, "Docs"));
                 CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "remote-file", "v1");
-                string target = directory ? "Docs\\remote" : "Docs\\remote.bin";
+                string parent = alternateCasing ? "docs" : "Docs";
+                string target = parent + (directory ? "\\remote" : "\\remote.bin");
                 if (directory)
                 {
-                    await fileSystem.GetDirectory("Docs").CreatePlaceholderAsync(
+                    await fileSystem.GetDirectory(parent).CreatePlaceholderAsync(
                         CloudDirectoryPlaceholderSpec.CreateBuilder("remote", identity).WithInSyncState(true)
                             .WithPopulationState(CloudDirectoryPopulationState.Complete).Build());
                     if (children)
@@ -715,7 +762,7 @@ public sealed class RemoteDeleteRecoveryTests
                 }
                 else
                 {
-                    await fileSystem.GetDirectory("Docs").CreatePlaceholderAsync(
+                    await fileSystem.GetDirectory(parent).CreatePlaceholderAsync(
                         CloudFilePlaceholderSpec.CreateBuilder("remote.bin", identity, 512).WithInSyncState(true).Build());
                 }
 

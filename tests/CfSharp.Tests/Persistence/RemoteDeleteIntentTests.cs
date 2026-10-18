@@ -3,6 +3,23 @@ namespace CfSharp.Tests.Persistence;
 public sealed class RemoteDeleteIntentTests
 {
     [Fact]
+    public void OriginalDurablePathRoundTripsIndependentlyOfNativeCasing()
+    {
+        (RemoteDeleteIntent intent, _) = Create();
+        RemoteDeleteMember member = intent.Members[0];
+        CloudItemState original = member.Original!;
+        member = member with
+        {
+            Original = new(original.ItemId, original.RemoteId, "docs\\file.bin", original.Kind,
+                original.RemoteRevision, original.LocalFileId, original.IsTombstone, original.UpdatedAt),
+        };
+        RemoteDeleteIntent decoded = RemoteDeleteIntent.Decode((intent with { Members = [member] }).Encode());
+        Assert.Equal("docs\\file.bin", decoded.Members[0].Original!.RelativePath);
+        Assert.Equal("Docs\\file.bin", decoded.Members[0].Object.RelativePath);
+        Assert.Equal((intent with { Members = [member] }).Encode(), decoded.Encode());
+    }
+
+    [Fact]
     public void PreparationReservesBothCompletionTimestampsForEveryMember()
     {
         (RemoteDeleteIntent original, _) = Create();
@@ -91,7 +108,9 @@ public sealed class RemoteDeleteIntentTests
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(new byte[] { 0 }));
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(new byte[] { 1 }.Concat(value).ToArray()));
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value.Concat(new byte[] { 0 }).ToArray()));
-        value[0] = 2;
+        value[0] = 1;
+        Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value));
+        value[0] = 3;
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode(value));
     }
 
@@ -106,6 +125,13 @@ public sealed class RemoteDeleteIntentTests
         }).Encode()));
         RemoteDeleteMember outside = member with { Object = member.Object with { RelativePath = "outside.bin" } };
         Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode((intent with { Members = [outside, member] }).Encode()));
+        CloudItemState original = member.Original!;
+        RemoteDeleteMember mismatched = member with
+        {
+            Original = new(original.ItemId, original.RemoteId, "elsewhere\\file.bin", original.Kind,
+                original.RemoteRevision, original.LocalFileId, false, original.UpdatedAt),
+        };
+        Assert.Throws<InvalidDataException>(() => RemoteDeleteIntent.Decode((intent with { Members = [mismatched] }).Encode()));
     }
 
     private static (RemoteDeleteIntent, CloudRemoteChangeBatch) Create()
