@@ -102,6 +102,37 @@ public sealed class RemoteDeleteRecoveryTests
     }
 
     [Fact]
+    public async Task ExplicitKeepRemoteRetainsConflictAndReceiptWhenReplacementAppearsAtFinalTransaction()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        await root.FileSystem.GetFile(root.Target).SetInSyncAsync(false);
+        Guid conflictId = Assert.Single((await root.ApplyAsync()).ConflictIds);
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        bool replaced = false;
+        root.Factory.BeforeDeleteOutcome = () =>
+        {
+            File.WriteAllText(path, "retain replacement bytes");
+            replaced = true;
+        };
+
+        await Assert.ThrowsAsync<CloudRemoteDeleteRecoveryException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+        Assert.True(replaced);
+        Assert.Equal("retain replacement bytes", await File.ReadAllTextAsync(path));
+        Assert.NotNull(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        await root.RestartAsync();
+        await Assert.ThrowsAsync<CloudRemoteDeleteRecoveryException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+        Assert.NotNull(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        Assert.Equal("retain replacement bytes", await File.ReadAllTextAsync(path));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        CloudStateCheckpoint checkpoint = Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.All(RemoteDeleteIntent.Decode(checkpoint.Value).Members, member => Assert.NotNull(member.ProjectedAtTicks));
+        Assert.True((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
     public async Task InventoryBudgetFailurePrecedesAnyNativeDeletionEvenUnderExplicitForce()
     {
         await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
@@ -733,6 +764,8 @@ public sealed class RemoteDeleteRecoveryTests
         internal int OutcomeCount { get; set; } = 1;
         internal int MemberCount { get; set; } = 1;
         internal Action? Cancel { get; set; }
+        internal Action? BeforeDeleteOutcome { get; set; }
+        private Action? _beforeNextTransaction;
         internal int FailuresObserved { get; private set; }
         internal IOException Error { get; } = new("Synthetic remote Delete commit interruption.");
 
@@ -741,8 +774,23 @@ public sealed class RemoteDeleteRecoveryTests
 
         private sealed class WrappedStore(ICloudStateStore store, DeleteFactory owner) : ICloudStateStore
         {
-            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
-                new Transaction(await store.BeginTransactionAsync(cancellationToken), owner);
+            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+            {
+                ICloudStateTransaction transaction = await store.BeginTransactionAsync(cancellationToken);
+                // Inject only after the final transaction has acquired store isolation.
+                Action? mutation = owner._beforeNextTransaction;
+                owner._beforeNextTransaction = null;
+                try
+                {
+                    mutation?.Invoke();
+                    return new Transaction(transaction, owner);
+                }
+                catch
+                {
+                    await transaction.DisposeAsync();
+                    throw;
+                }
+            }
             public ValueTask DisposeAsync() => store.DisposeAsync();
         }
 
@@ -757,6 +805,9 @@ public sealed class RemoteDeleteRecoveryTests
 
             public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
             {
+                bool completedProjection = owner.BeforeDeleteOutcome is not null &&
+                    (await Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken)).Any(checkpoint =>
+                        RemoteDeleteIntent.Decode(checkpoint.Value).Members.All(member => member.ProjectedAtTicks.HasValue));
                 bool inject = false;
                 if (owner.FailuresRemaining > 0)
                 {
@@ -789,6 +840,11 @@ public sealed class RemoteDeleteRecoveryTests
                 }
 
                 await transaction.CommitAsync(cancellationToken);
+                if (completedProjection)
+                {
+                    owner._beforeNextTransaction = owner.BeforeDeleteOutcome;
+                    owner.BeforeDeleteOutcome = null;
+                }
                 if (inject)
                 {
                     throw owner.Error;

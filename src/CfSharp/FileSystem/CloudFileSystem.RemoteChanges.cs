@@ -315,6 +315,14 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
+            ? HoldRemoteNamespaceParents(ToFullPath(retry.RelativePath), ToFullPath(retry.RelativePath))
+            : null;
+        if (deleteRequest is not null && deleteParents is not null)
+        {
+            await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+                .ConfigureAwait(false);
+        }
         await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
             .ConfigureAwait(false);
         if (deleteRequest is not null)
