@@ -35,7 +35,7 @@ public enum CloudRemoteConflictReason
     /// <summary>Remote and local namespace moves cannot both be applied.</summary>
     Move = 2,
 
-    /// <summary>A remote deletion conflicts with local unsynchronized state.</summary>
+    /// <summary>A remote deletion requires destructive authorization or conflicts with local unsynchronized state.</summary>
     Delete = 3,
 
     /// <summary>The remote target path is occupied by an unrelated local item.</summary>
@@ -445,6 +445,17 @@ public sealed record CloudRemoteApplyOptions
     public static CloudRemoteApplyOptions Default { get; } = new();
 
     /// <summary>Gets whether locally unsynchronized content is preserved by default.</summary>
+    /// <remarks>
+    /// Defaults to <see langword="true"/>. A Delete under this policy retains even a clean
+    /// file or directory and records a durable Delete conflict: user-mode share exclusion
+    /// cannot prevent concurrent attribute-only writes through native disposition.
+    /// Explicit <see cref="CloudRemoteConflictDecision.KeepRemote"/> resolution, or setting
+    /// this property to <see langword="false"/>, authorizes destructive deletion. Such
+    /// authorization does not exclude concurrent external metadata writes; object identity,
+    /// original evidence and recovery validation still apply. Other remote changes retain
+    /// their existing preservation checks. A previously prepared protected Delete without
+    /// native acceptance remains unresolved; changing this option cannot reauthorize it.
+    /// </remarks>
     public bool PreserveUnsynchronizedLocalContent { get; init; } = true;
 
     /// <summary>Gets whether provider-generated local echoes must be suppressed.</summary>

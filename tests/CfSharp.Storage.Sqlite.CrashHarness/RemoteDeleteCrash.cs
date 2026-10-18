@@ -16,7 +16,8 @@ internal static class RemoteDeleteCrash
         await system.StartAsync();
         CloudRemoteChange change = new("delete", CloudRemoteChangeKind.Delete, "remote-file", "v2",
             directory ? CloudItemKind.Directory : CloudItemKind.File, target, Guid.Parse(itemId), previousRemoteRevision: "v1");
-        await system.ApplyRemoteChangesAsync(new("stable-original-batch", new byte[] { 1 }, [change], new byte[] { 9 }));
+        await system.ApplyRemoteChangesAsync(new("stable-original-batch", new byte[] { 1 }, [change], new byte[] { 9 }),
+            new() { PreserveUnsynchronizedLocalContent = false });
         return 3; // Reaching this point means the selected kill boundary was not observed.
     }
 

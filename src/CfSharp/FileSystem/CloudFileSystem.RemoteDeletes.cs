@@ -62,24 +62,21 @@ public sealed partial class CloudFileSystem
             return RemoteEntryOutcome.ConflictResult(CreateConflict(change, original, CloudRemoteConflictReason.StaleRemoteRevision));
         }
 
-        if (options.PreserveUnsynchronizedLocalContent && context.LocalOperations.Count != 0)
+        // Share exclusion and oplocks do not serialize attribute-only writers with native
+        // disposition. Even a clean snapshot cannot authorize a protected Delete safely.
+        // KeepRemote or disabled preservation must explicitly authorize destruction instead.
+        if (options.PreserveUnsynchronizedLocalContent)
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(change, original, CloudRemoteConflictReason.Delete));
         }
 
         CloudItemSnapshot snapshot = await CreateItemReference(original.RelativePath, original.Kind).InspectAsync(cancellationToken).ConfigureAwait(false);
-        if (!snapshot.IsPlaceholder || (options.PreserveUnsynchronizedLocalContent && snapshot.SynchronizationState != CloudSynchronizationState.InSync))
+        if (!snapshot.IsPlaceholder)
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(change, original, CloudRemoteConflictReason.Delete));
         }
 
         List<RecursiveItemEntry> inventory = MaterializeRemoteDeleteInventory(original);
-        if (original.Kind == CloudItemKind.Directory && options.PreserveUnsynchronizedLocalContent &&
-            !await CanDeleteRemoteTreeAsync(inventory, original.RelativePath, cancellationToken).ConfigureAwait(false))
-        {
-            return RemoteEntryOutcome.ConflictResult(CreateConflict(change, original, CloudRemoteConflictReason.Delete));
-        }
-
         RemoteDeleteIntent intent = await PrepareRemoteDeleteAsync(original, inventory, request, options, cancellationToken).ConfigureAwait(false);
         return await CompleteRemoteDeleteAsync(request, intent, cancellationToken).ConfigureAwait(false);
     }
@@ -232,6 +229,14 @@ public sealed partial class CloudFileSystem
             ValidateRemoteDeleteParents(request, intent, parents.Parents);
             if (!member.DeletedAtTicks.HasValue)
             {
+                // An older preparation is not destructive authorization. Preserve its sealed
+                // scope and any completed children, while still allowing already accepted
+                // members to finish projection above/below without another native deletion.
+                if (intent.RequirePreservation)
+                {
+                    throw DeleteUnresolved(request, "protected Delete requires explicit destructive authorization");
+                }
+
                 // Enumeration needs its own LIST_DIRECTORY handle, which the exclusive delete
                 // handle would reject. The native disposition still rejects any new child
                 // created after this check, and the opened object's binding is verified below.

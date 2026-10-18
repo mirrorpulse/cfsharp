@@ -33,8 +33,13 @@ public sealed partial class CloudFileSystem
     /// <remarks>
     /// Remote content bytes never enter this method. File upserts update placeholder length,
     /// metadata, identity, and revision while leaving hydration to the configured provider. A
-    /// durable batch record is written after each entry, so a process restart resumes from the
-    /// last committed entry without publishing an unsafe cursor.
+    /// Delete under the default preservation policy retains the object, including clean files
+    /// and empty directories, and records a durable conflict. Explicit KeepRemote resolution
+    /// or disabled preservation authorizes deletion without promising concurrent attribute
+    /// isolation. A durable conflict is a processed batch entry under the existing cursor
+    /// contract, not proof that its object was deleted. A durable batch record is written
+    /// after each entry, so a process restart resumes from the last committed entry without
+    /// publishing an unsafe cursor.
     /// File moves retain versioned original object, ancestry, batch, and apply-policy evidence
     /// before native mutation. Replay authenticates that evidence before checking previous
     /// revisions, including when both revisions are equal. Successful recovery reports
@@ -229,6 +234,13 @@ public sealed partial class CloudFileSystem
     /// <param name="resolution">Explicit keep-local, keep-remote, keep-both, or defer decision.</param>
     /// <param name="cancellationToken">Token observed before durable and native work.</param>
     /// <returns>The resulting entry status. A deferred decision leaves the conflict durable.</returns>
+    /// <remarks>
+    /// KeepRemote explicitly authorizes destructive deletion, including an otherwise clean
+    /// object retained by default preservation. Native identity, sealed evidence and final
+    /// transaction checks still apply, but user-mode deletion does not exclude concurrent
+    /// external attribute writes. The conflict is removed only after validated completion.
+    /// Calls serialize on this file-system instance; no ownership of caller resources changes.
+    /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
     public async ValueTask<CloudRemoteApplyEntryResult> ResolveRemoteConflictAsync(

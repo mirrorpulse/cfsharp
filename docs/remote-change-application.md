@@ -36,9 +36,30 @@ Remote file upserts carry metadata and length. A configured content provider hyd
 response to Windows demand. Keep authentication tokens, transport cursors, and remote business
 payloads in application-owned storage rather than the CfSharp state database.
 
-### Preserving local descendants during remote directory deletion
+### Authorizing remote deletion
 
-The default preservation policy checks the materialized subtree, including ordinary files absent from the state store. An untracked or dirty descendant, a pending descendant operation, a link, or an identity mismatch produces a delete conflict before deletion starts. Parent in-sync state does not certify its descendants. Only preflighted entries are deleted, with a further check before each deletion; newly created children are never swept into a fresh recursive enumeration. Concurrent namespace changes can stop a partially completed deletion, whose durable tombstones are retained. This is not a filesystem-wide transaction. Explicitly disabling preservation retains the existing destructive policy.
+With the default `PreserveUnsynchronizedLocalContent = true`, a remote Delete retains the local
+object and records a durable Delete conflict, including for clean files, empty directories and
+fully synchronized trees. This changes the earlier automatic deletion behavior. A user-mode
+library cannot exclude arbitrary external attribute writers between its final observation and
+native deletion, so a clean snapshot alone is insufficient destructive authorization.
+
+Applications can explicitly select `KeepRemote` through the conflict resolver or
+`ResolveRemoteConflictAsync`, or submit the batch with `PreserveUnsynchronizedLocalContent = false`.
+These choices authorize destructive deletion, including existing unsynchronized content and
+ordinary descendants. They retain sealed inventory, object identity, attribute snapshots, local
+operation bindings, native receipts and terminal validation; they do not promise isolation from
+concurrent external metadata writes. Native APIs remain available for advanced callers.
+
+A retained conflict is a processed batch entry under the existing cursor contract: its durable
+record allows the safe prefix to advance, but the entry reports `Conflict`, not a successful
+Delete. Replaying that processed batch does not delete the retained object or duplicate the
+conflict. Resolve the conflict explicitly when the application authorizes deletion.
+
+Authorized deletion uses a sealed children-first inventory with a further check before each
+mutation. Newly created children are never swept into a fresh recursive enumeration. Concurrent
+namespace changes can stop partial deletion, whose original receipts and tombstones remain
+available for recovery. Native mutation and durable state are separate resources.
 `r`n### Cached content during file upserts
 
 File upserts atomically invalidate hydrated ranges when replacing the placeholder identity and metadata. Subsequent reads obtain the new revision from the content provider. Metadata-only changes retain cached content. The default preservation policy also verifies in-sync state in the native update. If Windows rejects invalidation (for example, a pinned or always-full file), the entry fails with its native error and the durable revision does not advance; CfSharp does not silently change pin or root policies.
@@ -155,8 +176,9 @@ results and remaining acceptance-matrix cases must be reported with their actual
 
 ## Recovering original remote deletions (CF-008)
 
-Submit the unchanged original batch again through `ApplyRemoteChangesAsync`, including its
-initial/final cursors, change IDs, entry order, opaque revisions and paths. Recovery also binds
+For an already-authorized Delete, submit the unchanged original batch again through
+`ApplyRemoteChangesAsync`, including its initial/final cursors, change IDs, entry order, opaque
+revisions and paths. Recovery also binds
 the preservation and echo policies; only the per-call entry limit may change. No application
 preparation token, private SQL, revision rewrite or automatic conflict decision is required.
 Revisions remain opaque: an omitted previous revision or equal previous/incoming revisions do
@@ -187,8 +209,9 @@ rollback. Neither preparation nor a matching current tombstone alone proves nati
 
 | Interruption | Unchanged original replay |
 |---|---|
-| Preparation not committed | Validate and prepare before any native mutation |
-| Preparation committed; original object still present | Revalidate the original object, parents, native USN and local work |
+| Preparation not committed | Protected policy records a conflict; explicit authorization validates and prepares before mutation |
+| Authorized preparation committed; original object still present | Revalidate the original object, parents, attributes, native USN and local work |
+| Earlier protected preparation; native acceptance not committed | Retain original evidence and report unresolved without another disposition |
 | Original absent; no committed native-completion receipt | Explicit unresolved entry; no success cursor |
 | Native acceptance committed; object still delete-pending | Retain proof and retry absence verification without deleting again |
 | Native receipt committed; tombstone transaction lost | Repair only the original projection after state and absence validation |
@@ -214,10 +237,10 @@ inventory and the completed descendant tombstones; they never sweep newly create
 the old authorization. A remaining/nonempty directory, dirty file, link, pending operation, identity
 change or replaced parent stops incomplete work without representing it as an intact-tree conflict.
 Directory last-write times can change as authorized children are removed; the directory's own USN
-and in-sync state remain mandatory checks under preservation. Completed children never exempt a
-later local metadata change, including one followed by an explicit in-sync reset. An unfinished
-directory prepared by an older draft without its own USN remains unresolved. Bindings, original
-local operations, completion receipts and the empty-directory native check are also revalidated.
+remains part of the sealed evidence. Completed children never exempt a later actual attribute
+change or changed USN. An unfinished directory prepared by an older draft without its own USN
+remains unresolved. Bindings, original local operations, completion receipts and the empty-directory
+native check are also revalidated.
 
 Preparation also stores every member's exact native file-attribute bits and compares them before
 disposition, independently of USN and InSync. NTFS may combine repeated attribute changes into one
@@ -230,8 +253,20 @@ Final native validation follows transaction acquisition and all asynchronous off
 journal reads, immediately before native disposition. This detects metadata changes made while
 waiting for the store. Windows exempts attribute-only writers from data-sharing exclusion, however;
 the native queries and disposition are separate calls, without atomic compare-USN-and-delete
-semantics. The preservation policy therefore cannot promise absolute isolation from concurrent
-external attribute writes. Applications requiring that guarantee must coordinate those writers.
+semantics. Default preservation therefore records a conflict before any disposition instead of
+claiming that isolation. Explicit destructive authorization accepts this concurrency boundary.
+
+An unfinished preparation from an earlier producer can retain an effective protected policy.
+Replay never issues a new native disposition for such a preparation, even when the current native
+snapshot matches. It returns `CloudRemoteDeleteRecoveryException` with the original preparation
+and any completed descendants retained. Members with durable native-acceptance receipts may still
+finish absence verification and projection, and a fully accepted preparation may finish its
+original outcome without deleting again. Changing apply options, deleting checkpoints or toggling
+private policy flags is not a supported reauthorization path; unresolved earlier preparations
+require explicit reconciliation. Force-authorized preparations retain their original recovery.
+An inline KeepRemote decision is sealed as effective destructive authorization independently
+of the original requested preservation option. Replay of that preparation can complete without
+invoking another conflict resolver, while retaining the original batch and apply-policy binding.
 
 A new ordinary file or placeholder at a completed path is never deleted by replay. Its pending
 scope remains unresolved until that replacement generation is reconciled, preventing delayed local

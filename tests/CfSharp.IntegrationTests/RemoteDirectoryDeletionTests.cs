@@ -13,7 +13,7 @@ public sealed class RemoteDirectoryDeletionTests
     [InlineData("clean", true)]
     [InlineData("ordinary", false)]
     [SupportedOSPlatform("windows10.0.16299")]
-    public async Task PreservationChecksDescendantsIndependentlyOfParent(string childState, bool preserve)
+    public async Task PreservationDefersEveryTreeUntilDeletionIsAuthorized(string childState, bool preserve)
     {
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
         {
@@ -60,7 +60,7 @@ public sealed class RemoteDirectoryDeletionTests
             CloudRemoteApplyResult result = await fileSystem.ApplyRemoteChangesAsync(
                 new CloudRemoteChangeBatch("batch", Array.Empty<byte>(), [change], new byte[] { 1 }),
                 new CloudRemoteApplyOptions { PreserveUnsynchronizedLocalContent = preserve });
-            bool protectedChild = preserve && childState != "clean";
+            bool protectedChild = preserve;
             Assert.Equal(protectedChild ? CloudRemoteApplyEntryStatus.Conflict : CloudRemoteApplyEntryStatus.Applied,
                 Assert.Single(result.Entries).Status);
             Assert.Equal(protectedChild, File.Exists(childPath));
