@@ -15,6 +15,70 @@ public sealed partial class RemoteDeleteRecoveryTests
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
 
     [Theory]
+    [InlineData("none")]
+    [InlineData("prepare-after")]
+    [InlineData("projection")]
+    [InlineData("projection-after")]
+    public async Task KeepRemoteDeletesTheIdentifiedLocallyRenamedFileAndPreservesOldPathOccupants(string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        string originalPath = root.Target;
+        string currentPath = "Docs\\renamed.bin";
+        await using (CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed())
+        {
+            await feed.StartAsync();
+            File.Move(System.IO.Path.Combine(root.Path, originalPath), System.IO.Path.Combine(root.Path, currentPath));
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+            while (true)
+            {
+                await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync(deadline.Token))
+                {
+                    if ((await verify.Items.GetByItemIdAsync(root.ItemId, deadline.Token))?.RelativePath == currentPath &&
+                        (await verify.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue, deadline.Token)).Any(row => row.Kind == CloudStateOperationKind.Move))
+                    {
+                        break;
+                    }
+                }
+                await Task.Delay(25, deadline.Token);
+            }
+        }
+
+        await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, originalPath), "retain unrelated old path");
+        IReadOnlyList<CloudOperationJournalEntry> originalOperations;
+        await using (ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            originalOperations = await capture.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue);
+        }
+        CloudRemoteApplyResult conflict = await root.ApplyAsync();
+        Guid conflictId = Assert.Single(conflict.ConflictIds);
+        Assert.Equal(CloudRemoteConflictReason.Delete, (await root.FileSystem.GetRemoteConflictAsync(conflictId))!.Conflict.Reason);
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = boundary == "none" ? 0 : 1;
+        if (boundary != "none")
+        {
+            await Assert.ThrowsAsync<IOException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+                new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+            await root.RestartAsync();
+            await using ICloudStateTransaction prepared = await root.Factory.Store!.BeginTransactionAsync();
+            RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await prepared.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            Assert.Equal(currentPath, intent.Members[^1].Original!.RelativePath);
+        }
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, (await root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote))).Status);
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, currentPath)));
+        Assert.Equal("retain unrelated old path", await File.ReadAllTextAsync(System.IO.Path.Combine(root.Path, originalPath)));
+        Assert.Null(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState tombstone = (await completed.Items.GetByItemIdAsync(root.ItemId))!;
+        Assert.True(tombstone.IsTombstone);
+        Assert.Equal(currentPath, tombstone.RelativePath);
+        Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(originalOperations),
+            RemoteNamespaceEvidence.FingerprintOperations(await completed.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue)));
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
     [InlineData(true, false)]
     [InlineData(false, false)]
     [InlineData(true, true)]

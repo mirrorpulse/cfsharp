@@ -316,7 +316,7 @@ public sealed partial class CloudFileSystem
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
         using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
-            ? HoldRemoteNamespaceParents(ToFullPath(retry.RelativePath), ToFullPath(retry.RelativePath))
+            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
             : null;
         if (deleteRequest is not null && deleteParents is not null)
         {
@@ -1076,7 +1076,7 @@ public sealed partial class CloudFileSystem
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
         using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
-            ? HoldRemoteNamespaceParents(ToFullPath(change.RelativePath), ToFullPath(change.RelativePath))
+            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)
             : null;
         if (deleteParents is not null)
         {

@@ -31,7 +31,6 @@ public sealed partial class CloudFileSystem
         if (!intent.Matches(request.Batch, request.EntryIndex, request.Options) ||
             original.RemoteId != change.RemoteId || original.Kind != change.ItemKind ||
             (change.ItemId.HasValue && change.ItemId != original.ItemId) ||
-            !CloudDirectoryStateProjection.SamePath(original.RelativePath, change.RelativePath) ||
             !string.Equals(intent.RootPath, SyncRootPath, StringComparison.OrdinalIgnoreCase) ||
             intent.StoreScope != await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false))
         {
@@ -46,8 +45,7 @@ public sealed partial class CloudFileSystem
     {
         CloudItemState? original = context.LocalState;
         if (original is null || original.RemoteId != change.RemoteId || original.Kind != change.ItemKind ||
-            (change.ItemId.HasValue && change.ItemId != original.ItemId) ||
-            !CloudDirectoryStateProjection.SamePath(original.RelativePath, change.RelativePath))
+            (change.ItemId.HasValue && change.ItemId != original.ItemId))
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(change, original, CloudRemoteConflictReason.MissingItem));
         }
@@ -390,6 +388,15 @@ public sealed partial class CloudFileSystem
                 throw DeleteUnresolved(request, "replacement before terminal outcome publication");
             }
         }
+    }
+
+    private async ValueTask<RemoteNamespaceParentLease> HoldRemoteDeleteOutcomeParentsAsync(ICloudStateTransaction transaction,
+        CloudRemoteChangeBatch batch, int entryIndex, CancellationToken cancellationToken)
+    {
+        CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(RemoteDeleteIntent.Name(batch.BatchId, entryIndex), cancellationToken)
+            .ConfigureAwait(false) ?? throw new InvalidDataException("A successful remote Delete outcome requires its original completion receipts.");
+        string path = ToFullPath(RemoteDeleteIntent.Decode(checkpoint.Value).RelativePath);
+        return HoldRemoteNamespaceParents(path, path);
     }
 
     private static CloudItemState ProjectDeletedMember(CloudItemState original, CloudRemoteChange change, bool root, DateTimeOffset time) =>

@@ -233,6 +233,12 @@ native/official identity agreement. Force still fixes the original inventory and
 replacement objects, later work and newly added children. Lower-level native capabilities remain
 available; recovery never silently changes preservation policy.
 
+A Delete identifies an existing item by its matched remote/item identity even after a locally
+tracked rename. Default preservation still retains its pending move as a Delete conflict;
+explicit `KeepRemote` binds and deletes that identity's current official/native path, retaining
+the original local journal. Its preparation and terminal parent checks use the bound path; a new
+occupant of the old remote spelling is never enlisted in this authorization.
+
 Pending Delete scopes fence local-feed observations and scans until original remote recovery
 finishes. Observations remain durable and require a full rescan; rescan acknowledgement cannot
 discard a pending Delete. Replay, reconcile the actual namespace including replacement generations,
