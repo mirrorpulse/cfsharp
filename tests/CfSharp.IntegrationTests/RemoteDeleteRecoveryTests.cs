@@ -13,6 +13,153 @@ public sealed class RemoteDeleteRecoveryTests
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
 
     [Theory]
+    [InlineData(false, "none", false)]
+    [InlineData(true, "none", false)]
+    [InlineData(false, "prepare-after", false)]
+    [InlineData(true, "prepare-after", false)]
+    [InlineData(false, "projection", false)]
+    [InlineData(true, "projection", false)]
+    [InlineData(false, "none", true)]
+    [InlineData(true, "none", true)]
+    [InlineData(false, "prepare-after", true)]
+    [InlineData(true, "prepare-after", true)]
+    [InlineData(false, "projection", true)]
+    [InlineData(true, "projection", true)]
+    public async Task ExplicitForceDeletesTrackedOrdinaryDescendantsAndRetainsTheirOriginalOperations(bool keepRemote, string boundary, bool directory)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
+        (CloudItemState child, IReadOnlyList<CloudOperationJournalEntry> operations) = await CreateTrackedOrdinaryChildAsync(root, directory);
+        Guid? conflictId = keepRemote ? Assert.Single((await root.ApplyAsync()).ConflictIds) : null;
+        if (keepRemote)
+        {
+            string path = System.IO.Path.Combine(root.Path, child.RelativePath);
+            Assert.True(directory ? Directory.Exists(path) : File.Exists(path));
+        }
+
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = boundary == "none" ? 0 : 1;
+        CloudRemoteApplyOptions force = new() { PreserveUnsynchronizedLocalContent = false };
+        if (boundary != "none")
+        {
+            if (keepRemote)
+            {
+                await Assert.ThrowsAsync<IOException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId!.Value,
+                    new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+            }
+            else
+            {
+                Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force)).RequiresRetry);
+            }
+
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                RemoteDeleteMember member = Assert.Single(intent.Members.Where(member => member.Original?.ItemId == child.ItemId));
+                Assert.Empty(member.Object.Identity);
+                Assert.Equal(child.RelativePath, member.Original!.RelativePath);
+                Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(operations), member.OperationsFingerprint);
+            }
+            await root.RestartAsync();
+        }
+
+        if (keepRemote)
+        {
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, (await root.FileSystem.ResolveRemoteConflictAsync(conflictId!.Value,
+                new(CloudRemoteConflictDecision.KeepRemote))).Status);
+            Assert.Null(await root.FileSystem.GetRemoteConflictAsync(conflictId.Value));
+        }
+        else
+        {
+            CloudRemoteApplyResult result = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force);
+            Assert.False(result.RequiresRetry, result.Entries[0].Error?.ToString());
+            Assert.Equal(1, result.AppliedEntryCount);
+            Assert.Empty(result.ConflictIds);
+        }
+
+        Assert.False(Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await completed.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        CloudItemState deletedChild = (await completed.Items.GetByItemIdAsync(child.ItemId))!;
+        Assert.True(deletedChild.IsTombstone);
+        Assert.Equal(child.RemoteId, deletedChild.RemoteId);
+        Assert.Equal(child.RelativePath, deletedChild.RelativePath);
+        Assert.Equal(child.RemoteRevision, deletedChild.RemoteRevision);
+        Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(operations),
+            RemoteNamespaceEvidence.FingerprintOperations(await completed.Operations.ListByItemIdAsync(child.ItemId, int.MaxValue)));
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ForcedTrackedOrdinaryDescendantRejectsReplacementOrLaterLocalWork(bool replace)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
+        (CloudItemState child, _) = await CreateTrackedOrdinaryChildAsync(root);
+        CloudRemoteApplyOptions force = new() { PreserveUnsynchronizedLocalContent = false };
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force)).RequiresRetry);
+        await root.RestartAsync();
+        string path = System.IO.Path.Combine(root.Path, child.RelativePath);
+        if (replace)
+        {
+            File.Move(path, System.IO.Path.Combine(root.Path, "retained-local.txt"));
+            await File.WriteAllTextAsync(path, "retain replacement");
+        }
+        else
+        {
+            await using ICloudStateTransaction mutate = await root.Factory.Store!.BeginTransactionAsync();
+            await mutate.Operations.EnqueueAsync(new(Guid.NewGuid(), CloudStateOperationKind.ContentUpdate,
+                child.ItemId, [99], DateTimeOffset.UtcNow));
+            await mutate.CommitAsync();
+        }
+
+        CloudRemoteApplyResult replay = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force);
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.Equal(replace ? "retain replacement" : "local content", await File.ReadAllTextAsync(path));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.False((await verify.Items.GetByItemIdAsync(child.ItemId))!.IsTombstone);
+        Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    private static async Task<(CloudItemState, IReadOnlyList<CloudOperationJournalEntry>)> CreateTrackedOrdinaryChildAsync(DeleteRoot root, bool directory = false)
+    {
+        string childPath = root.Target + (directory ? "\\local" : "\\local.txt");
+        await using (CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed())
+        {
+            await feed.StartAsync();
+            if (directory)
+            {
+                Directory.CreateDirectory(System.IO.Path.Combine(root.Path, childPath));
+            }
+            else
+            {
+                await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, childPath), "local content");
+            }
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(20));
+            while (!(await feed.ReadBatchAsync(timeout.Token)).Changes.Any(change => change.RelativePath == childPath))
+            {
+                await Task.Delay(25, timeout.Token);
+            }
+        }
+
+        CloudItemSnapshot snapshot = directory ? await root.FileSystem.GetDirectory(childPath).InspectAsync() :
+            await root.FileSystem.GetFile(childPath).InspectAsync();
+        Assert.False(snapshot.IsPlaceholder);
+        await using ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState child = Assert.IsType<CloudItemState>(await capture.Items.GetByRelativePathAsync(childPath));
+        IReadOnlyList<CloudOperationJournalEntry> operations = await capture.Operations.ListByItemIdAsync(child.ItemId, int.MaxValue);
+        Assert.NotEmpty(operations);
+        return (child, operations);
+    }
+
+    [Theory]
     [InlineData(false, "none")]
     [InlineData(true, "none")]
     [InlineData(false, "prepare-after")]

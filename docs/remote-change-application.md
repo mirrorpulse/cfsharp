@@ -218,7 +218,10 @@ projection validation also leaves the original entry unresolved.
 Explicit `KeepRemote` resolution performs the same terminal validation inside the transaction
 that removes its conflict and recovery evidence, retaining both when a replacement appears.
 The explicit force policy can authorize existing ordinary descendants and existing pending local
-work, retaining their original journal rows. It still fixes the original inventory and rejects
+work, including ordinary descendants already tracked by the local feed. Such descendants are bound
+to their native object, exact official state and pending operations without a placeholder identity;
+their original journal rows remain intact. Placeholders and the operation root still require
+native/official identity agreement. Force still fixes the original inventory and rejects
 replacement objects, later work and newly added children. Lower-level native capabilities remain
 available; recovery never silently changes preservation policy.
 

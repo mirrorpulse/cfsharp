@@ -149,14 +149,21 @@ public sealed partial class CloudFileSystem
         {
             cancellationToken.ThrowIfCancellationRequested();
             using SafeFileHandle guard = WindowsFileMetadata.OpenForDelete(entry.FullPath);
-            RemoteNamespaceObject observed = ObserveRemoteDeleteObject(guard, entry.Kind, effectiveOptions.PreserveUnsynchronizedLocalContent, request);
+            RemoteNamespaceObject observed = ObserveRemoteDeleteObject(guard, entry.Kind, effectiveOptions.PreserveUnsynchronizedLocalContent, request,
+                out bool placeholder);
             CloudItemState? state = await transaction.Items.GetByRelativePathAsync(entry.RelativePath, cancellationToken).ConfigureAwait(false);
             if (state is not null && (state.IsTombstone || state.Kind != entry.Kind))
             {
                 throw DeleteUnresolved(request, "changed original projection during preparation");
             }
 
-            if (state is not null && (!CloudPlaceholderIdentity.TryDecode(observed.Identity, out CloudPlaceholderIdentity? identity) ||
+            // Explicit force also authorizes ordinary descendants discovered by the local feed.
+            // Their official rows have no placeholder identity; bind the inspected native object,
+            // exact official state and original journal instead. The root and every placeholder
+            // still require native/official identity agreement, including under force.
+            bool ordinaryDescendant = !placeholder && !effectiveOptions.PreserveUnsynchronizedLocalContent &&
+                !CloudDirectoryStateProjection.SamePath(entry.RelativePath, original.RelativePath);
+            if (state is not null && !ordinaryDescendant && (!CloudPlaceholderIdentity.TryDecode(observed.Identity, out CloudPlaceholderIdentity? identity) ||
                 identity.ItemId != state.ItemId || identity.RemoteId != state.RemoteId))
             {
                 throw DeleteUnresolved(request, "original native/official identity agreement");
@@ -253,7 +260,7 @@ public sealed partial class CloudFileSystem
 
                 bool ownChildrenDeleted = member.Kind == CloudItemKind.Directory && intent.Members.Any(child =>
                     child.DeletedAtTicks.HasValue && child.Object.RelativePath.StartsWith(member.Object.RelativePath + "\\", StringComparison.OrdinalIgnoreCase));
-                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation && !ownChildrenDeleted, request);
+                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation && !ownChildrenDeleted, request, out _);
                 if (!SameDeleteObject(member, observed) || (member.Usn.HasValue && WindowsFileUsn.Read(fullPath, expectedDirectory: false) != member.Usn))
                 {
                     throw DeleteUnresolved(request, "changed original native object");
@@ -396,10 +403,11 @@ public sealed partial class CloudFileSystem
     private static ValueTask SaveRemoteDeleteIntentAsync(ICloudStateTransaction transaction, RemoteDeleteIntent intent, CancellationToken cancellationToken) =>
         transaction.Checkpoints.UpsertAsync(new(RemoteDeleteIntent.Name(intent.BatchId, intent.EntryIndex), intent.Encode(), DateTimeOffset.UtcNow), cancellationToken);
 
-    private RemoteNamespaceObject ObserveRemoteDeleteObject(SafeFileHandle handle, CloudItemKind kind, bool preserve, RemoteChangeRequest request)
+    private RemoteNamespaceObject ObserveRemoteDeleteObject(SafeFileHandle handle, CloudItemKind kind, bool preserve, RemoteChangeRequest request,
+        out bool placeholder)
     {
         NativeFileMetadata metadata = WindowsFileMetadata.Read(handle.DangerousGetHandle());
-        bool placeholder = metadata.PlaceholderState != CfPlaceholderState.Invalid && metadata.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder);
+        placeholder = metadata.PlaceholderState != CfPlaceholderState.Invalid && metadata.PlaceholderState.HasFlag(CfPlaceholderState.Placeholder);
         if (metadata.Directory != (kind == CloudItemKind.Directory) || metadata.DeletePending || metadata.Links != 1 ||
             (metadata.ReparseTag != 0 && !placeholder) || (preserve && (!placeholder || !metadata.InSync)))
         {
