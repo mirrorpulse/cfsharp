@@ -30,6 +30,12 @@ internal sealed record RemoteDeleteIntent(
 
     internal byte[] Encode()
     {
+        // Presence flags are always encoded, but each later completion adds an Int64.
+        // Reserve every missing payload before accepting preparation, so neither receipt
+        // can exhaust the evidence budget after its destructive effect has completed.
+        int remainingGrowth = Members.Sum(member =>
+            (member.DeletedAtTicks.HasValue ? 0 : sizeof(long)) +
+            (member.ProjectedAtTicks.HasValue ? 0 : sizeof(long)));
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, CloudDirectoryEvidenceCodec.Utf8, leaveOpen: true);
         writer.Write(1);
@@ -92,13 +98,13 @@ internal sealed record RemoteDeleteIntent(
                 writer.Write(projected);
             }
 
-            if (stream.Length > MaximumBytes)
+            if (stream.Length + remainingGrowth > MaximumBytes)
             {
                 throw new IOException("The remote Delete inventory exceeds the 8 MiB durable evidence budget.");
             }
         }
 
-        if (stream.Length > MaximumBytes)
+        if (stream.Length + remainingGrowth > MaximumBytes)
         {
             throw new IOException("The remote Delete inventory exceeds the 8 MiB durable evidence budget.");
         }

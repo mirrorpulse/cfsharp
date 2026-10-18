@@ -199,7 +199,8 @@ conflict entries; it does not certify successful deletion of every entry.
 ### Recursive authorization and replacements
 
 The inventory is sealed before the first mutation, with at most **4096 members** and **8 MiB** of
-encoded evidence per operation. Enumeration stops at the member budget and performs no deletion
+encoded evidence per operation, including reserved space for both completion timestamps of every
+member. Enumeration stops at the member budget and performs no deletion
 if sealing fails. Preparation is one bounded transaction; each member uses separate short native
 receipt and projection transactions. Children precede their parent. Retries retain that same
 inventory and the completed descendant tombstones; they never sweep newly created children into

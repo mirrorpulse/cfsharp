@@ -3,6 +3,51 @@ namespace CfSharp.Tests.Persistence;
 public sealed class RemoteDeleteIntentTests
 {
     [Fact]
+    public void PreparationReservesBothCompletionTimestampsForEveryMember()
+    {
+        (RemoteDeleteIntent original, _) = Create();
+        RemoteDeleteMember root = original.Members[0];
+        CloudItemState state = root.Original!;
+        const int count = 2048;
+        RemoteDeleteMember[] members = Enumerable.Range(0, count).Select(index => root with
+        {
+            Object = root.Object with { RelativePath = $"Docs\\child-{index:D4}", Identity = [] },
+            Original = null,
+        }).ToArray();
+        members[^1] = root with
+        {
+            Kind = CloudItemKind.Directory,
+            Object = root.Object with { RelativePath = "Docs", Identity = [] },
+            Original = new(state.ItemId, state.RemoteId, "Docs", CloudItemKind.Directory,
+                state.RemoteRevision, state.LocalFileId, false, state.UpdatedAt),
+        };
+        RemoteDeleteIntent intent = original with { Members = members };
+        int reserved = count * 2 * sizeof(long);
+        int padding = RemoteDeleteIntent.MaximumBytes - reserved - intent.Encode().Length;
+        for (int index = 0; index < members.Length; index++)
+        {
+            int length = Math.Min(padding, SyncRootRegistrationOptions.MaxFileIdentityLength);
+            members[index] = members[index] with { Object = members[index].Object with { Identity = new byte[length] } };
+            padding -= length;
+        }
+
+        Assert.Equal(0, padding);
+        Assert.Equal(RemoteDeleteIntent.MaximumBytes - reserved, intent.Encode().Length);
+        Assert.Equal(intent.Encode(), RemoteDeleteIntent.Decode(intent.Encode()).Encode());
+        long now = DateTimeOffset.UtcNow.UtcTicks;
+        RemoteDeleteIntent native = intent with { Members = members.Select(member => member with { DeletedAtTicks = now }).ToArray() };
+        Assert.Equal(RemoteDeleteIntent.MaximumBytes - (count * sizeof(long)), native.Encode().Length);
+        RemoteDeleteIntent completed = native with { Members = native.Members.Select(member => member with { ProjectedAtTicks = now }).ToArray() };
+        Assert.Equal(RemoteDeleteIntent.MaximumBytes, completed.Encode().Length);
+        Assert.Equal(completed.Encode(), RemoteDeleteIntent.Decode(completed.Encode()).Encode());
+
+        // One extra byte is rejected in preparation, while there have been no native effects.
+        RemoteDeleteMember[] oversized = members.ToArray();
+        oversized[^1] = oversized[^1] with { Object = oversized[^1].Object with { Identity = new byte[oversized[^1].Object.Identity.Length + 1] } };
+        Assert.Throws<IOException>(() => (intent with { Members = oversized }).Encode());
+    }
+
+    [Fact]
     public void SealedInventoryRoundTripsOriginalAndIndependentCompletionStages()
     {
         (RemoteDeleteIntent intent, CloudRemoteChangeBatch batch) = Create();
