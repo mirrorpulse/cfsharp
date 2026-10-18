@@ -1,6 +1,12 @@
 using CfSharp;
 using CfSharp.Storage.Sqlite;
 
+if (args.Length == 2 && args[0] == "delete-directory-hidden")
+{
+    File.SetAttributes(args[1], File.GetAttributes(args[1]) | FileAttributes.Hidden);
+    return 0;
+}
+
 if (args.Length == 5 && args[4].StartsWith("delete-", StringComparison.Ordinal) && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
 {
     return await RemoteDeleteCrash.RunAsync(args[0], args[1], args[2], args[3], args[4]);

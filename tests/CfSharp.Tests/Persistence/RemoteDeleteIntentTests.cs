@@ -3,6 +3,25 @@ namespace CfSharp.Tests.Persistence;
 public sealed class RemoteDeleteIntentTests
 {
     [Fact]
+    public void DirectoryInventoryRetainsItsIndependentMetadataUsn()
+    {
+        (RemoteDeleteIntent intent, _) = Create();
+        RemoteDeleteMember member = intent.Members[0];
+        CloudItemState original = member.Original!;
+        member = member with
+        {
+            Kind = CloudItemKind.Directory,
+            Original = new(original.ItemId, original.RemoteId, original.RelativePath, CloudItemKind.Directory,
+                original.RemoteRevision, original.LocalFileId, false, original.UpdatedAt),
+            Usn = 987654321,
+        };
+        RemoteDeleteIntent decoded = RemoteDeleteIntent.Decode((intent with { Members = [member] }).Encode());
+        Assert.Equal(CloudItemKind.Directory, decoded.Members[0].Kind);
+        Assert.Equal(member.Usn, decoded.Members[0].Usn);
+        Assert.Equal((intent with { Members = [member] }).Encode(), decoded.Encode());
+    }
+
+    [Fact]
     public void OriginalDurablePathRoundTripsIndependentlyOfNativeCasing()
     {
         (RemoteDeleteIntent intent, _) = Create();

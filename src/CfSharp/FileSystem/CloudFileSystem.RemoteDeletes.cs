@@ -177,7 +177,7 @@ public sealed partial class CloudFileSystem
             }
 
             members.Add(new(entry.Kind, observed, state, RemoteNamespaceEvidence.FingerprintOperations(operations), null, null,
-                entry.Kind == CloudItemKind.File ? WindowsFileUsn.Read(entry.FullPath, expectedDirectory: false) : null));
+                WindowsFileUsn.Read(entry.FullPath, expectedDirectory: entry.Kind == CloudItemKind.Directory)));
         }
 
         if (!SameRemoteItemState(members[^1].Original, original))
@@ -258,10 +258,16 @@ public sealed partial class CloudFileSystem
                     throw DeleteUnresolved(request, "unproven native deletion before completion receipt");
                 }
 
-                bool ownChildrenDeleted = member.Kind == CloudItemKind.Directory && intent.Members.Any(child =>
-                    child.DeletedAtTicks.HasValue && child.Object.RelativePath.StartsWith(member.Object.RelativePath + "\\", StringComparison.OrdinalIgnoreCase));
-                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation && !ownChildrenDeleted, request, out _);
-                if (!SameDeleteObject(member, observed) || (member.Usn.HasValue && WindowsFileUsn.Read(fullPath, expectedDirectory: false) != member.Usn))
+                // Completed children do not authorize later metadata changes on their parent.
+                // The directory's own USN and in-sync state remain part of preservation even
+                // though its last-write time can change as our children disappear.
+                if (member.Kind == CloudItemKind.Directory && !member.Usn.HasValue)
+                {
+                    throw DeleteUnresolved(request, "missing original directory change evidence");
+                }
+                RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation, request, out _);
+                if (!SameDeleteObject(member, observed) || (member.Usn.HasValue &&
+                    WindowsFileUsn.Read(fullPath, expectedDirectory: member.Kind == CloudItemKind.Directory) != member.Usn))
                 {
                     throw DeleteUnresolved(request, "changed original native object");
                 }

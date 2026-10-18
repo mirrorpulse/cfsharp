@@ -7,6 +7,28 @@ namespace CfSharp.Native.Tests;
 public sealed class WindowsFileUsnTests
 {
     [Fact]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.16299")]
+    public void DirectoryUsnDistinguishesOwnMetadataFromChildNamespaceChanges()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "CfSharp-directory-usn", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        try
+        {
+            long original = WindowsFileUsn.Read(path, expectedDirectory: true);
+            string child = Path.Combine(path, "child.txt");
+            File.WriteAllText(child, "local content");
+            File.Delete(child);
+            Assert.Equal(original, WindowsFileUsn.Read(path, expectedDirectory: true));
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+            Assert.NotEqual(original, WindowsFileUsn.Read(path, expectedDirectory: true));
+        }
+        finally
+        {
+            Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ReadFileUsnDataLayoutMatchesWindowsSdk()
     {
         Assert.Equal(4, Marshal.SizeOf<WindowsFileUsn.ReadFileUsnData>());

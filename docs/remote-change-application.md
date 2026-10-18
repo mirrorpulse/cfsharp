@@ -166,9 +166,9 @@ Before native work, CfSharp commits a versioned preparation containing the origi
 identity, root/store scope, guarded parent bindings, local-operation fingerprints and the complete
 authorized inventory. The exact original official path is stored separately from the native
 path spelling, preserving durable state when Windows reports different path casing.
-File evidence includes a native USN so equal-length writes with restored
-timestamps cannot silently reuse old authorization. Native deletion targets the inspected handle;
-it never reopens a mutable path for deletion. Handles exclude competing file writers/deleters,
+File and directory evidence includes native USNs so equal-length writes with restored timestamps
+and later directory metadata changes cannot silently reuse old authorization. Native deletion
+targets the inspected handle; it never reopens a mutable path for deletion. Handles exclude competing file writers/deleters,
 parent guards prevent ancestor replacement, and metadata queries do not hydrate content.
 
 Deletion requires exclusive data access. Existing readers, including readers that share deletion,
@@ -213,8 +213,11 @@ receipt and projection transactions. Children precede their parent. Retries reta
 inventory and the completed descendant tombstones; they never sweep newly created children into
 the old authorization. A remaining/nonempty directory, dirty file, link, pending operation, identity
 change or replaced parent stops incomplete work without representing it as an intact-tree conflict.
-Directory timestamps can change as authorized children are removed; they do not substitute for
-the per-member bindings, receipts and empty-directory native check.
+Directory last-write times can change as authorized children are removed; the directory's own USN
+and in-sync state remain mandatory checks under preservation. Completed children never exempt a
+later local metadata change, including one followed by an explicit in-sync reset. An unfinished
+directory prepared by an older draft without its own USN remains unresolved. Bindings, original
+local operations, completion receipts and the empty-directory native check are also revalidated.
 
 A new ordinary file or placeholder at a completed path is never deleted by replay. Its pending
 scope remains unresolved until that replacement generation is reconciled, preventing delayed local

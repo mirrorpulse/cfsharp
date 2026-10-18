@@ -15,6 +15,85 @@ public sealed partial class RemoteDeleteRecoveryTests
     public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
 
     [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task LaterExternalDirectoryMetadataSurvivesPartialDelete(bool preserveInSync, bool restoreInSync)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true, children: true, preserveInSync: preserveInSync);
+        root.Factory.Boundary = "projection-after";
+        root.Factory.MemberCount = 2;
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAsync()).RequiresRetry);
+        Assert.Equal(1, root.Factory.FailuresObserved);
+        await root.RestartAsync();
+
+        await using CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        System.Diagnostics.ProcessStartInfo start = new("dotnet")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        string configuration = typeof(RemoteDeleteRecoveryTests).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
+            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
+        string harness = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory,
+            "../../../../CfSharp.Storage.Sqlite.CrashHarness/bin", configuration, "net10.0-windows/CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        start.ArgumentList.Add(harness);
+        start.ArgumentList.Add("delete-directory-hidden");
+        start.ArgumentList.Add(path);
+        using (System.Diagnostics.Process external = System.Diagnostics.Process.Start(start)!)
+        {
+            await external.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            _output.WriteLine(await external.StandardOutput.ReadToEndAsync());
+            _output.WriteLine(await external.StandardError.ReadToEndAsync());
+            Assert.Equal(0, external.ExitCode);
+        }
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        while (true)
+        {
+            await using (ICloudStateTransaction observed = await root.Factory.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                if ((await observed.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix, deadline.Token)).Count != 0)
+                {
+                    break;
+                }
+            }
+            await Task.Delay(25, deadline.Token);
+        }
+        Assert.Equal(CloudSynchronizationState.NotInSync, (await root.FileSystem.GetDirectory(root.Target).InspectAsync()).SynchronizationState);
+        if (restoreInSync)
+        {
+            await root.FileSystem.GetDirectory(root.Target).SetInSyncAsync(true);
+            Assert.Equal(CloudSynchronizationState.InSync, (await root.FileSystem.GetDirectory(root.Target).InspectAsync()).SynchronizationState);
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.True(Directory.Exists(path));
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            Assert.All(intent.Members.Take(2), member => Assert.NotNull(member.ProjectedAtTicks));
+            Assert.Null(intent.Members[^1].DeletedAtTicks);
+            Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        }
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(false, true)]
@@ -863,11 +942,13 @@ public sealed partial class RemoteDeleteRecoveryTests
     }
 
     [Theory]
-    [InlineData("new-child")]
-    [InlineData("complete")]
-    public async Task PartialTreeUsesItsSealedInventoryAndPreservesNewChildren(string scenario)
+    [InlineData("new-child", true)]
+    [InlineData("complete", true)]
+    [InlineData("new-child", false)]
+    [InlineData("complete", false)]
+    public async Task PartialTreeUsesItsSealedInventoryAndPreservesNewChildren(string scenario, bool preserveInSync)
     {
-        await using DeleteRoot root = await DeleteRoot.OpenAsync(true, children: true);
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true, children: true, preserveInSync: preserveInSync);
         root.Factory.Boundary = "projection";
         root.Factory.MemberCount = 2;
         root.Factory.FailuresRemaining = 1;
