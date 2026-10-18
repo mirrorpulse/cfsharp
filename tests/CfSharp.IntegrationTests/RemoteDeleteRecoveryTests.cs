@@ -79,6 +79,57 @@ public sealed partial class RemoteDeleteRecoveryTests
     }
 
     [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task ReplayRechecksNativeMetadataAfterWaitingForTheStateTransaction(bool directory, bool preserveInSync)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, preserveInSync: preserveInSync);
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAsync()).RequiresRetry);
+        await root.RestartAsync();
+
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        int mutations = 0;
+        root.Factory.BeforeBegin = async cancellationToken =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Only the exclusive native Delete handle rejects this data-access open. Wait
+            // until replay holds that handle, then emulate a store-gate wait while another
+            // process uses the attribute access that Windows exempts from sharing checks.
+            using (SafeFileHandle probe = CreateFile(path, 1, 7, 0, 3, 0x02200000, 0))
+            {
+                if (!probe.IsInvalid || Marshal.GetLastPInvokeError() != 32)
+                {
+                    return;
+                }
+            }
+            root.Factory.BeforeBegin = null;
+            await SetHiddenFromExternalProcessAsync(path);
+            mutations++;
+        };
+
+        CloudRemoteApplyResult replay = await root.ApplyAsync();
+        Assert.Equal(1, mutations);
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(Assert.Single(replay.Entries).Error);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await root.RestartAsync();
+        Assert.True((await root.ApplyAsync()).RequiresRetry);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+        Assert.All(intent.Members, member => Assert.Null(member.DeletedAtTicks));
+        Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await verify.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
     [InlineData(true, false)]
     [InlineData(false, false)]
     [InlineData(true, true)]
@@ -96,28 +147,7 @@ public sealed partial class RemoteDeleteRecoveryTests
         await using CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
         await feed.StartAsync();
         string path = System.IO.Path.Combine(root.Path, root.Target);
-        System.Diagnostics.ProcessStartInfo start = new("dotnet")
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        string configuration = typeof(RemoteDeleteRecoveryTests).Assembly
-            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
-            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
-        string harness = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory,
-            "../../../../CfSharp.Storage.Sqlite.CrashHarness/bin", configuration, "net10.0-windows/CfSharp.Storage.Sqlite.CrashHarness.dll"));
-        start.ArgumentList.Add(harness);
-        start.ArgumentList.Add("delete-directory-hidden");
-        start.ArgumentList.Add(path);
-        using (System.Diagnostics.Process external = System.Diagnostics.Process.Start(start)!)
-        {
-            await external.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
-            _output.WriteLine(await external.StandardOutput.ReadToEndAsync());
-            _output.WriteLine(await external.StandardError.ReadToEndAsync());
-            Assert.Equal(0, external.ExitCode);
-        }
+        await SetHiddenFromExternalProcessAsync(path);
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
 
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
@@ -1043,6 +1073,30 @@ public sealed partial class RemoteDeleteRecoveryTests
         Assert.Equal(0, root.Provider.Reads);
     }
 
+    private async Task SetHiddenFromExternalProcessAsync(string path)
+    {
+        System.Diagnostics.ProcessStartInfo start = new("dotnet")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        string configuration = typeof(RemoteDeleteRecoveryTests).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
+            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
+        string harness = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory,
+            "../../../../CfSharp.Storage.Sqlite.CrashHarness/bin", configuration, "net10.0-windows/CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        start.ArgumentList.Add(harness);
+        start.ArgumentList.Add("delete-directory-hidden");
+        start.ArgumentList.Add(path);
+        using System.Diagnostics.Process external = System.Diagnostics.Process.Start(start)!;
+        await external.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        _output.WriteLine(await external.StandardOutput.ReadToEndAsync());
+        _output.WriteLine(await external.StandardError.ReadToEndAsync());
+        Assert.Equal(0, external.ExitCode);
+    }
+
     // Attribute-only access is intentionally outside Windows data-sharing exclusion.
     private static SafeFileHandle OpenAttributeQuery(string path) => CreateFile(path, 0x80, 7, 0, 3, 0x02200000, 0);
 
@@ -1168,6 +1222,7 @@ public sealed partial class RemoteDeleteRecoveryTests
         internal int MemberCount { get; set; } = 1;
         internal Action? Cancel { get; set; }
         internal Action? BeforeDeleteOutcome { get; set; }
+        internal Func<CancellationToken, ValueTask>? BeforeBegin { get; set; }
         private Action? _beforeNextTransaction;
         internal int FailuresObserved { get; private set; }
         internal IOException Error { get; } = new("Synthetic remote Delete commit interruption.");
@@ -1179,6 +1234,10 @@ public sealed partial class RemoteDeleteRecoveryTests
         {
             public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
             {
+                if (owner.BeforeBegin is { } before)
+                {
+                    await before(cancellationToken);
+                }
                 ICloudStateTransaction transaction = await store.BeginTransactionAsync(cancellationToken);
                 // Inject only after the final transaction has acquired store isolation.
                 Action? mutation = owner._beforeNextTransaction;

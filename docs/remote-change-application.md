@@ -219,6 +219,13 @@ later local metadata change, including one followed by an explicit in-sync reset
 directory prepared by an older draft without its own USN remains unresolved. Bindings, original
 local operations, completion receipts and the empty-directory native check are also revalidated.
 
+Final native validation follows transaction acquisition and all asynchronous official-state and
+journal reads, immediately before native disposition. This detects metadata changes made while
+waiting for the store. Windows exempts attribute-only writers from data-sharing exclusion, however;
+the native queries and disposition are separate calls, without atomic compare-USN-and-delete
+semantics. The preservation policy therefore cannot promise absolute isolation from concurrent
+external attribute writes. Applications requiring that guarantee must coordinate those writers.
+
 A new ordinary file or placeholder at a completed path is never deleted by replay. Its pending
 scope remains unresolved until that replacement generation is reconciled, preventing delayed local
 observations from reusing the tombstoned identity. A later official generation that prevents exact

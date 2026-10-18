@@ -263,6 +263,17 @@ public sealed partial class CloudFileSystem
                 {
                     throw DeleteUnresolved(request, "missing original directory change evidence");
                 }
+                // Exclude transactional projections across the same-object native mutation.
+                // This is not a cross-filesystem/store atomic transaction: the prepared-but-
+                // absent crash window deliberately remains unresolved without a completion.
+                await using ICloudStateTransaction native = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                await ValidateRemoteDeleteStateAsync(native, request, intent, member, index, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // Attribute-only writers bypass data sharing and can change this object
+                // during any awaited store operation. Observe native state only after all
+                // transaction/journal waits, with no further await before disposition.
+                // These queries are not an atomic compare-and-delete or an attribute lock.
                 RemoteNamespaceObject observed = ObserveRemoteDeleteObject(handle, member.Kind, intent.RequirePreservation, request, out _);
                 if (!SameDeleteObject(member, observed) || (member.Usn.HasValue &&
                     WindowsFileUsn.Read(fullPath, expectedDirectory: member.Kind == CloudItemKind.Directory) != member.Usn))
@@ -270,12 +281,6 @@ public sealed partial class CloudFileSystem
                     throw DeleteUnresolved(request, "changed original native object");
                 }
 
-                // Exclude transactional projections across the same-object native mutation.
-                // This is not a cross-filesystem/store atomic transaction: the prepared-but-
-                // absent crash window deliberately remains unresolved without a completion.
-                await using ICloudStateTransaction native = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-                await ValidateRemoteDeleteStateAsync(native, request, intent, member, index, cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     WindowsFileMetadata.Delete(handle.DangerousGetHandle());
