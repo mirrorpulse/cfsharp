@@ -8,7 +8,7 @@ namespace CfSharp;
 
 public sealed partial class CloudFileSystem
 {
-    private async ValueTask<RemoteMoveIntent?> ReadRemoteMoveIntentAsync(RemoteMoveRequest request,
+    private async ValueTask<RemoteMoveIntent?> ReadRemoteMoveIntentAsync(RemoteChangeRequest request,
         CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken)
@@ -17,7 +17,7 @@ public sealed partial class CloudFileSystem
     }
 
     private async ValueTask<RemoteMoveIntent?> ReadRemoteMoveIntentCoreAsync(ICloudStateTransaction transaction,
-        RemoteMoveRequest request, CancellationToken cancellationToken)
+        RemoteChangeRequest request, CancellationToken cancellationToken)
     {
         CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(
             RemoteMoveIntent.Name(request.Batch.BatchId, request.EntryIndex), cancellationToken).ConfigureAwait(false);
@@ -46,15 +46,15 @@ public sealed partial class CloudFileSystem
     }
 
     private async ValueTask<RemoteMoveIntent> PrepareRemoteFileMoveAsync(CloudRemoteChange change,
-        CloudItemState original, CloudRemoteApplyOptions effectiveOptions, RemoteMoveRequest request,
+        CloudItemState original, CloudRemoteApplyOptions effectiveOptions, RemoteChangeRequest request,
         CancellationToken cancellationToken)
     {
         string source = ToFullPath(change.PreviousRelativePath!);
         string target = ToFullPath(change.RelativePath);
         using CloudPathHandleLease chains = CloudPathHandleLease.OpenParentChains(SyncRootPath, [source, target]);
-        using RemoteMoveParentLease parentLease = HoldRemoteMoveParents(source, target);
+        using RemoteNamespaceParentLease parentLease = HoldRemoteNamespaceParents(source, target);
         using SafeFileHandle guard = WindowsFileMetadata.Open(source, preventDelete: true);
-        RemoteMoveObject observed = ObserveRemoteMoveObject(guard, directory: false, effectiveOptions.PreserveUnsynchronizedLocalContent,
+        RemoteNamespaceObject observed = ObserveRemoteNamespaceObject(guard, directory: false, effectiveOptions.PreserveUnsynchronizedLocalContent,
             preserveContent: effectiveOptions.PreserveUnsynchronizedLocalContent);
         CloudPlaceholderIdentity identity = CloudPlaceholderIdentity.Decode(observed.Identity);
         if (original.IsTombstone || original.Kind != CloudItemKind.File || original.RemoteId != change.RemoteId ||
@@ -64,12 +64,12 @@ public sealed partial class CloudFileSystem
             throw new IOException("The remote move source does not match its original durable identity.");
         }
 
-        IReadOnlyList<RemoteMoveObject> parents = parentLease.Parents;
+        IReadOnlyList<RemoteNamespaceObject> parents = parentLease.Parents;
         string destinationParent = Path.GetDirectoryName(target)!;
         using SafeFileHandle parentHandle = WindowsFileMetadata.Open(destinationParent, preventDelete: true);
         string actualTarget = Path.Combine(WindowsFileMetadata.ReadFinalPath(parentHandle.DangerousGetHandle()), Path.GetFileName(target));
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        if (!SameRemoteMoveItem(await transaction.Items.GetByItemIdAsync(original.ItemId, cancellationToken).ConfigureAwait(false), original))
+        if (!SameRemoteItemState(await transaction.Items.GetByItemIdAsync(original.ItemId, cancellationToken).ConfigureAwait(false), original))
         {
             throw new IOException("The remote move source state changed during preparation.");
         }
@@ -97,11 +97,11 @@ public sealed partial class CloudFileSystem
             policy.PreserveUnsynchronizedLocalContent, policy.SuppressLocalEcho,
             policy.EchoSuppressionLifetime.Ticks, policy.EchoSuppressionObservationCount,
             original, observed, parents, null, effectiveOptions.PreserveUnsynchronizedLocalContent,
-            RemoteMoveIntent.FingerprintOperations(localOperations), null);
+            RemoteNamespaceEvidence.FingerprintOperations(localOperations), null);
         await transaction.Checkpoints.UpsertAsync(new(RemoteMoveIntent.Name(intent.BatchId, intent.EntryIndex),
             intent.Encode(), DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
         ValidateRemoteMoveParents(intent, source, target);
-        RequireSameRemoteMoveObject(observed, ObserveRemoteMoveObject(guard, false, intent.RequireInSync, intent.RequireInSync));
+        RequireSameRemoteNamespaceObject(observed, ObserveRemoteNamespaceObject(guard, false, intent.RequireInSync, intent.RequireInSync));
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return intent;
     }
@@ -112,16 +112,16 @@ public sealed partial class CloudFileSystem
         string source = ToFullPath(intent.Object.RelativePath);
         string target = ToFullPath(intent.TargetRelativePath);
         using CloudPathHandleLease chains = CloudPathHandleLease.OpenParentChains(SyncRootPath, [source, target]);
-        using RemoteMoveParentLease parentLease = HoldRemoteMoveParents(source, target);
+        using RemoteNamespaceParentLease parentLease = HoldRemoteNamespaceParents(source, target);
         ValidateRemoteMoveParents(intent, source, target);
         bool requireInSync = intent.RequireInSync && intent.ProjectedAtTicks is null;
-        using SafeFileHandle? sourceHandle = TryOpenRemoteMoveObject(source);
-        using SafeFileHandle? targetHandle = TryOpenRemoteMoveObject(target);
-        RemoteMoveObject? atSource = sourceHandle is null ? null : ObserveRemoteMoveObject(sourceHandle, false, requireInSync, intent.RequireInSync);
-        RemoteMoveObject? atTarget = targetHandle is null ? null : ObserveRemoteMoveObject(targetHandle, false, requireInSync, intent.RequireInSync);
-        bool moved = atTarget is not null && SameRemoteMoveObject(intent.Object, atTarget) &&
+        using SafeFileHandle? sourceHandle = TryOpenRemoteNamespaceObject(source);
+        using SafeFileHandle? targetHandle = TryOpenRemoteNamespaceObject(target);
+        RemoteNamespaceObject? atSource = sourceHandle is null ? null : ObserveRemoteNamespaceObject(sourceHandle, false, requireInSync, intent.RequireInSync);
+        RemoteNamespaceObject? atTarget = targetHandle is null ? null : ObserveRemoteNamespaceObject(targetHandle, false, requireInSync, intent.RequireInSync);
+        bool moved = atTarget is not null && SameRemoteNamespaceObject(intent.Object, atTarget) &&
             atTarget.RelativePath == intent.TargetRelativePath;
-        bool notMoved = atSource is not null && SameRemoteMoveObject(intent.Object, atSource) &&
+        bool notMoved = atSource is not null && SameRemoteNamespaceObject(intent.Object, atSource) &&
             atSource.RelativePath == intent.Object.RelativePath;
         bool samePath = CloudDirectoryStateProjection.SamePath(intent.Object.RelativePath, intent.TargetRelativePath);
         if ((!moved && !notMoved) || (!samePath && moved && atSource is not null) ||
@@ -153,8 +153,8 @@ public sealed partial class CloudFileSystem
                 change.RemoteRevision, intent.Original.LocalFileId, false, new DateTimeOffset(ticks, TimeSpan.Zero))
             : intent.Original;
         CloudItemState? occupant = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
-        if (!SameRemoteMoveItem(current, expected) || (occupant is not null && occupant.ItemId != expected.ItemId) ||
-            !RemoteMoveIntent.FingerprintOperations(await transaction.Operations.ListByItemIdAsync(expected.ItemId, int.MaxValue,
+        if (!SameRemoteItemState(current, expected) || (occupant is not null && occupant.ItemId != expected.ItemId) ||
+            !RemoteNamespaceEvidence.FingerprintOperations(await transaction.Operations.ListByItemIdAsync(expected.ItemId, int.MaxValue,
                 cancellationToken).ConfigureAwait(false)).AsSpan().SequenceEqual(intent.LocalOperationsFingerprint))
         {
             throw RemoteMoveUnresolved(intent, "durable projection validation");
@@ -164,7 +164,7 @@ public sealed partial class CloudFileSystem
         {
             cancellationToken.ThrowIfCancellationRequested();
             using SafeFileHandle rename = WindowsFileMetadata.OpenForRename(source);
-            RequireSameRemoteMoveObject(intent.Object, ObserveRemoteMoveObject(rename, false, intent.RequireInSync, intent.RequireInSync));
+            RequireSameRemoteNamespaceObject(intent.Object, ObserveRemoteNamespaceObject(rename, false, intent.RequireInSync, intent.RequireInSync));
             if (Path.GetRelativePath(SyncRootPath, WindowsFileMetadata.ReadFinalPath(rename.DangerousGetHandle())) != intent.Object.RelativePath)
             {
                 throw RemoteMoveUnresolved(intent, "source path validation");
@@ -193,8 +193,8 @@ public sealed partial class CloudFileSystem
         // it in sync or guess that a later dirty object is ours. Retain the observed post-rename
         // USN with projection; replay rejects any subsequent native change, even an equal-size
         // content write whose timestamps were restored. Earlier gaps still require in-sync proof.
-        RemoteMoveObject completed = ObserveRemoteMoveObject(final, false, requireInSync: false, preserveContent: intent.RequireInSync);
-        RequireSameRemoteMoveObject(intent.Object, completed);
+        RemoteNamespaceObject completed = ObserveRemoteNamespaceObject(final, false, requireInSync: false, preserveContent: intent.RequireInSync);
+        RequireSameRemoteNamespaceObject(intent.Object, completed);
         long completedUsn = WindowsFileUsn.Read(target, expectedDirectory: false);
         if (intent.ProjectedUsn.HasValue && intent.ProjectedUsn != completedUsn)
         {
@@ -223,7 +223,7 @@ public sealed partial class CloudFileSystem
 
             await transaction.Checkpoints.UpsertAsync(new(name, (intent with { ProjectedAtTicks = now.UtcTicks, ProjectedUsn = completedUsn }).Encode(), now),
                 CancellationToken.None).ConfigureAwait(false);
-            RequireSameRemoteMoveObject(intent.Object, ObserveRemoteMoveObject(final, false, requireInSync: false, preserveContent: intent.RequireInSync));
+            RequireSameRemoteNamespaceObject(intent.Object, ObserveRemoteNamespaceObject(final, false, requireInSync: false, preserveContent: intent.RequireInSync));
             if (WindowsFileUsn.Read(target, expectedDirectory: false) != completedUsn)
             {
                 throw RemoteMoveUnresolved(intent, "post-rename native USN validation");
@@ -250,7 +250,7 @@ public sealed partial class CloudFileSystem
         return paths.Order(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
-    private RemoteMoveParentLease HoldRemoteMoveParents(string source, string target)
+    private RemoteNamespaceParentLease HoldRemoteNamespaceParents(string source, string target)
     {
         List<SafeFileHandle> handles = [];
         try
@@ -260,7 +260,7 @@ public sealed partial class CloudFileSystem
                 handles.Add(WindowsFileMetadata.OpenDirectoryGuard(path));
             }
 
-            return new(handles, handles.Select(handle => ObserveRemoteMoveObject(handle, directory: true, requireInSync: false)).ToArray());
+            return new(handles, handles.Select(handle => ObserveRemoteNamespaceObject(handle, directory: true, requireInSync: false)).ToArray());
         }
         catch
         {
@@ -275,8 +275,8 @@ public sealed partial class CloudFileSystem
 
     private void ValidateRemoteMoveParents(RemoteMoveIntent intent, string source, string target)
     {
-        using RemoteMoveParentLease lease = HoldRemoteMoveParents(source, target);
-        RemoteMoveObject[] parents = lease.Parents;
+        using RemoteNamespaceParentLease lease = HoldRemoteNamespaceParents(source, target);
+        RemoteNamespaceObject[] parents = lease.Parents;
         if (parents.Length != intent.Parents.Count || parents.Where((parent, index) =>
             parent.RelativePath != intent.Parents[index].RelativePath || parent.Binding != intent.Parents[index].Binding ||
             parent.CreationTime != intent.Parents[index].CreationTime ||
@@ -286,7 +286,7 @@ public sealed partial class CloudFileSystem
         }
     }
 
-    private RemoteMoveObject ObserveRemoteMoveObject(SafeFileHandle handle, bool directory, bool requireInSync, bool preserveContent = true)
+    private RemoteNamespaceObject ObserveRemoteNamespaceObject(SafeFileHandle handle, bool directory, bool requireInSync, bool preserveContent = true)
     {
         NativeFileMetadata metadata = WindowsFileMetadata.Read(handle.DangerousGetHandle());
         bool placeholder = metadata.PlaceholderState != CfPlaceholderState.Invalid &&
@@ -310,7 +310,7 @@ public sealed partial class CloudFileSystem
             basic.CreationTime, basic.LastWriteTime, metadata.Length);
     }
 
-    private static SafeFileHandle? TryOpenRemoteMoveObject(string path)
+    private static SafeFileHandle? TryOpenRemoteNamespaceObject(string path)
     {
         try
         {
@@ -322,19 +322,19 @@ public sealed partial class CloudFileSystem
         }
     }
 
-    private static bool SameRemoteMoveObject(RemoteMoveObject expected, RemoteMoveObject current) =>
+    private static bool SameRemoteNamespaceObject(RemoteNamespaceObject expected, RemoteNamespaceObject current) =>
         expected.Binding == current.Binding && expected.Identity.AsSpan().SequenceEqual(current.Identity) &&
         expected.CreationTime == current.CreationTime && expected.LastWriteTime == current.LastWriteTime && expected.Length == current.Length;
 
-    private static void RequireSameRemoteMoveObject(RemoteMoveObject expected, RemoteMoveObject current)
+    private static void RequireSameRemoteNamespaceObject(RemoteNamespaceObject expected, RemoteNamespaceObject current)
     {
-        if (!SameRemoteMoveObject(expected, current))
+        if (!SameRemoteNamespaceObject(expected, current))
         {
             throw new IOException("The native object no longer matches the retained remote move preparation.");
         }
     }
 
-    private static bool SameRemoteMoveItem(CloudItemState? current, CloudItemState expected) =>
+    private static bool SameRemoteItemState(CloudItemState? current, CloudItemState expected) =>
         current is not null && current.ItemId == expected.ItemId && current.RemoteId == expected.RemoteId &&
         current.RelativePath == expected.RelativePath && current.Kind == expected.Kind &&
         current.RemoteRevision == expected.RemoteRevision && current.LocalFileId == expected.LocalFileId &&
@@ -344,9 +344,9 @@ public sealed partial class CloudFileSystem
         new($"Remote batch '{intent.BatchId}' entry {intent.EntryIndex} remains pending at {stage}; " +
             "retain the original batch and reconcile the namespace before retrying.");
 
-    private sealed class RemoteMoveParentLease(List<SafeFileHandle> handles, RemoteMoveObject[] parents) : IDisposable
+    private sealed class RemoteNamespaceParentLease(List<SafeFileHandle> handles, RemoteNamespaceObject[] parents) : IDisposable
     {
-        internal RemoteMoveObject[] Parents => parents;
+        internal RemoteNamespaceObject[] Parents => parents;
         public void Dispose()
         {
             foreach (SafeFileHandle handle in handles)

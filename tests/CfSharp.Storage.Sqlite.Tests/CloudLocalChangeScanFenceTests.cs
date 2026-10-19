@@ -4,6 +4,40 @@ namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LaterGenerationObservationCannotResurrectACompletedDeletesTombstone(bool created)
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        CloudItemState historical = new(Guid.NewGuid(), "deleted-remote", "recreated.txt", CloudItemKind.File,
+            "v2", 123, true, DateTimeOffset.UtcNow);
+        Guid pending = Guid.NewGuid();
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            await seed.Items.UpsertAsync(historical);
+            await seed.Operations.EnqueueAsync(new(pending, CloudStateOperationKind.ContentUpdate, historical.ItemId, [42], DateTimeOffset.UtcNow));
+            await seed.CommitAsync();
+        }
+
+        await File.WriteAllTextAsync(Path.Combine(_syncRootPath, historical.RelativePath), "replacement bytes");
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(store, source);
+        await feed.StartAsync();
+        await source.EmitAsync(new(created ? LocalChangeSourceAction.Created : LocalChangeSourceAction.Modified, historical.RelativePath));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(5));
+        await WaitForLossPersistenceAsync(feed, deadline.Token);
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        await using ICloudStateTransaction verify = await store.BeginTransactionAsync();
+        CloudItemState retained = (await verify.Items.GetByItemIdAsync(historical.ItemId))!;
+        Assert.True(retained.IsTombstone);
+        Assert.Equal(historical.UpdatedAt, retained.UpdatedAt);
+        Assert.Equal("v2", retained.RemoteRevision);
+        Assert.Equal(pending, Assert.Single(await verify.Operations.ListAsync(100)).OperationId);
+        Assert.NotEmpty(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix));
+        Assert.Equal("replacement bytes", await File.ReadAllTextAsync(Path.Combine(_syncRootPath, historical.RelativePath)));
+    }
+
     [Fact]
     [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "xUnit1031:Do not use blocking task operations in test method",
         Justification = "A dedicated background caller installs a paused context; the test awaits startup and rescues queued callbacks.")]
@@ -281,33 +315,39 @@ public sealed partial class CloudLocalChangeFeedTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task RemoteIntentAndRetainedObservationFenceScansUntilExplicitRecovery(bool move)
+    [InlineData("creation")]
+    [InlineData("move")]
+    [InlineData("delete")]
+    public async Task RemoteIntentAndRetainedObservationFenceScansUntilExplicitRecovery(string kind)
     {
+        bool move = kind == "move";
+        bool delete = kind == "delete";
         await using ICloudStateStore store = await OpenStoreAsync();
         await SeedChangesAsync(store, 2);
         FakeSource source = new();
         await using CloudLocalChangeFeed feed = CreateFeed(store, source);
         await feed.StartAsync();
         CloudLocalChangeScan original = await feed.BeginScanAsync();
-        string intentName = move ? RemoteMoveIntent.Name("batch", 0) : RemoteCreationIntent.Prefix + "/test";
-        string observationName = (move ? CloudLocalChangeFeed.NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/test";
+        string intentName = move ? RemoteMoveIntent.Name("batch", 0) : delete ? RemoteDeleteIntent.Name("batch", 0) : RemoteCreationIntent.Prefix + "/test";
+        string observationName = (move || delete ? CloudLocalChangeFeed.NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/test";
         await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
         {
             RemoteCreationIntent intent = new("pending", CloudItemKind.Directory,
                 new CloudPlaceholderIdentity(Guid.NewGuid(), "pending-remote"), new byte[32], false);
             byte[] evidence = intent.Encode();
-            if (move)
+            if (move || delete)
             {
                 CloudLocalFileBinding binding = new(1, Guid.NewGuid(), Guid.NewGuid());
                 CloudItemState originalItem = new(intent.Identity.ItemId, "pending-remote", "source.bin",
                     CloudItemKind.File, "v1", null, false, DateTimeOffset.UtcNow);
-                RemoteMoveObject item = new(originalItem.RelativePath, binding, intent.Identity.Encode(), 10, 20, 512);
+                RemoteNamespaceObject item = new(originalItem.RelativePath, binding, intent.Identity.Encode(), 10, 20, 512);
                 RemoteMoveIntent preparation = new(Guid.NewGuid(), _syncRootPath, "batch", 0, new byte[32], "target.bin",
                     true, true, TimeSpan.FromMinutes(2).Ticks, 4, originalItem, item, [new(string.Empty, binding, [], 5, 6, 0)],
-                    null, true, RemoteMoveIntent.FingerprintOperations([]), null);
-                evidence = preparation.Encode();
+                    null, true, RemoteNamespaceEvidence.FingerprintOperations([]), null);
+                evidence = delete ? new RemoteDeleteIntent(Guid.NewGuid(), _syncRootPath, "batch", 0, new byte[32],
+                    true, true, true, TimeSpan.FromMinutes(2).Ticks, 4, preparation.Parents,
+                    [new(CloudItemKind.File, item, originalItem, RemoteNamespaceEvidence.FingerprintOperations([]), null, null, null,
+                        (uint)FileAttributes.Archive)]).Encode() : preparation.Encode();
             }
 
             await write.Checkpoints.UpsertAsync(new CloudStateCheckpoint(intentName, evidence, DateTimeOffset.UtcNow));
@@ -315,9 +355,9 @@ public sealed partial class CloudLocalChangeFeedTests
             await write.CommitAsync();
         }
 
-        if (move)
+        if (move || delete)
         {
-            await source.EmitAsync(new(LocalChangeSourceAction.Modified, "target.bin"));
+            await source.EmitAsync(new(LocalChangeSourceAction.Modified, delete ? "source.bin" : "target.bin"));
             using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
             await WaitForLossPersistenceAsync(feed, timeout.Token);
         }

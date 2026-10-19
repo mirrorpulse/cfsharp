@@ -49,7 +49,7 @@ Pages own no reader or transaction and do not acknowledge operations or update i
 The legacy `ICloudOperationJournal` contract is unchanged: custom stores may opt into paging on
 their repository, preserving monotonic enqueue sequences and transactional read semantics.
 
-### Schema 7 recovery fence
+### Schema 8 recovery fence
 
 Schema 6 preserves the existing table layout and data while fencing directory object provenance,
 move preparation, and completion-receipt recovery. It includes schema 5's remote placeholder
@@ -57,7 +57,10 @@ creation and observation-reconciliation fence. Versions 0 through 5 upgrade in p
 item IDs, revisions, tombstones, journal sequences and payloads, suppressions, and checkpoints.
 Schema 7 additionally fences original remote-file-move preparations and feed observation recovery.
 Versions 0 through 6 upgrade in place without fabricating proof for legacy interrupted file moves.
-Older SQLite packages reject version 7 before accessing its recovery metadata. Do not downgrade
+Schema 8 adds sealed original remote-Delete inventories and per-member native/projection receipts,
+including pending observation fences. Versions 0 through 7 upgrade atomically without inventing
+ownership for legacy interrupted deletions; an absent original without proof remains unresolved.
+Older SQLite packages reject version 8 before accessing its recovery metadata. Do not downgrade
 the schema number manually. Back up state before upgrading and use matching core and SQLite packages.
 
 Custom stores must enforce the same protocol boundary when opening persistent state with older

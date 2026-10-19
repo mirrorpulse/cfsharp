@@ -8,7 +8,7 @@ namespace CfSharp;
 internal sealed record RemoteMoveIntent(
     Guid StoreScope, string RootPath, string BatchId, int EntryIndex, byte[] Fingerprint, string TargetRelativePath,
     bool PreserveContent, bool SuppressEcho, long EchoLifetimeTicks, int EchoObservations,
-    CloudItemState Original, RemoteMoveObject Object, IReadOnlyList<RemoteMoveObject> Parents,
+    CloudItemState Original, RemoteNamespaceObject Object, IReadOnlyList<RemoteNamespaceObject> Parents,
     long? ProjectedAtTicks, bool RequireInSync, byte[] LocalOperationsFingerprint, long? ProjectedUsn)
 {
     internal const string Prefix = "cfsharp/remote-move/v1/";
@@ -55,11 +55,11 @@ internal sealed record RemoteMoveIntent(
         }
 
         writer.Write(Original.UpdatedAt.UtcTicks);
-        WriteObject(writer, Object);
+        RemoteNamespaceEvidence.WriteObject(writer, Object);
         writer.Write(Parents.Count);
-        foreach (RemoteMoveObject parent in Parents)
+        foreach (RemoteNamespaceObject parent in Parents)
         {
-            WriteObject(writer, parent);
+            RemoteNamespaceEvidence.WriteObject(writer, parent);
         }
 
         writer.Write(ProjectedAtTicks.HasValue);
@@ -107,17 +107,17 @@ internal sealed record RemoteMoveIntent(
             long? localId = reader.ReadBoolean() ? reader.ReadInt64() : null;
             CloudItemState original = new(id, remote, path, CloudItemKind.File, revision, localId, false,
                 new DateTimeOffset(reader.ReadInt64(), TimeSpan.Zero));
-            RemoteMoveObject item = ReadObject(reader);
+            RemoteNamespaceObject item = RemoteNamespaceEvidence.ReadObject(reader);
             int count = reader.ReadInt32();
             if (count is < 1 or > 1024)
             {
                 throw new InvalidDataException("The remote move parent count is invalid.");
             }
 
-            List<RemoteMoveObject> parents = new(count);
+            List<RemoteNamespaceObject> parents = new(count);
             for (int parent = 0; parent < count; parent++)
             {
-                parents.Add(ReadObject(reader));
+                parents.Add(RemoteNamespaceEvidence.ReadObject(reader));
             }
 
             long? projected = reader.ReadBoolean() ? reader.ReadInt64() : null;
@@ -140,55 +140,7 @@ internal sealed record RemoteMoveIntent(
         }
     }
 
-    private static void WriteObject(BinaryWriter writer, RemoteMoveObject item)
-    {
-        WriteText(writer, item.RelativePath);
-        writer.Write(item.Binding.VolumeSerialNumber);
-        writer.Write(item.Binding.SyncRootFileId.ToByteArray());
-        writer.Write(item.Binding.LocalFileId.ToByteArray());
-        writer.Write(item.Identity.Length);
-        writer.Write(item.Identity);
-        writer.Write(item.CreationTime);
-        writer.Write(item.LastWriteTime);
-        writer.Write(item.Length);
-    }
-
-    private static RemoteMoveObject ReadObject(BinaryReader reader)
-    {
-        string path = ReadText(reader);
-        if (path.Length != 0)
-        {
-            path = CloudRemotePathValidation.Canonicalize(path, "path");
-        }
-
-        CloudLocalFileBinding binding = new(reader.ReadUInt64(), CloudDirectoryEvidenceCodec.ReadGuid(reader),
-            CloudDirectoryEvidenceCodec.ReadGuid(reader));
-        byte[] identity = CloudDirectoryEvidenceCodec.ReadBytes(reader, SyncRootRegistrationOptions.MaxFileIdentityLength);
-        return new(path, binding, identity, reader.ReadInt64(), reader.ReadInt64(), reader.ReadInt64());
-    }
-
     private static void WriteText(BinaryWriter writer, string value) => CloudDirectoryEvidenceCodec.WriteText(writer, value);
     private static string ReadText(BinaryReader reader) => CloudDirectoryEvidenceCodec.ReadText(reader);
 
-    internal static byte[] FingerprintOperations(IReadOnlyList<CloudOperationJournalEntry> operations)
-    {
-        using MemoryStream stream = new();
-        using BinaryWriter writer = new(stream);
-        foreach (CloudOperationJournalEntry operation in operations.OrderBy(operation => operation.OperationId))
-        {
-            writer.Write(operation.OperationId.ToByteArray());
-            writer.Write((int)operation.Kind);
-            writer.Write(operation.Sequence);
-            writer.Write(operation.CreatedAt.UtcTicks);
-            writer.Write(operation.Payload.Length);
-            writer.Write(operation.Payload.Span);
-        }
-
-        return SHA256.HashData(stream.ToArray());
-    }
 }
-
-internal sealed record RemoteMoveObject(string RelativePath, CloudLocalFileBinding Binding, byte[] Identity,
-    long CreationTime, long LastWriteTime, long Length);
-
-internal sealed record RemoteMoveRequest(CloudRemoteChangeBatch Batch, int EntryIndex, CloudRemoteApplyOptions Options);

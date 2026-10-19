@@ -7,6 +7,93 @@ namespace CfSharp.Native.Tests;
 
 public sealed class WindowsFileMetadataTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.16299")]
+    public void AttributeOnlyHandleCanDelayAnAcceptedDeletion(bool directory)
+    {
+        string area = Path.Combine(Path.GetTempPath(), "CfSharp-delete-attributes", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(area);
+        string path = Path.Combine(area, "original");
+        try
+        {
+            if (directory) { Directory.CreateDirectory(path); }
+            else { File.WriteAllText(path, "original"); }
+            using (var query = WindowsFileMetadata.Open(path))
+            {
+                using (var deletion = WindowsFileMetadata.OpenForDelete(path))
+                {
+                    WindowsFileMetadata.Delete(deletion.DangerousGetHandle());
+                }
+
+                Assert.True(WindowsFileMetadata.Read(query.DangerousGetHandle()).DeletePending);
+                Assert.Equal(5, Assert.Throws<Win32Exception>(() => WindowsFileMetadata.Open(path)).NativeErrorCode);
+            }
+            Assert.False(File.Exists(path) || Directory.Exists(path));
+        }
+        finally
+        {
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void DeleteGuardRejectsReadersEvenWhenTheyShareDelete()
+    {
+        string area = Path.Combine(Path.GetTempPath(), "CfSharp-delete-reader", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(area);
+        string path = Path.Combine(area, "original");
+        File.WriteAllText(path, "original");
+        try
+        {
+            using (FileStream reader = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                Win32Exception failure = Assert.Throws<Win32Exception>(() => WindowsFileMetadata.OpenForDelete(path));
+                Assert.Equal(32, failure.NativeErrorCode);
+                Assert.Equal("original", File.ReadAllText(path));
+            }
+
+            using var guard = WindowsFileMetadata.OpenForDelete(path);
+            Assert.Throws<IOException>(() => File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        }
+        finally
+        {
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.16299")]
+    public void DeleteUsesTheGuardedObjectAndCompletesAfterHandleClose(bool directory)
+    {
+        Assert.Equal(1, Marshal.SizeOf<WindowsFileMetadata.FileDispositionInformation>());
+        string area = Path.Combine(Path.GetTempPath(), "CfSharp-handle-delete", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(area);
+        string path = Path.Combine(area, "original");
+        try
+        {
+            if (directory) { Directory.CreateDirectory(path); }
+            else { File.WriteAllText(path, "original"); }
+            using (var handle = WindowsFileMetadata.OpenForDelete(path))
+            {
+                Assert.Throws<IOException>(() => { if (directory) { Directory.Move(path, path + ".moved"); } else { File.Move(path, path + ".moved"); } });
+                WindowsFileMetadata.Delete(handle.DangerousGetHandle());
+                Assert.True(WindowsFileMetadata.Read(handle.DangerousGetHandle()).DeletePending);
+            }
+
+            Assert.False(File.Exists(path) || Directory.Exists(path));
+            File.WriteAllText(path, "replacement");
+            Assert.Equal("replacement", File.ReadAllText(path));
+        }
+        finally
+        {
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
     [Fact]
     public void DirectoryGuardPreventsAncestorReplacementUntilReleased()
     {

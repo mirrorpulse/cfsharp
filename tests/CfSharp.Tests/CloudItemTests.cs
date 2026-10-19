@@ -5,6 +5,79 @@ namespace CfSharp.Tests;
 [SupportedOSPlatform("windows10.0.16299")]
 public sealed class CloudItemTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PathResolutionToleratesItemsDisappearingDuringLinkInspection(bool directory)
+    {
+        using TestDirectory root = new();
+        string active = Path.Combine(root.Path, "active");
+        string moved = Path.Combine(root.Path, "moved");
+        if (directory)
+        {
+            Directory.CreateDirectory(active);
+            await File.WriteAllTextAsync(Path.Combine(active, "item.txt"), "retained");
+        }
+        else
+        {
+            await File.WriteAllTextAsync(active, "retained");
+        }
+
+        using CancellationTokenSource cancellation = new();
+        using ManualResetEventSlim started = new();
+        Task mutation = Task.Run(() =>
+        {
+            started.Set();
+            while (!cancellation.IsCancellationRequested)
+            {
+                Move(active, moved);
+                Move(moved, active);
+            }
+        });
+        try
+        {
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)));
+            string relative = directory ? "active\\item.txt" : "active";
+            for (int iteration = 0; iteration < 512; iteration++)
+            {
+                CloudItemPath resolved = CloudItemPathResolver.Resolve(root.Path, relative, allowRoot: false);
+                Assert.Equal(Path.Combine(root.Path, relative), resolved.FullPath);
+                Assert.Equal(relative, resolved.RelativePath);
+            }
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            await mutation.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        Assert.Equal("retained", await File.ReadAllTextAsync(directory ? Path.Combine(active, "item.txt") : active));
+
+        void Move(string source, string destination)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    if (directory)
+                    {
+                        Directory.Move(source, destination);
+                    }
+                    else
+                    {
+                        File.Move(source, destination);
+                    }
+                    return;
+                }
+                catch (IOException exception) when (attempt < 1000 && (exception.HResult & 0xffff) is 5 or 32)
+                {
+                    // A transient query handle may reject this particular rename. Retry
+                    // that move without hiding exceptions from the resolver under test.
+                    Thread.Sleep(1);
+                }
+            }
+        }
+    }
+
     [Fact]
     public async Task InspectionReturnsFreshImmutableFileAndRootSnapshots()
     {

@@ -1,0 +1,1420 @@
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.Principal;
+using CfSharp.Storage.Sqlite;
+using Microsoft.Win32.SafeHandles;
+using Xunit.Abstractions;
+
+namespace CfSharp.IntegrationTests;
+
+[SupportedOSPlatform("windows10.0.16299")]
+public sealed partial class RemoteDeleteRecoveryTests
+{
+    private static readonly CloudRemoteApplyOptions DestructiveOptions = new() { PreserveUnsynchronizedLocalContent = false };
+    private readonly ITestOutputHelper _output;
+
+    public RemoteDeleteRecoveryTests(ITestOutputHelper output) => _output = output;
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task ReplayPreservesChangedAttributesWhenAnOpenWriterCoalescesTheUsn(bool directory, bool force)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        CloudRemoteApplyOptions options = force ? DestructiveOptions : new() { ConflictResolver = new KeepRemoteResolver() };
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        using (SafeFileHandle writer = CreateFile(path, 0x180, 7, 0, 3, 0x02200000, 0))
+        {
+            Assert.False(writer.IsInvalid);
+            SetNativeAttributes(writer, File.GetAttributes(path) | FileAttributes.Hidden);
+            root.Factory.Boundary = "prepare-after";
+            root.Factory.FailuresRemaining = 1;
+            Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options)).RequiresRetry);
+            Assert.Equal(1, root.Factory.FailuresObserved);
+            await root.RestartAsync();
+            RemoteDeleteIntent prepared;
+            await using (ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                prepared = RemoteDeleteIntent.Decode(Assert.Single(await capture.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            }
+            Assert.Equal((uint)File.GetAttributes(path), prepared.Members[0].Attributes);
+
+            SetNativeAttributes(writer, File.GetAttributes(path) | FileAttributes.System);
+            Assert.Equal(prepared.Members[0].Usn, ReadNativeUsn(writer));
+            CloudItemSnapshot snapshot = directory ? await root.FileSystem.GetDirectory(root.Target).InspectAsync() :
+                await root.FileSystem.GetFile(root.Target).InspectAsync();
+            Assert.Equal(CloudSynchronizationState.InSync, snapshot.SynchronizationState);
+            CloudRemoteApplyResult replay = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options);
+            Assert.True(replay.RequiresRetry);
+            Assert.Equal(0, replay.AppliedEntryCount);
+            Assert.Empty(replay.ConflictIds);
+            Assert.IsType<CloudRemoteDeleteRecoveryException>(Assert.Single(replay.Entries).Error);
+            Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+            await using ICloudStateTransaction retained = await root.Factory.Store!.BeginTransactionAsync();
+            Assert.Equal(prepared.Encode(), Assert.Single(await retained.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value.ToArray());
+            Assert.False((await retained.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+            Assert.Equal(0, (await retained.RemoteBatches.GetAsync(root.Batch.BatchId))!.AppliedEntryCount);
+        }
+
+        // Closing the writer must not complete an incorrectly accepted delete or allow the
+        // next replay to manufacture progress from the object's delayed disappearance.
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+        await root.RestartAsync();
+        CloudRemoteApplyResult afterClose = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, options);
+        Assert.True(afterClose.RequiresRetry);
+        Assert.Equal(0, afterClose.AppliedEntryCount);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden | FileAttributes.System));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData("none")]
+    [InlineData("prepare-after")]
+    [InlineData("projection")]
+    [InlineData("projection-after")]
+    public async Task KeepRemoteDeletesTheIdentifiedLocallyRenamedFileAndPreservesOldPathOccupants(string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        string originalPath = root.Target;
+        string currentPath = "Docs\\renamed.bin";
+        await using (CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed())
+        {
+            await feed.StartAsync();
+            File.Move(System.IO.Path.Combine(root.Path, originalPath), System.IO.Path.Combine(root.Path, currentPath));
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+            while (true)
+            {
+                await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync(deadline.Token))
+                {
+                    if ((await verify.Items.GetByItemIdAsync(root.ItemId, deadline.Token))?.RelativePath == currentPath &&
+                        (await verify.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue, deadline.Token)).Any(row => row.Kind == CloudStateOperationKind.Move))
+                    {
+                        break;
+                    }
+                }
+                await Task.Delay(25, deadline.Token);
+            }
+        }
+
+        await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, originalPath), "retain unrelated old path");
+        IReadOnlyList<CloudOperationJournalEntry> originalOperations;
+        await using (ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            originalOperations = await capture.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue);
+        }
+        CloudRemoteApplyResult conflict = await root.ApplyProtectedAsync();
+        Guid conflictId = Assert.Single(conflict.ConflictIds);
+        Assert.Equal(CloudRemoteConflictReason.Delete, (await root.FileSystem.GetRemoteConflictAsync(conflictId))!.Conflict.Reason);
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = boundary == "none" ? 0 : 1;
+        if (boundary != "none")
+        {
+            await Assert.ThrowsAsync<IOException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+                new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+            await root.RestartAsync();
+            await using ICloudStateTransaction prepared = await root.Factory.Store!.BeginTransactionAsync();
+            RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await prepared.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            Assert.Equal(currentPath, intent.Members[^1].Original!.RelativePath);
+        }
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, (await root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote))).Status);
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, currentPath)));
+        Assert.Equal("retain unrelated old path", await File.ReadAllTextAsync(System.IO.Path.Combine(root.Path, originalPath)));
+        Assert.Null(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState tombstone = (await completed.Items.GetByItemIdAsync(root.ItemId))!;
+        Assert.True(tombstone.IsTombstone);
+        Assert.Equal(currentPath, tombstone.RelativePath);
+        Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(originalOperations),
+            RemoteNamespaceEvidence.FingerprintOperations(await completed.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue)));
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task ReplayRechecksNativeMetadataAfterWaitingForTheStateTransaction(bool directory, bool preserveInSync)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, preserveInSync: preserveInSync);
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        await root.RestartAsync();
+
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        int mutations = 0;
+        root.Factory.BeforeBegin = async cancellationToken =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Only the exclusive native Delete handle rejects this data-access open. Wait
+            // until replay holds that handle, then emulate a store-gate wait while another
+            // process uses the attribute access that Windows exempts from sharing checks.
+            using (SafeFileHandle probe = CreateFile(path, 1, 7, 0, 3, 0x02200000, 0))
+            {
+                if (!probe.IsInvalid || Marshal.GetLastPInvokeError() != 32)
+                {
+                    return;
+                }
+            }
+            root.Factory.BeforeBegin = null;
+            await SetHiddenFromExternalProcessAsync(path);
+            mutations++;
+        };
+
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.Equal(1, mutations);
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(Assert.Single(replay.Entries).Error);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await root.RestartAsync();
+        Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+        Assert.All(intent.Members, member => Assert.Null(member.DeletedAtTicks));
+        Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await verify.Operations.ListByItemIdAsync(root.ItemId, int.MaxValue));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task LaterExternalDirectoryMetadataSurvivesPartialDelete(bool preserveInSync, bool restoreInSync)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true, children: true, preserveInSync: preserveInSync);
+        root.Factory.Boundary = "projection-after";
+        root.Factory.MemberCount = 2;
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        Assert.Equal(1, root.Factory.FailuresObserved);
+        await root.RestartAsync();
+
+        await using CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        await SetHiddenFromExternalProcessAsync(path);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        while (true)
+        {
+            await using (ICloudStateTransaction observed = await root.Factory.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                if ((await observed.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix, deadline.Token)).Count != 0)
+                {
+                    break;
+                }
+            }
+            await Task.Delay(25, deadline.Token);
+        }
+        Assert.Equal(CloudSynchronizationState.NotInSync, (await root.FileSystem.GetDirectory(root.Target).InspectAsync()).SynchronizationState);
+        if (restoreInSync)
+        {
+            await root.FileSystem.GetDirectory(root.Target).SetInSyncAsync(true);
+            Assert.Equal(CloudSynchronizationState.InSync, (await root.FileSystem.GetDirectory(root.Target).InspectAsync()).SynchronizationState);
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.True(Directory.Exists(path));
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+            Assert.All(intent.Members.Take(2), member => Assert.NotNull(member.ProjectedAtTicks));
+            Assert.Null(intent.Members[^1].DeletedAtTicks);
+            Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        }
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task AttributeQueryHandleRetainsNativeAcceptanceUntilNamespaceDisappears(bool directory, bool afterPreparation)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        if (afterPreparation)
+        {
+            root.Factory.Boundary = "prepare-after";
+            root.Factory.FailuresRemaining = 1;
+            Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+            await root.RestartAsync();
+        }
+
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        using (SafeFileHandle query = OpenAttributeQuery(path))
+        {
+            Assert.False(query.IsInvalid);
+            CloudRemoteApplyResult pending = await root.ApplyAuthorizedAsync();
+            Assert.True(pending.RequiresRetry);
+            Assert.Equal(0, pending.AppliedEntryCount);
+            Assert.Empty(pending.ConflictIds);
+            using (SafeFileHandle pendingOpen = OpenAttributeQuery(path))
+            {
+                Assert.True(pendingOpen.IsInvalid);
+                Assert.Equal(5, Marshal.GetLastPInvokeError());
+            }
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                Assert.NotNull(intent.Members[0].DeletedAtTicks);
+                Assert.Null(intent.Members[0].ProjectedAtTicks);
+                Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+            }
+
+            // Restart while the independent attribute-only handle still delays disappearance.
+            await root.RestartAsync();
+            Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+            await using CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
+            await feed.StartAsync();
+            Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        }
+
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Equal(1, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await completed.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false, "none", false)]
+    [InlineData(true, "none", false)]
+    [InlineData(false, "prepare-after", false)]
+    [InlineData(true, "prepare-after", false)]
+    [InlineData(false, "projection", false)]
+    [InlineData(true, "projection", false)]
+    [InlineData(false, "none", true)]
+    [InlineData(true, "none", true)]
+    [InlineData(false, "prepare-after", true)]
+    [InlineData(true, "prepare-after", true)]
+    [InlineData(false, "projection", true)]
+    [InlineData(true, "projection", true)]
+    public async Task ExplicitForceDeletesTrackedOrdinaryDescendantsAndRetainsTheirOriginalOperations(bool keepRemote, string boundary, bool directory)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
+        (CloudItemState child, IReadOnlyList<CloudOperationJournalEntry> operations) = await CreateTrackedOrdinaryChildAsync(root, directory);
+        Guid? conflictId = keepRemote ? Assert.Single((await root.ApplyProtectedAsync()).ConflictIds) : null;
+        if (keepRemote)
+        {
+            string path = System.IO.Path.Combine(root.Path, child.RelativePath);
+            Assert.True(directory ? Directory.Exists(path) : File.Exists(path));
+        }
+
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = boundary == "none" ? 0 : 1;
+        CloudRemoteApplyOptions force = new() { PreserveUnsynchronizedLocalContent = false };
+        if (boundary != "none")
+        {
+            if (keepRemote)
+            {
+                await Assert.ThrowsAsync<IOException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId!.Value,
+                    new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+            }
+            else
+            {
+                Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force)).RequiresRetry);
+            }
+
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                RemoteDeleteMember member = Assert.Single(intent.Members.Where(member => member.Original?.ItemId == child.ItemId));
+                Assert.Empty(member.Object.Identity);
+                Assert.Equal(child.RelativePath, member.Original!.RelativePath);
+                Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(operations), member.OperationsFingerprint);
+            }
+            await root.RestartAsync();
+        }
+
+        if (keepRemote)
+        {
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, (await root.FileSystem.ResolveRemoteConflictAsync(conflictId!.Value,
+                new(CloudRemoteConflictDecision.KeepRemote))).Status);
+            Assert.Null(await root.FileSystem.GetRemoteConflictAsync(conflictId.Value));
+        }
+        else
+        {
+            CloudRemoteApplyResult result = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force);
+            Assert.False(result.RequiresRetry, result.Entries[0].Error?.ToString());
+            Assert.Equal(1, result.AppliedEntryCount);
+            Assert.Empty(result.ConflictIds);
+        }
+
+        Assert.False(Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await completed.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        CloudItemState deletedChild = (await completed.Items.GetByItemIdAsync(child.ItemId))!;
+        Assert.True(deletedChild.IsTombstone);
+        Assert.Equal(child.RemoteId, deletedChild.RemoteId);
+        Assert.Equal(child.RelativePath, deletedChild.RelativePath);
+        Assert.Equal(child.RemoteRevision, deletedChild.RemoteRevision);
+        Assert.Equal(RemoteNamespaceEvidence.FingerprintOperations(operations),
+            RemoteNamespaceEvidence.FingerprintOperations(await completed.Operations.ListByItemIdAsync(child.ItemId, int.MaxValue)));
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ForcedTrackedOrdinaryDescendantRejectsReplacementOrLaterLocalWork(bool replace)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
+        (CloudItemState child, _) = await CreateTrackedOrdinaryChildAsync(root);
+        CloudRemoteApplyOptions force = new() { PreserveUnsynchronizedLocalContent = false };
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force)).RequiresRetry);
+        await root.RestartAsync();
+        string path = System.IO.Path.Combine(root.Path, child.RelativePath);
+        if (replace)
+        {
+            File.Move(path, System.IO.Path.Combine(root.Path, "retained-local.txt"));
+            await File.WriteAllTextAsync(path, "retain replacement");
+        }
+        else
+        {
+            await using ICloudStateTransaction mutate = await root.Factory.Store!.BeginTransactionAsync();
+            await mutate.Operations.EnqueueAsync(new(Guid.NewGuid(), CloudStateOperationKind.ContentUpdate,
+                child.ItemId, [99], DateTimeOffset.UtcNow));
+            await mutate.CommitAsync();
+        }
+
+        CloudRemoteApplyResult replay = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch, force);
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.Equal(replace ? "retain replacement" : "local content", await File.ReadAllTextAsync(path));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.False((await verify.Items.GetByItemIdAsync(child.ItemId))!.IsTombstone);
+        Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    private static async Task<(CloudItemState, IReadOnlyList<CloudOperationJournalEntry>)> CreateTrackedOrdinaryChildAsync(DeleteRoot root, bool directory = false)
+    {
+        string childPath = root.Target + (directory ? "\\local" : "\\local.txt");
+        await using (CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed())
+        {
+            await feed.StartAsync();
+            if (directory)
+            {
+                Directory.CreateDirectory(System.IO.Path.Combine(root.Path, childPath));
+            }
+            else
+            {
+                await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, childPath), "local content");
+            }
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(20));
+            while (!(await feed.ReadBatchAsync(timeout.Token)).Changes.Any(change => change.RelativePath == childPath))
+            {
+                await Task.Delay(25, timeout.Token);
+            }
+        }
+
+        CloudItemSnapshot snapshot = directory ? await root.FileSystem.GetDirectory(childPath).InspectAsync() :
+            await root.FileSystem.GetFile(childPath).InspectAsync();
+        Assert.False(snapshot.IsPlaceholder);
+        await using ICloudStateTransaction capture = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState child = Assert.IsType<CloudItemState>(await capture.Items.GetByRelativePathAsync(childPath));
+        IReadOnlyList<CloudOperationJournalEntry> operations = await capture.Operations.ListByItemIdAsync(child.ItemId, int.MaxValue);
+        Assert.NotEmpty(operations);
+        return (child, operations);
+    }
+
+    [Theory]
+    [InlineData(false, "none")]
+    [InlineData(true, "none")]
+    [InlineData(false, "prepare-after")]
+    [InlineData(true, "prepare-after")]
+    [InlineData(false, "outcome")]
+    [InlineData(true, "outcome")]
+    public async Task OriginalDurablePathCasingSurvivesNativeDeletionAndRecovery(bool directory, string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, alternateCasing: true);
+        if (boundary != "none")
+        {
+            root.Factory.Boundary = boundary;
+            root.Factory.FailuresRemaining = 1;
+            if (boundary == "prepare-after")
+            {
+                Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+            }
+            else
+            {
+                await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+            }
+
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync())
+            {
+                RemoteDeleteIntent intent = RemoteDeleteIntent.Decode(Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix)).Value);
+                Assert.Equal(root.Target, intent.Members[^1].Original!.RelativePath);
+                Assert.StartsWith("Docs\\", intent.Members[^1].Object.RelativePath, StringComparison.Ordinal);
+            }
+            await root.RestartAsync();
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Equal(1, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        Assert.Empty(replay.ConflictIds);
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)) || Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState state = (await completed.Items.GetByItemIdAsync(root.ItemId))!;
+        Assert.Equal(root.Target, state.RelativePath);
+        Assert.True(state.IsTombstone);
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SharedReaderDefersDeletionUntilItClosesWithoutLosingOriginalRecovery(bool prepared)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false, hydrated: true);
+        if (prepared)
+        {
+            root.Factory.Boundary = "prepare-after";
+            root.Factory.FailuresRemaining = 1;
+            Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+            await root.RestartAsync();
+        }
+
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await root.FileSystem.GetFile(root.Target).InspectAsync()).LocalBinding);
+        using (FileStream reader = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            CloudRemoteApplyResult blocked = await root.ApplyAuthorizedAsync();
+            Assert.True(blocked.RequiresRetry);
+            Assert.Equal(0, blocked.AppliedEntryCount);
+            Assert.Empty(blocked.ConflictIds);
+            Assert.NotNull(blocked.Entries[0].Error);
+            Assert.True(File.Exists(path));
+            Assert.Equal(binding, (await root.FileSystem.GetFile(root.Target).InspectAsync()).LocalBinding);
+            await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+            Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+            IReadOnlyList<CloudStateCheckpoint> checkpoints = await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix);
+            Assert.Equal(prepared ? 1 : 0, checkpoints.Count);
+            Assert.All(checkpoints, checkpoint => Assert.All(RemoteDeleteIntent.Decode(checkpoint.Value).Members,
+                member => Assert.Null(member.DeletedAtTicks)));
+        }
+
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Empty(replay.ConflictIds);
+        Assert.False(File.Exists(path));
+        await using ICloudStateTransaction completed = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await completed.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await completed.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task CompletedReceiptCannotPublishProgressThroughAReplacedParent()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        root.Factory.Boundary = "outcome";
+        root.Factory.FailuresRemaining = 1;
+        await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+        await root.RestartAsync();
+        Directory.Move(System.IO.Path.Combine(root.Path, "Docs"), System.IO.Path.Combine(root.Path, "Retained"));
+        Directory.CreateDirectory(System.IO.Path.Combine(root.Path, "Docs"));
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Empty(replay.ConflictIds);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task ExplicitKeepRemoteResolutionRetainsItsOwnDeleteRecoveryAfterProjectionFailure()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        await root.FileSystem.GetFile(root.Target).SetInSyncAsync(false);
+        CloudRemoteApplyResult conflict = await root.ApplyProtectedAsync();
+        Guid conflictId = Assert.Single(conflict.ConflictIds);
+        root.Factory.Boundary = "projection";
+        root.Factory.FailuresRemaining = 1;
+        await Assert.ThrowsAsync<IOException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+        await root.RestartAsync();
+        Assert.NotNull(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        CloudRemoteApplyEntryResult resolved = await root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote));
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, resolved.Status);
+        Assert.Null(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.True((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Empty(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task ExplicitKeepRemoteRetainsConflictAndReceiptWhenReplacementAppearsAtFinalTransaction()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        await root.FileSystem.GetFile(root.Target).SetInSyncAsync(false);
+        Guid conflictId = Assert.Single((await root.ApplyProtectedAsync()).ConflictIds);
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        bool replaced = false;
+        root.Factory.BeforeDeleteOutcome = () =>
+        {
+            File.WriteAllText(path, "retain replacement bytes");
+            replaced = true;
+        };
+
+        await Assert.ThrowsAsync<CloudRemoteDeleteRecoveryException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+        Assert.True(replaced);
+        Assert.Equal("retain replacement bytes", await File.ReadAllTextAsync(path));
+        Assert.NotNull(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        await root.RestartAsync();
+        await Assert.ThrowsAsync<CloudRemoteDeleteRecoveryException>(() => root.FileSystem.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote)).AsTask());
+        Assert.NotNull(await root.FileSystem.GetRemoteConflictAsync(conflictId));
+        Assert.Equal("retain replacement bytes", await File.ReadAllTextAsync(path));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        CloudStateCheckpoint checkpoint = Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.All(RemoteDeleteIntent.Decode(checkpoint.Value).Members, member => Assert.NotNull(member.ProjectedAtTicks));
+        Assert.True((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task InventoryBudgetFailurePrecedesAnyNativeDeletionEvenUnderExplicitForce()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true);
+        string directory = System.IO.Path.Combine(root.Path, root.Target);
+        for (int child = 0; child < RemoteDeleteIntent.MaximumMembers; child++)
+        {
+            await File.WriteAllTextAsync(System.IO.Path.Combine(directory, $"child-{child}.txt"), "retain");
+        }
+
+        CloudRemoteApplyResult result = await root.FileSystem.ApplyRemoteChangesAsync(root.Batch,
+            new() { PreserveUnsynchronizedLocalContent = false });
+        Assert.True(result.RequiresRetry);
+        Assert.Equal(0, result.AppliedEntryCount);
+        Assert.Equal(RemoteDeleteIntent.MaximumMembers, Directory.EnumerateFiles(directory).Count());
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.Empty(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+    }
+
+    [Theory]
+    [InlineData("dirty")]
+    [InlineData("pending")]
+    [InlineData("replacement")]
+    [InlineData("restored-timestamps")]
+    [InlineData("parent")]
+    [InlineData("policy")]
+    public async Task ChangedPreparedEvidenceRemainsUnresolvedAndPreservesTheOriginalPrefix(string scenario)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false, hydrated: scenario == "restored-timestamps");
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        await root.RestartAsync();
+        string path = System.IO.Path.Combine(root.Path, root.Target);
+        switch (scenario)
+        {
+            case "dirty":
+                await root.FileSystem.GetFile(root.Target).SetInSyncAsync(false);
+                break;
+            case "restored-timestamps":
+                DateTime originalTime = File.GetLastWriteTimeUtc(path);
+                CloudItemSnapshot originalObject = await root.FileSystem.GetFile(root.Target).InspectAsync();
+                await using (FileStream writer = new(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    byte[] changedBytes = new byte[512];
+                    changedBytes[0] = 88;
+                    await writer.WriteAsync(changedBytes);
+                }
+                File.SetLastWriteTimeUtc(path, originalTime);
+                await root.FileSystem.GetFile(root.Target).SetInSyncAsync(true);
+                CloudItemSnapshot changedObject = await root.FileSystem.GetFile(root.Target).InspectAsync();
+                Assert.Equal(originalObject.LocalBinding, changedObject.LocalBinding);
+                Assert.Equal(originalObject.PlaceholderIdentity.ToArray(), changedObject.PlaceholderIdentity.ToArray());
+                Assert.Equal(CloudSynchronizationState.InSync, changedObject.SynchronizationState);
+                break;
+            case "pending":
+                await using (ICloudStateTransaction seed = await root.Factory.Store!.BeginTransactionAsync())
+                {
+                    await seed.Operations.EnqueueAsync(new(Guid.NewGuid(), CloudStateOperationKind.ContentUpdate, root.ItemId, [5], DateTimeOffset.UtcNow));
+                    await seed.CommitAsync();
+                }
+                break;
+            case "replacement":
+                File.Move(path, path + ".original");
+                await File.WriteAllTextAsync(path, "retain replacement");
+                break;
+            case "parent":
+                Directory.Move(System.IO.Path.Combine(root.Path, "Docs"), System.IO.Path.Combine(root.Path, "Retained"));
+                Directory.CreateDirectory(System.IO.Path.Combine(root.Path, "Docs"));
+                await File.WriteAllTextAsync(path, "retain new parent");
+                break;
+            case "policy":
+                await Assert.ThrowsAsync<InvalidDataException>(() => root.FileSystem.ApplyRemoteChangesAsync(root.Batch,
+                    CloudRemoteApplyOptions.Default).AsTask());
+                break;
+        }
+
+        if (scenario != "policy")
+        {
+            CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+            Assert.True(replay.RequiresRetry);
+            Assert.Equal(0, replay.AppliedEntryCount);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Failed, replay.Entries[0].Status);
+            Assert.Empty(replay.ConflictIds);
+        }
+
+        Assert.True(File.Exists(path));
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, (await verify.RemoteBatches.GetAsync(root.Batch.BatchId))!.AppliedEntryCount);
+        Assert.Equal(scenario == "pending" ? 1 : 0, (await verify.Operations.ListAsync(100)).Count);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnotherOperationsTombstoneNeverCertifiesTheOriginalDelete(bool directory)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        if (directory) { await root.FileSystem.GetDirectory(root.Target).DeleteAsync(); }
+        else { await root.FileSystem.GetFile(root.Target).DeleteAsync(); }
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 1 }, replay.SafeCursor.ToArray());
+        Assert.Empty(replay.ConflictIds);
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.Empty(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal("v1", (await verify.Items.GetByItemIdAsync(root.ItemId))!.RemoteRevision);
+    }
+
+    [Theory]
+    [InlineData("stale")]
+    [InlineData("wrong-item")]
+    public async Task GenuineInitialConflictRemainsDurableAndPubliclyDecoded(string scenario)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        CloudRemoteChange original = root.Batch.Changes[0];
+        CloudRemoteChange changed = new(original.ChangeId, original.Kind, original.RemoteId, original.RemoteRevision,
+            original.ItemKind, original.RelativePath, scenario == "wrong-item" ? Guid.NewGuid() : original.ItemId,
+            previousRemoteRevision: scenario == "stale" ? "v0" : "v1");
+        root.UseBatch(new(root.Batch.BatchId, root.Batch.InitialCursor, [changed], root.Batch.FinalCursor));
+        CloudRemoteApplyResult result = await root.ApplyAuthorizedAsync();
+        Assert.False(result.RequiresRetry);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, result.Entries[0].Status);
+        CloudRemoteConflictReason reason = scenario == "stale" ? CloudRemoteConflictReason.StaleRemoteRevision : CloudRemoteConflictReason.MissingItem;
+        Assert.Equal(reason, result.Entries[0].Conflict!.Reason);
+        Assert.True(File.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await root.RestartAsync();
+        CloudRemoteConflictRecord record = (await root.FileSystem.GetRemoteConflictAsync(result.ConflictIds[0]))!;
+        Assert.NotNull(record);
+        Assert.Equal(reason, record.Conflict.Reason);
+        Assert.Equal(changed.ChangeId, record.Conflict.Change.ChangeId);
+    }
+
+    [Theory]
+    [InlineData("prepare-after")]
+    [InlineData("native-after")]
+    [InlineData("projection-after")]
+    public async Task CancellationAfterCommitRetainsOriginalRecoveryEvidence(string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        using CancellationTokenSource cancellation = new();
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = 1;
+        root.Factory.Cancel = cancellation.Cancel;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => root.FileSystem.ApplyRemoteChangesAsync(root.Batch,
+            DestructiveOptions, cancellation.Token).AsTask());
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task ChangedFingerprintCannotConsumeOriginalPreparation()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        root.Factory.Boundary = "prepare-after";
+        root.Factory.FailuresRemaining = 1;
+        await root.ApplyAuthorizedAsync();
+        await root.RestartAsync();
+        CloudRemoteChangeBatch changed = new(root.Batch.BatchId, root.Batch.InitialCursor, root.Batch.Changes, new byte[] { 10 });
+        await Assert.ThrowsAsync<ArgumentException>(() => root.FileSystem.ApplyRemoteChangesAsync(changed).AsTask());
+        Assert.True(File.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        Assert.False((await root.ApplyAuthorizedAsync()).RequiresRetry);
+    }
+
+    [Fact]
+    public async Task MultiEntryFailureRetainsItsSafePrefixAndStopsTheSuffix()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        CloudRemoteChange first = new("first", CloudRemoteChangeKind.FileUpsert, "first", "v1", CloudItemKind.File,
+            "first.bin", length: 512, metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build(), cursorAfter: new byte[] { 2 });
+        CloudRemoteChange last = new("last", CloudRemoteChangeKind.FileUpsert, "last", "v1", CloudItemKind.File,
+            "last.bin", length: 512, metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
+        root.UseBatch(new(root.Batch.BatchId, root.Batch.InitialCursor, [first, root.Batch.Changes[0], last], root.Batch.FinalCursor));
+        root.Factory.Boundary = "outcome";
+        root.Factory.OutcomeCount = 2;
+        root.Factory.FailuresRemaining = 2;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+            await root.RestartAsync();
+            Assert.False(File.Exists(System.IO.Path.Combine(root.Path, "last.bin")));
+            await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+            CloudRemoteBatchState state = (await verify.RemoteBatches.GetAsync(root.Batch.BatchId))!;
+            Assert.Equal(1, state.AppliedEntryCount);
+            Assert.Equal(new byte[] { 2 }, state.Cursor.ToArray());
+            Assert.Equal("first", state.LastAppliedChangeId);
+        }
+
+        CloudRemoteApplyResult result = await root.ApplyAuthorizedAsync();
+        Assert.False(result.RequiresRetry, result.Entries[1].Error?.ToString());
+        Assert.Empty(result.ConflictIds);
+        Assert.Equal(3, result.AppliedEntryCount);
+        Assert.True(File.Exists(System.IO.Path.Combine(root.Path, "last.bin")));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Fact]
+    public async Task PendingDeleteFencesScansAndRetainsReplacementObservationsAfterEchoExpiry()
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        root.Factory.Boundary = "outcome";
+        root.Factory.FailuresRemaining = 1;
+        await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+        await root.RestartAsync();
+        CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeFullRescanAsync().AsTask());
+        await using (ICloudStateTransaction expire = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            foreach (CloudEchoSuppressionState suppression in await expire.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow))
+            {
+                await expire.EchoSuppressions.RemoveAsync(suppression.SuppressionId);
+            }
+
+            await expire.CommitAsync();
+        }
+
+        await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, root.Target), "retain later local edit");
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(5));
+        Assert.True((await feed.ReadBatchAsync(deadline.Token)).RequiresFullRescan);
+        bool retainedObservation = false;
+        while (!retainedObservation)
+        {
+            await using (ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                retainedObservation = (await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix, deadline.Token)).Count != 0;
+            }
+            if (!retainedObservation)
+            {
+                await Task.Delay(25, deadline.Token);
+            }
+        }
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.Equal("retain later local edit", await File.ReadAllTextAsync(System.IO.Path.Combine(root.Path, root.Target)));
+        File.Move(System.IO.Path.Combine(root.Path, root.Target), System.IO.Path.Combine(root.Path, "retained.bin"));
+        Assert.False((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+    }
+
+    [Theory]
+    [InlineData(false, "prepare-before")]
+    [InlineData(true, "prepare-before")]
+    [InlineData(false, "prepare-after")]
+    [InlineData(true, "prepare-after")]
+    [InlineData(false, "native-before")]
+    [InlineData(true, "native-before")]
+    [InlineData(false, "native-after")]
+    [InlineData(true, "native-after")]
+    [InlineData(false, "projection-before")]
+    [InlineData(true, "projection-before")]
+    [InlineData(false, "projection-after")]
+    [InlineData(true, "projection-after")]
+    [InlineData(false, "outcome-before")]
+    [InlineData(true, "outcome-before")]
+    [InlineData(false, "outcome-after")]
+    [InlineData(true, "outcome-after")]
+    public async Task RealProcessKillPreservesOnlyProvenNativeAndDurableCompletion(bool directory, string boundary)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        await root.FileSystem.DisposeAsync();
+        System.Diagnostics.ProcessStartInfo start = new("dotnet") { UseShellExecute = false, CreateNoWindow = true };
+        string configuration = typeof(RemoteDeleteRecoveryTests).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
+            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
+        string harness = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory,
+            "../../../../CfSharp.Storage.Sqlite.CrashHarness/bin", configuration, "net10.0-windows/CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        Assert.True(File.Exists(harness));
+        foreach (string argument in new[] { harness, root.Database, root.Path, directory ? "directory" : "file", root.ItemId.ToString(), "delete-" + boundary })
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        using System.Diagnostics.Process child = System.Diagnostics.Process.Start(start)!;
+        try
+        {
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+            while (!File.Exists(root.Database + ".delete-ready") && !child.HasExited && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(50);
+            }
+
+            Assert.True(File.Exists(root.Database + ".delete-ready"), "The child did not reach the requested native/store cut point.");
+            Assert.False(child.HasExited);
+        }
+        finally
+        {
+            if (!child.HasExited)
+            {
+                child.Kill(entireProcessTree: true);
+            }
+
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(boundary == "native-before", replay.RequiresRetry);
+        if (boundary == "native-before")
+        {
+            Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+            Assert.Equal(0, replay.AppliedEntryCount);
+        }
+        else
+        {
+            Assert.Equal(1, replay.AppliedEntryCount);
+            Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        }
+
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false, "outcome")]
+    [InlineData(true, "outcome")]
+    [InlineData(false, "projection")]
+    [InlineData(true, "projection")]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    [InlineData(false, "prepare-after")]
+    [InlineData(true, "prepare-after")]
+    [InlineData(false, "native-after")]
+    [InlineData(true, "native-after")]
+    [InlineData(false, "projection-after")]
+    [InlineData(true, "projection-after")]
+    [InlineData(false, "outcome-after")]
+    [InlineData(true, "outcome-after")]
+    public async Task OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen(bool directory, string boundary)
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        bool administrator = new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+        string architecture = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString();
+        _output.WriteLine($"Native producer: architecture={architecture}; OS={Environment.OSVersion.VersionString}; SID={identity.User?.Value}; administrator={administrator}.");
+        if (Environment.GetEnvironmentVariable("CFSHARP_EXPECTED_TEST_SID") is string expectedSid)
+        {
+            Assert.Equal(expectedSid, identity.User?.Value);
+            Assert.False(administrator);
+            Assert.Equal(Environment.GetEnvironmentVariable("CFSHARP_EXPECTED_TEST_ARCHITECTURE"), architecture, ignoreCase: true);
+        }
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        root.Factory.Boundary = boundary;
+        root.Factory.FailuresRemaining = 1;
+        if (boundary.StartsWith("outcome", StringComparison.Ordinal))
+        {
+            Assert.Same(root.Factory.Error, await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync));
+        }
+        else
+        {
+            CloudRemoteApplyResult failed = await root.ApplyAuthorizedAsync();
+            Assert.True(failed.RequiresRetry);
+            Assert.Equal(0, failed.AppliedEntryCount);
+            Assert.Equal(new byte[] { 1 }, failed.SafeCursor.ToArray());
+            Assert.Same(root.Factory.Error, failed.Entries[0].Error);
+        }
+
+        Assert.Equal(1, root.Factory.FailuresObserved);
+        bool preparedOnly = boundary.StartsWith("prepare", StringComparison.Ordinal);
+        bool projected = boundary.StartsWith("outcome", StringComparison.Ordinal) || boundary == "projection-after";
+        Assert.Equal(preparedOnly, File.Exists(System.IO.Path.Combine(root.Path, root.Target)) ||
+            Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await using (ICloudStateTransaction interrupted = await root.Factory.Store!.BeginTransactionAsync())
+        {
+            CloudItemState interruptedItem = (await interrupted.Items.GetByItemIdAsync(root.ItemId))!;
+            Assert.Equal(projected, interruptedItem.IsTombstone);
+            Assert.Equal(projected ? "v2" : "v1", interruptedItem.RemoteRevision);
+            CloudRemoteBatchState progress = (await interrupted.RemoteBatches.GetAsync(root.Batch.BatchId))!;
+            Assert.Equal(boundary == "outcome-after" ? 1 : 0, progress.AppliedEntryCount);
+            Assert.Equal(root.Batch.Fingerprint.ToArray(), progress.Fingerprint.ToArray());
+            Assert.Empty(await interrupted.Conflicts.ListAsync());
+        }
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(1, replay.AppliedEntryCount);
+        Assert.Equal(new byte[] { 9 }, replay.SafeCursor.ToArray());
+        Assert.Equal(boundary == "outcome-after" ? CloudRemoteApplyEntryStatus.AlreadyApplied : CloudRemoteApplyEntryStatus.Applied,
+            replay.Entries[0].Status);
+        Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)) || Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        await root.RestartAsync();
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, (await root.ApplyAuthorizedAsync()).Entries[0].Status);
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        CloudItemState item = (await verify.Items.GetByItemIdAsync(root.ItemId))!;
+        Assert.True(item.IsTombstone);
+        Assert.Equal("v2", item.RemoteRevision);
+        Assert.Empty(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Empty(await verify.Conflicts.ListAsync());
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LostNativeReceiptDoesNotCertifyAnAbsentOriginalObject(bool directory)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory);
+        root.Factory.Boundary = "native";
+        root.Factory.FailuresRemaining = 1;
+        Assert.True((await root.ApplyAuthorizedAsync()).RequiresRetry);
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(replay.RequiresRetry);
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(0, replay.AppliedEntryCount);
+        CloudRemoteDeleteRecoveryException error = Assert.IsType<CloudRemoteDeleteRecoveryException>(replay.Entries[0].Error);
+        Assert.Equal(root.Batch.BatchId, error.BatchId);
+        Assert.Equal(root.Batch.Changes[0].ChangeId, error.ChangeId);
+        Assert.Equal(0, error.EntryIndex);
+        Assert.Equal(new byte[] { 1 }, replay.SafeCursor.ToArray());
+        await using ICloudStateTransaction verify = await root.Factory.Store!.BeginTransactionAsync();
+        Assert.False((await verify.Items.GetByItemIdAsync(root.ItemId))!.IsTombstone);
+        Assert.Single(await verify.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task EqualOrOmittedPreviousRevisionStillRequiresOriginalOwnership(bool directory, bool omitPrevious)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, equalRevisions: true, omitPrevious: omitPrevious);
+        root.Factory.Boundary = "outcome";
+        root.Factory.FailuresRemaining = 1;
+        await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+        await root.RestartAsync();
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReplacementSurvivesOriginalCompletionWithoutAnotherNativeDelete(bool placeholder)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(false);
+        root.Factory.Boundary = "outcome";
+        root.Factory.FailuresRemaining = 1;
+        await Assert.ThrowsAsync<IOException>(root.ApplyAuthorizedAsync);
+        await root.RestartAsync();
+        string replacement = System.IO.Path.Combine(root.Path, root.Target);
+        if (placeholder)
+        {
+            // A different native object even with copied opaque identity is not the original.
+            await root.FileSystem.GetDirectory("Docs").CreatePlaceholderAsync(
+                CloudFilePlaceholderSpec.CreateBuilder("remote.bin", root.Identity, 512).WithInSyncState(true).Build());
+        }
+        else
+        {
+            await File.WriteAllTextAsync(replacement, "retain replacement bytes");
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.True(File.Exists(replacement));
+        if (!placeholder)
+        {
+            Assert.Equal("retain replacement bytes", await File.ReadAllTextAsync(replacement));
+        }
+
+        Assert.True(replay.RequiresRetry); // The replacement generation must be reconciled before releasing its pending scope.
+
+        Assert.Empty(replay.ConflictIds);
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    [Theory]
+    [InlineData("new-child", true)]
+    [InlineData("complete", true)]
+    [InlineData("new-child", false)]
+    [InlineData("complete", false)]
+    public async Task PartialTreeUsesItsSealedInventoryAndPreservesNewChildren(string scenario, bool preserveInSync)
+    {
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(true, children: true, preserveInSync: preserveInSync);
+        root.Factory.Boundary = "projection";
+        root.Factory.MemberCount = 2;
+        root.Factory.FailuresRemaining = 1;
+        CloudRemoteApplyResult interrupted = await root.ApplyAuthorizedAsync();
+        Assert.True(interrupted.RequiresRetry);
+        Assert.Equal(1, root.Factory.FailuresObserved);
+        await root.RestartAsync();
+        string added = System.IO.Path.Combine(root.Path, root.Target, "new.txt");
+        if (scenario == "new-child")
+        {
+            await File.WriteAllTextAsync(added, "retain new child");
+        }
+
+        CloudRemoteApplyResult replay = await root.ApplyAuthorizedAsync();
+        Assert.Empty(replay.ConflictIds);
+        if (scenario == "new-child")
+        {
+            Assert.True(replay.RequiresRetry);
+            Assert.Equal(0, replay.AppliedEntryCount);
+            Assert.Equal("retain new child", await File.ReadAllTextAsync(added));
+        }
+        else
+        {
+            Assert.False(replay.RequiresRetry, replay.Entries[0].Error?.ToString());
+            Assert.False(Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
+        }
+
+        Assert.Equal(0, root.Provider.Reads);
+    }
+
+    private async Task SetHiddenFromExternalProcessAsync(string path)
+    {
+        System.Diagnostics.ProcessStartInfo start = new("dotnet")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        string configuration = typeof(RemoteDeleteRecoveryTests).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyConfigurationAttribute), false)
+            .Cast<System.Reflection.AssemblyConfigurationAttribute>().Single().Configuration;
+        string harness = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory,
+            "../../../../CfSharp.Storage.Sqlite.CrashHarness/bin", configuration, "net10.0-windows/CfSharp.Storage.Sqlite.CrashHarness.dll"));
+        start.ArgumentList.Add(harness);
+        start.ArgumentList.Add("delete-directory-hidden");
+        start.ArgumentList.Add(path);
+        using System.Diagnostics.Process external = System.Diagnostics.Process.Start(start)!;
+        await external.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        _output.WriteLine(await external.StandardOutput.ReadToEndAsync());
+        _output.WriteLine(await external.StandardError.ReadToEndAsync());
+        Assert.Equal(0, external.ExitCode);
+    }
+
+    // Attribute-only access is intentionally outside Windows data-sharing exclusion.
+    private static SafeFileHandle OpenAttributeQuery(string path) => CreateFile(path, 0x80, 7, 0, 3, 0x02200000, 0);
+
+    private static void SetNativeAttributes(SafeFileHandle handle, FileAttributes attributes)
+    {
+        DeleteTestBasicInfo basic = new() { Attributes = (uint)attributes };
+        Assert.Equal(40, Marshal.SizeOf<DeleteTestBasicInfo>());
+        Assert.True(SetFileInformationByHandle(handle, 0, ref basic, 40), new System.ComponentModel.Win32Exception(Marshal.GetLastPInvokeError()).Message);
+    }
+
+    private static unsafe long ReadNativeUsn(SafeFileHandle handle)
+    {
+        uint versions = 0x00030002;
+        byte[] record = new byte[4096];
+        fixed (byte* buffer = record)
+        {
+            Assert.True(DeviceIoControl(handle, 0x000900eb, &versions, sizeof(uint), buffer, (uint)record.Length, out uint returned, 0));
+            Assert.InRange(returned, 60u, (uint)record.Length);
+        }
+        int offset = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(4)) switch
+        {
+            2 => 24,
+            3 => 40,
+            _ => throw new InvalidDataException("Unexpected native USN record version."),
+        };
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(offset));
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DeleteTestBasicInfo
+    {
+        internal long CreationTime;
+        internal long LastAccessTime;
+        internal long LastWriteTime;
+        internal long ChangeTime;
+        internal uint Attributes;
+    }
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, ref DeleteTestBasicInfo value, uint size);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static unsafe partial bool DeviceIoControl(SafeFileHandle handle, uint code, void* input, uint inputSize,
+        void* output, uint outputSize, out uint returned, nint overlapped);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial SafeFileHandle CreateFile(string path, uint access, uint share, nint security, uint disposition, uint flags, nint template);
+
+    private sealed class DeleteRoot(string area, CloudFileSystem fileSystem, DeleteFactory factory,
+        RejectingProvider provider, CloudPlaceholderIdentity identity, CloudRemoteChangeBatch batch, string target) : IAsyncDisposable
+    {
+        internal CloudFileSystem FileSystem => fileSystem;
+        internal string Path => fileSystem.SyncRootPath;
+        internal string Database => System.IO.Path.Combine(area, "state.db");
+        internal DeleteFactory Factory => factory;
+        internal RejectingProvider Provider => provider;
+        internal CloudPlaceholderIdentity Identity => identity;
+        internal Guid ItemId => identity.ItemId;
+        internal CloudRemoteChangeBatch Batch => batch;
+        internal void UseBatch(CloudRemoteChangeBatch value) => batch = value;
+        internal string Target => target;
+        internal Task<CloudRemoteApplyResult> ApplyAuthorizedAsync() => fileSystem.ApplyRemoteChangesAsync(batch, DestructiveOptions).AsTask();
+        internal Task<CloudRemoteApplyResult> ApplyProtectedAsync() => fileSystem.ApplyRemoteChangesAsync(batch).AsTask();
+
+        internal async Task RestartAsync()
+        {
+            string root = Path;
+            await fileSystem.DisposeAsync();
+            fileSystem = CloudFileSystem.CreateBuilder(root).WithStateStore(factory).WithContentProvider(provider).Build();
+            await fileSystem.StartAsync();
+        }
+
+        internal static async Task<DeleteRoot> OpenAsync(bool directory, bool equalRevisions = false, bool omitPrevious = false,
+            bool children = false, bool preserveInSync = true, bool hydrated = false, bool alternateCasing = false)
+        {
+            string area = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "CfSharp-remote-delete", Guid.NewGuid().ToString("N"));
+            string root = System.IO.Path.Combine(area, "root");
+            Directory.CreateDirectory(root);
+            DeleteFactory factory = new(new SqliteCloudStateStoreFactory(System.IO.Path.Combine(area, "state.db")));
+            RejectingProvider provider = new();
+            CloudFileSystem fileSystem = CloudFileSystem.CreateBuilder(root).WithStateStore(factory)
+                .WithRegistration(SyncRootRegistrationOptions.CreateBuilder("CfSharp Remote Delete Test", "1.0")
+                    .WithProviderId(Guid.NewGuid()).WithRootMarkedInSync()
+                    .WithInSyncPolicy(preserveInSync ? CloudInSyncPolicy.TrackAll | CloudInSyncPolicy.PreserveForSyncEngine : CloudInSyncPolicy.TrackAll)
+                    .Build()).WithContentProvider(provider).Build();
+            bool registered = false;
+            try
+            {
+                await fileSystem.StartAsync();
+                registered = true;
+                Directory.CreateDirectory(System.IO.Path.Combine(root, "Docs"));
+                CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "remote-file", "v1");
+                string parent = alternateCasing ? "docs" : "Docs";
+                string target = parent + (directory ? "\\remote" : "\\remote.bin");
+                if (directory)
+                {
+                    await fileSystem.GetDirectory(parent).CreatePlaceholderAsync(
+                        CloudDirectoryPlaceholderSpec.CreateBuilder("remote", identity).WithInSyncState(true)
+                            .WithPopulationState(CloudDirectoryPopulationState.Complete).Build());
+                    if (children)
+                    {
+                        for (int child = 0; child < 2; child++)
+                        {
+                            await fileSystem.GetDirectory(target).CreatePlaceholderAsync(CloudFilePlaceholderSpec.CreateBuilder(
+                                $"child{child}.bin", new CloudPlaceholderIdentity(Guid.NewGuid(), $"child{child}", "v1"), 512).WithInSyncState(true).Build());
+                        }
+
+                        await fileSystem.GetDirectory(target).SetInSyncAsync(true);
+                    }
+                }
+                else if (hydrated)
+                {
+                    await File.WriteAllBytesAsync(System.IO.Path.Combine(root, target), new byte[512]);
+                    await fileSystem.GetFile(target).ConvertToPlaceholderAsync(identity);
+                    await fileSystem.GetFile(target).SetInSyncAsync(true);
+                }
+                else
+                {
+                    await fileSystem.GetDirectory(parent).CreatePlaceholderAsync(
+                        CloudFilePlaceholderSpec.CreateBuilder("remote.bin", identity, 512).WithInSyncState(true).Build());
+                }
+
+                CloudRemoteChange delete = new("delete", CloudRemoteChangeKind.Delete, identity.RemoteId,
+                    equalRevisions ? "v1" : "v2", directory ? CloudItemKind.Directory : CloudItemKind.File, target, identity.ItemId,
+                    previousRemoteRevision: omitPrevious ? null : "v1");
+                CloudRemoteChangeBatch batch = new("stable-original-batch", new byte[] { 1 }, [delete], new byte[] { 9 });
+                return new(area, fileSystem, factory, provider, identity, batch, target);
+            }
+            catch
+            {
+                await fileSystem.DisposeAsync();
+                if (registered)
+                {
+                    CloudSyncRoot.Open(root).Unregister();
+                }
+
+                Directory.Delete(area, recursive: true);
+                throw;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await fileSystem.DisposeAsync();
+            CloudSyncRoot.Open(Path).Unregister();
+            Directory.Delete(area, recursive: true);
+        }
+    }
+
+    private sealed class RejectingProvider : ICloudFileContentProvider
+    {
+        internal int Reads { get; private set; }
+        public ValueTask<Stream> OpenReadAsync(CloudFileFetchRequest request, CancellationToken cancellationToken)
+        {
+            Reads++;
+            throw new InvalidOperationException("Remote Delete recovery must never hydrate content.");
+        }
+    }
+
+    private sealed class DeleteFactory(ICloudStateStoreFactory inner) : ICloudStateStoreFactory
+    {
+        internal ICloudStateStore? Store { get; private set; }
+        internal string Boundary { get; set; } = string.Empty;
+        internal int FailuresRemaining { get; set; }
+        internal int OutcomeCount { get; set; } = 1;
+        internal int MemberCount { get; set; } = 1;
+        internal Action? Cancel { get; set; }
+        internal Action? BeforeDeleteOutcome { get; set; }
+        internal Func<CancellationToken, ValueTask>? BeforeBegin { get; set; }
+        private Action? _beforeNextTransaction;
+        internal int FailuresObserved { get; private set; }
+        internal IOException Error { get; } = new("Synthetic remote Delete commit interruption.");
+
+        public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context, CancellationToken cancellationToken = default) =>
+            Store = new WrappedStore(await inner.OpenAsync(context, cancellationToken), this);
+
+        private sealed class WrappedStore(ICloudStateStore store, DeleteFactory owner) : ICloudStateStore
+        {
+            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+            {
+                if (owner.BeforeBegin is { } before)
+                {
+                    await before(cancellationToken);
+                }
+                ICloudStateTransaction transaction = await store.BeginTransactionAsync(cancellationToken);
+                // Inject only after the final transaction has acquired store isolation.
+                Action? mutation = owner._beforeNextTransaction;
+                owner._beforeNextTransaction = null;
+                try
+                {
+                    mutation?.Invoke();
+                    return new Transaction(transaction, owner);
+                }
+                catch
+                {
+                    await transaction.DisposeAsync();
+                    throw;
+                }
+            }
+            public ValueTask DisposeAsync() => store.DisposeAsync();
+        }
+
+        private sealed class Transaction(ICloudStateTransaction transaction, DeleteFactory owner) : ICloudStateTransaction
+        {
+            public ICloudItemStateRepository Items => transaction.Items;
+            public ICloudCheckpointRepository Checkpoints => transaction.Checkpoints;
+            public ICloudOperationJournal Operations => transaction.Operations;
+            public ICloudConflictRepository Conflicts => transaction.Conflicts;
+            public ICloudRemoteBatchRepository RemoteBatches => transaction.RemoteBatches;
+            public ICloudEchoSuppressionRepository EchoSuppressions => transaction.EchoSuppressions;
+
+            public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
+            {
+                bool completedProjection = owner.BeforeDeleteOutcome is not null &&
+                    (await Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken)).Any(checkpoint =>
+                        RemoteDeleteIntent.Decode(checkpoint.Value).Members.All(member => member.ProjectedAtTicks.HasValue));
+                bool inject = false;
+                if (owner.FailuresRemaining > 0)
+                {
+                    CloudRemoteBatchState? batch = await RemoteBatches.GetAsync("stable-original-batch", cancellationToken);
+                    IReadOnlyList<CloudStateCheckpoint> preparations = await Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken);
+                    bool prepared = preparations.Count != 0;
+                    RemoteDeleteIntent? intent = prepared ? RemoteDeleteIntent.Decode(preparations[0].Value) : null;
+                    bool projected = intent?.Members.Count(member => member.ProjectedAtTicks.HasValue) >= owner.MemberCount;
+                    bool native = intent?.Members.Count(member => member.DeletedAtTicks.HasValue) >= owner.MemberCount;
+                    inject = owner.Boundary.StartsWith("outcome", StringComparison.Ordinal) ? batch?.AppliedEntryCount == owner.OutcomeCount :
+                        owner.Boundary.StartsWith("projection", StringComparison.Ordinal) ? projected :
+                        owner.Boundary.StartsWith("native", StringComparison.Ordinal) ? native : prepared;
+                    if (inject)
+                    {
+                        owner.FailuresRemaining--;
+                        owner.FailuresObserved++;
+                    }
+                }
+
+                if (inject && owner.Cancel is not null)
+                {
+                    await transaction.CommitAsync(cancellationToken);
+                    owner.Cancel();
+                    return;
+                }
+
+                if (inject && !owner.Boundary.EndsWith("-after", StringComparison.Ordinal))
+                {
+                    throw owner.Error;
+                }
+
+                await transaction.CommitAsync(cancellationToken);
+                if (completedProjection)
+                {
+                    owner._beforeNextTransaction = owner.BeforeDeleteOutcome;
+                    owner.BeforeDeleteOutcome = null;
+                }
+                if (inject)
+                {
+                    throw owner.Error;
+                }
+            }
+
+            public ValueTask RollbackAsync(CancellationToken cancellationToken = default) => transaction.RollbackAsync(cancellationToken);
+            public ValueTask DisposeAsync() => transaction.DisposeAsync();
+        }
+    }
+}

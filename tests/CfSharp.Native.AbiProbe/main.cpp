@@ -25,6 +25,8 @@ int main()
               << "  \"fileStandardInfoDeleteOffset\": " << offsetof(FILE_STANDARD_INFO, DeletePending) << ",\n"
               << "  \"fileStandardInfoDirectoryOffset\": " << offsetof(FILE_STANDARD_INFO, Directory) << ",\n"
               << "  \"fileAttributeTagInfoSize\": " << sizeof(FILE_ATTRIBUTE_TAG_INFO) << ",\n"
+              << "  \"fileDispositionInfoSize\": " << sizeof(FILE_DISPOSITION_INFO) << ",\n"
+              << "  \"fileDispositionInfoDeleteOffset\": " << offsetof(FILE_DISPOSITION_INFO, DeleteFile) << ",\n"
               << "  \"fileRenameInfoSize\": " << sizeof(FILE_RENAME_INFO) << ",\n"
               << "  \"fileRenameInfoRootOffset\": " << offsetof(FILE_RENAME_INFO, RootDirectory) << ",\n"
               << "  \"fileRenameInfoLengthOffset\": " << offsetof(FILE_RENAME_INFO, FileNameLength) << ",\n"

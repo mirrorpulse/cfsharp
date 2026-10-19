@@ -153,6 +153,8 @@ public sealed partial class CloudLocalChangeFeed
             .ConfigureAwait(false)).Count != 0 ||
         (await transaction.Checkpoints.ListAsync(RemoteMoveIntent.Prefix, cancellationToken)
             .ConfigureAwait(false)).Count != 0 ||
+        (await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken)
+            .ConfigureAwait(false)).Count != 0 ||
         (await transaction.Checkpoints.ListAsync(RemoteCreationIntent.Prefix, cancellationToken)
             .ConfigureAwait(false)).Any(value => !RemoteCreationIntent.Decode(value.Value).Committed);
 }

@@ -77,6 +77,10 @@ jobs:
       - name: Test
         run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
 
+      - name: Verify Delete recovery as a fresh ordinary user
+        shell: pwsh
+        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release
+
       - name: Pack native bindings
         run: dotnet pack src/CfSharp.Native/CfSharp.Native.csproj --configuration Release --no-build --output artifacts/packages -p:Version=0.0.0-ci.${{ github.run_number }} -p:PackageVersion=0.0.0-ci.${{ github.run_number }}
 
@@ -115,6 +119,7 @@ jobs:
           path: |
             **/TestResults/**/*.trx
             **/TestResults/**/*.xml
+            artifacts/ordinary-user-delete/**
           if-no-files-found: ignore
 
       - name: Upload packages
@@ -171,6 +176,10 @@ jobs:
       - name: Test ARM64 solution
         run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
 
+      - name: Verify Delete recovery as a fresh ordinary ARM64 user
+        shell: pwsh
+        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release
+
       - name: Verify isolated package capabilities on ARM64
         shell: pwsh
         run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities
@@ -183,6 +192,7 @@ jobs:
           path: |
             **/TestResults/**/*.trx
             artifacts/runtime-boundaries/*/publish.log
+            artifacts/ordinary-user-delete/**
             artifacts/package-capabilities/*/manifest.json
             artifacts/package-capabilities/*/sbom.spdx.json
             artifacts/package-capabilities/*/release-notes.md

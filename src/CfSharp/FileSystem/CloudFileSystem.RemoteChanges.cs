@@ -33,8 +33,13 @@ public sealed partial class CloudFileSystem
     /// <remarks>
     /// Remote content bytes never enter this method. File upserts update placeholder length,
     /// metadata, identity, and revision while leaving hydration to the configured provider. A
-    /// durable batch record is written after each entry, so a process restart resumes from the
-    /// last committed entry without publishing an unsafe cursor.
+    /// Delete under the default preservation policy retains the object, including clean files
+    /// and empty directories, and records a durable conflict. Explicit KeepRemote resolution
+    /// or disabled preservation authorizes deletion without promising concurrent attribute
+    /// isolation. A durable conflict is a processed batch entry under the existing cursor
+    /// contract, not proof that its object was deleted. A durable batch record is written
+    /// after each entry, so a process restart resumes from the last committed entry without
+    /// publishing an unsafe cursor.
     /// File moves retain versioned original object, ancestry, batch, and apply-policy evidence
     /// before native mutation. Replay authenticates that evidence before checking previous
     /// revisions, including when both revisions are equal. Successful recovery reports
@@ -121,10 +126,10 @@ public sealed partial class CloudFileSystem
             cancellationToken.ThrowIfCancellationRequested();
             int index = progress.AppliedEntryCount;
             CloudRemoteChange change = batch.Changes[index];
-            RemoteMoveRequest moveRequest = new(batch, index, selectedOptions);
+            RemoteChangeRequest request = new(batch, index, selectedOptions);
             // Reject a mismatched pending preparation before changing any batch progress.
             RemoteMoveIntent? pendingMove = change.Kind == CloudRemoteChangeKind.Move && change.ItemKind == CloudItemKind.File
-                ? await ReadRemoteMoveIntentAsync(moveRequest, cancellationToken).ConfigureAwait(false)
+                ? await ReadRemoteMoveIntentAsync(request, cancellationToken).ConfigureAwait(false)
                 : null;
             RemoteEntryOutcome outcome;
             try
@@ -135,7 +140,7 @@ public sealed partial class CloudFileSystem
                         change,
                         selectedOptions,
                         cancellationToken,
-                        moveRequest)
+                        request)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -144,12 +149,20 @@ public sealed partial class CloudFileSystem
             }
             catch (Exception exception)
             {
-                progress = await PersistRemoteBatchFailureAsync(
-                        batch,
-                        progress,
-                        exception,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                try
+                {
+                    progress = await PersistRemoteBatchFailureAsync(
+                            batch,
+                            progress,
+                            exception,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception persistenceError)
+                {
+                    throw new AggregateException("Remote entry application and failure-state persistence both failed; retain the original batch.",
+                        exception, persistenceError);
+                }
                 results.Add(new CloudRemoteApplyEntryResult(
                     change.ChangeId,
                     CloudRemoteApplyEntryStatus.Failed,
@@ -221,6 +234,13 @@ public sealed partial class CloudFileSystem
     /// <param name="resolution">Explicit keep-local, keep-remote, keep-both, or defer decision.</param>
     /// <param name="cancellationToken">Token observed before durable and native work.</param>
     /// <returns>The resulting entry status. A deferred decision leaves the conflict durable.</returns>
+    /// <remarks>
+    /// KeepRemote explicitly authorizes destructive deletion, including an otherwise clean
+    /// object retained by default preservation. Native identity, sealed evidence and final
+    /// transaction checks still apply, but user-mode deletion does not exclude concurrent
+    /// external attribute writes. The conflict is removed only after validated completion.
+    /// Calls serialize on this file-system instance; no ownership of caller resources changes.
+    /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
     public async ValueTask<CloudRemoteApplyEntryResult> ResolveRemoteConflictAsync(
@@ -282,14 +302,19 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange retry = resolution.Decision is CloudRemoteConflictDecision.KeepBoth
             ? CreateConflictCopyChange(conflict.Change, resolution.KeepBothRelativePath!)
             : CreateForceApplyChange(conflict.Change);
+        CloudRemoteApplyOptions resolutionOptions = CloudRemoteApplyOptions.Default with
+        {
+            PreserveUnsynchronizedLocalContent = false,
+            ConflictResolver = null,
+        };
+        RemoteChangeRequest? deleteRequest = retry.Kind == CloudRemoteChangeKind.Delete
+            ? new(new CloudRemoteChangeBatch("cfsharp.resolve-delete/" + conflictId.ToString("N"), ReadOnlyMemory<byte>.Empty, [retry], ReadOnlyMemory<byte>.Empty), 0, resolutionOptions)
+            : null;
         RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(
                 retry,
-                CloudRemoteApplyOptions.Default with
-                {
-                    PreserveUnsynchronizedLocalContent = false,
-                    ConflictResolver = null,
-                },
-                cancellationToken)
+                resolutionOptions,
+                cancellationToken,
+                deleteRequest)
             .ConfigureAwait(false);
         if (outcome.Status is not CloudRemoteApplyEntryStatus.Applied)
         {
@@ -302,8 +327,20 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
+            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (deleteRequest is not null && deleteParents is not null)
+        {
+            await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+                .ConfigureAwait(false);
+        }
         await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
             .ConfigureAwait(false);
+        if (deleteRequest is not null)
+        {
+            await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
+        }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new CloudRemoteApplyEntryResult(
             conflict.Change.ChangeId,
@@ -342,6 +379,13 @@ public sealed partial class CloudFileSystem
                 batch.Changes[existing.AppliedEntryCount] is { Kind: CloudRemoteChangeKind.Move, ItemKind: CloudItemKind.File })
             {
                 await ReadRemoteMoveIntentCoreAsync(transaction, new(batch, existing.AppliedEntryCount, options), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (existing.AppliedEntryCount < batch.Changes.Count &&
+                batch.Changes[existing.AppliedEntryCount].Kind == CloudRemoteChangeKind.Delete)
+            {
+                await ReadRemoteDeleteIntentCoreAsync(transaction, new(batch, existing.AppliedEntryCount, options), cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -415,9 +459,9 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         CloudRemoteApplyOptions options,
         CancellationToken cancellationToken,
-        RemoteMoveRequest? moveRequest = null)
+        RemoteChangeRequest? request = null)
     {
-        RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(change, options, cancellationToken, moveRequest)
+        RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(change, options, cancellationToken, request)
             .ConfigureAwait(false);
         if (outcome.Conflict is null || options.ConflictResolver is null)
         {
@@ -452,7 +496,7 @@ public sealed partial class CloudFileSystem
                     ConflictResolver = null,
                 },
                 cancellationToken,
-                moveRequest)
+                request)
             .ConfigureAwait(false);
     }
 
@@ -460,8 +504,17 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         CloudRemoteApplyOptions options,
         CancellationToken cancellationToken,
-        RemoteMoveRequest? moveRequest = null)
+        RemoteChangeRequest? request = null)
     {
+        if (change.Kind == CloudRemoteChangeKind.Delete && request is not null)
+        {
+            RemoteDeleteIntent? pending = await ReadRemoteDeleteIntentAsync(request, cancellationToken).ConfigureAwait(false);
+            if (pending is not null)
+            {
+                return await CompleteRemoteDeleteAsync(request, pending, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
         {
             RemoteCreationIntent? pending = await ReadRemoteCreationIntentAsync(change, cancellationToken)
@@ -477,13 +530,13 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         if (change.Kind is CloudRemoteChangeKind.Move)
         {
-            return await ApplyRemoteMoveAsync(change, context, options, moveRequest, cancellationToken)
+            return await ApplyRemoteMoveAsync(change, context, options, request, cancellationToken)
                 .ConfigureAwait(false);
         }
 
         if (change.Kind is CloudRemoteChangeKind.Delete)
         {
-            return await ApplyRemoteDeleteAsync(change, context, options, cancellationToken)
+            return await ApplyRemoteDeleteAsync(change, context, options, request!, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -653,7 +706,7 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         RemoteEntryContext context,
         CloudRemoteApplyOptions options,
-        RemoteMoveRequest? moveRequest,
+        RemoteChangeRequest? request,
         CancellationToken cancellationToken)
     {
         CloudItemState? localState = context.LocalState;
@@ -734,9 +787,9 @@ public sealed partial class CloudFileSystem
         string destinationParentPath = Path.GetDirectoryName(change.RelativePath) ?? string.Empty;
         CloudDirectory destination = GetDirectory(destinationParentPath);
         string destinationName = Path.GetFileName(change.RelativePath);
-        if (moveRequest is not null && change.ItemKind == CloudItemKind.File)
+        if (request is not null && change.ItemKind == CloudItemKind.File)
         {
-            RemoteMoveIntent intent = await PrepareRemoteFileMoveAsync(change, localState, options, moveRequest,
+            RemoteMoveIntent intent = await PrepareRemoteFileMoveAsync(change, localState, options, request,
                 cancellationToken).ConfigureAwait(false);
             return await CompleteRemoteFileMoveAsync(change, intent, cancellationToken).ConfigureAwait(false);
         }
@@ -778,193 +831,6 @@ public sealed partial class CloudFileSystem
                 change.ItemKind,
                 change.RemoteRevision,
                 isTombstone: false,
-                cancellationToken)
-            .ConfigureAwait(false);
-        return RemoteEntryOutcome.AppliedResult;
-    }
-
-    private async ValueTask<RemoteEntryOutcome> ApplyRemoteDeleteAsync(
-        CloudRemoteChange change,
-        RemoteEntryContext context,
-        CloudRemoteApplyOptions options,
-        CancellationToken cancellationToken)
-    {
-        CloudItemState? localState = context.LocalState;
-        if (localState is null)
-        {
-            return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                change,
-                localState: null,
-                CloudRemoteConflictReason.MissingItem));
-        }
-
-        if (change.PreviousRemoteRevision is not null && !string.Equals(
-                localState.RemoteRevision,
-                change.PreviousRemoteRevision,
-                StringComparison.Ordinal))
-        {
-            return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                change,
-                localState,
-                CloudRemoteConflictReason.StaleRemoteRevision));
-        }
-
-        string fullPath = ToFullPath(localState.RelativePath);
-        bool exists = change.ItemKind is CloudItemKind.Directory
-            ? Directory.Exists(fullPath)
-            : File.Exists(fullPath);
-        if (localState.IsTombstone && !exists)
-        {
-            return RemoteEntryOutcome.AlreadyAppliedResult;
-        }
-
-        if (!exists)
-        {
-            if (options.PreserveUnsynchronizedLocalContent && context.LocalOperations.Count != 0)
-            {
-                return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                    change,
-                    localState,
-                    CloudRemoteConflictReason.Delete));
-            }
-
-            // The native delete may have committed before durable tombstone persistence failed.
-            // A missing namespace entry with the expected durable identity is therefore an
-            // idempotent retry, not a new missing-item conflict; only finish the durable update.
-            await UpdateRemoteItemRevisionAsync(
-                    localState.ItemId,
-                    change.RemoteId,
-                    localState.RelativePath,
-                    change.ItemKind,
-                    change.RemoteRevision,
-                    isTombstone: true,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            return RemoteEntryOutcome.AppliedResult;
-        }
-
-        if (options.PreserveUnsynchronizedLocalContent && context.LocalOperations.Count != 0)
-        {
-            return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                change,
-                localState,
-                CloudRemoteConflictReason.Delete));
-        }
-
-        CloudItem item = CreateItemReference(localState.RelativePath, change.ItemKind);
-        CloudItemSnapshot snapshot = await item.InspectAsync(cancellationToken).ConfigureAwait(false);
-        if (!snapshot.IsPlaceholder ||
-            (options.PreserveUnsynchronizedLocalContent &&
-             snapshot.SynchronizationState is CloudSynchronizationState.NotInSync))
-        {
-            return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                change,
-                localState,
-                CloudRemoteConflictReason.Delete));
-        }
-
-        IReadOnlyList<RecursiveItemEntry>? protectedTree = null;
-        if (options.PreserveUnsynchronizedLocalContent && item is CloudDirectory protectedDirectory)
-        {
-            protectedTree = MaterializeLocalTree(protectedDirectory, childrenFirst: true, includeRoot: true);
-            if (!await CanDeleteRemoteTreeAsync(protectedTree, localState.RelativePath, cancellationToken)
-                .ConfigureAwait(false))
-            {
-                return RemoteEntryOutcome.ConflictResult(CreateConflict(
-                    change, localState, CloudRemoteConflictReason.Delete));
-            }
-        }
-
-        Guid? suppressionId = null;
-        if (options.SuppressLocalEcho)
-        {
-            suppressionId = await RegisterRemoteEchoSuppressionAsync(
-                    change,
-                    localState.ItemId,
-                    CloudStateOperationKind.Delete,
-                    options,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-
-        if (item is CloudDirectory directory)
-        {
-            try
-            {
-                if (protectedTree is not null)
-                {
-                    // Delete only the preflighted entries. A new child must not be picked up
-                    // by a second recursive enumeration and deleted without validation.
-                    foreach (RecursiveItemEntry entry in protectedTree)
-                    {
-                        if (!await CanDeleteRemoteTreeAsync([entry], entry.RelativePath, cancellationToken)
-                            .ConfigureAwait(false))
-                        {
-                            if (suppressionId is Guid registeredId)
-                            {
-                                await RemoveRemoteEchoSuppressionAsync(registeredId).ConfigureAwait(false);
-                            }
-
-                            // Earlier descendants may already have been deleted. Preserve the
-                            // remote batch cursor and retry evidence instead of recording a
-                            // terminal conflict that would make the partially applied delete
-                            // invisible to recovery.
-                            throw new IOException(
-                                $"The local subtree changed while deleting remote directory '{change.RelativePath}'.");
-                        }
-
-                        cancellationToken.ThrowIfCancellationRequested();
-                        DeleteLocalItem(entry.FullPath, entry.Kind, "CloudFileSystem.ApplyRemoteDelete");
-                        await PersistTombstoneAsync(_stateStore!, entry.RelativePath, CancellationToken.None)
-                            .ConfigureAwait(false);
-                    }
-                }
-                else
-                {
-                    CloudRecursiveOperationResult result = await directory.DeleteTreeAsync(
-                            new CloudRecursiveOperationOptions(includeRoot: true, stopOnFirstFailure: true),
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    if (!result.IsSuccessful)
-                    {
-                        throw result.Entries.First(entry => entry.Error is not null).Error!;
-                    }
-                }
-            }
-            catch
-            {
-                if (suppressionId is Guid registeredSuppressionId)
-                {
-                    await RemoveRemoteEchoSuppressionAsync(registeredSuppressionId).ConfigureAwait(false);
-                }
-
-                throw;
-            }
-        }
-        else
-        {
-            try
-            {
-                await item.DeleteAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch
-            {
-                if (suppressionId is Guid registeredSuppressionId)
-                {
-                    await RemoveRemoteEchoSuppressionAsync(registeredSuppressionId).ConfigureAwait(false);
-                }
-
-                throw;
-            }
-        }
-
-        await UpdateRemoteItemRevisionAsync(
-                localState.ItemId,
-                change.RemoteId,
-                localState.RelativePath,
-                change.ItemKind,
-                change.RemoteRevision,
-                isTombstone: true,
                 cancellationToken)
             .ConfigureAwait(false);
         return RemoteEntryOutcome.AppliedResult;
@@ -1221,6 +1087,14 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
+            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (deleteParents is not null)
+        {
+            await ValidateRemoteDeleteOutcomeAsync(transaction, batch, appliedEntryCount - 1, deleteParents.Parents, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (outcome.Conflict is not null)
         {
             Guid id = conflictId ?? Guid.NewGuid();
@@ -1248,6 +1122,8 @@ public sealed partial class CloudFileSystem
         await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(change), cancellationToken)
             .ConfigureAwait(false);
         await transaction.Checkpoints.RemoveAsync(RemoteMoveIntent.Name(batch.BatchId, appliedEntryCount - 1), cancellationToken)
+            .ConfigureAwait(false);
+        await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(batch.BatchId, appliedEntryCount - 1), cancellationToken)
             .ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return next;

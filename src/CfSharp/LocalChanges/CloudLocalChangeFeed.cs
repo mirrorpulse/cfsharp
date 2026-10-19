@@ -260,7 +260,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
     /// <exception cref="InvalidOperationException">
-    /// A remote creation or file move remains pending, a loss signal is not yet durable, or new
+    /// A remote creation, file move or Delete remains pending, a loss signal is not yet durable, or new
     /// loss raced this acknowledgement.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
@@ -273,9 +273,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         if (creations.Any(value => !RemoteCreationIntent.Decode(value.Value).Committed) ||
-            (await transaction.Checkpoints.ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0)
+            (await transaction.Checkpoints.ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0 ||
+            (await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0)
         {
-            throw new InvalidOperationException("Replay pending remote creations and moves before acknowledging reconciliation.");
+            throw new InvalidOperationException("Replay pending remote creations, moves and deletions before acknowledging reconciliation.");
         }
 
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
@@ -749,6 +750,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .ConfigureAwait(false);
         long observation = Math.Max(_nextObservation + 1, checkpoint.Observation + 1);
         _nextObservation = observation;
+        CloudItemState? current = await transaction.Items
+            .GetByRelativePathAsync(path.RelativePath, cancellationToken).ConfigureAwait(false);
+        CloudItemState? previous = previousPath is null
+            ? null
+            : await transaction.Items.GetByRelativePathAsync(previousPath.Value.RelativePath, cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingCreation = creations.Select(value => RemoteCreationIntent.Decode(value.Value)).Any(intent =>
@@ -761,7 +767,21 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             CloudDirectoryStateProjection.SamePath(intent.TargetRelativePath, path.RelativePath) ||
             (previousPath is not null && (CloudDirectoryStateProjection.SamePath(intent.Object.RelativePath, previousPath.Value.RelativePath) ||
                 CloudDirectoryStateProjection.SamePath(intent.TargetRelativePath, previousPath.Value.RelativePath))));
-        if (pendingCreation || pendingMove)
+        IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
+        bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
+            intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
+        // A delayed observation may arrive after a remote Delete's terminal commit consumed
+        // its preparation. Never resurrect that historical identity for a replacement at the
+        // same path. Retain the observation without assigning an identity until reconciliation.
+        bool tombstonedGeneration = kind != CloudLocalChangeKind.Delete &&
+            (current?.IsTombstone == true || previous?.IsTombstone == true);
+        if (tombstonedGeneration && kind == CloudLocalChangeKind.Move)
+        {
+            // Preserve the existing unassigned move journal and its acknowledgement identity.
+            // Neither historical endpoint can establish the replacement's current ownership.
+            uncertainDirectory ??= (previous ?? current)?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath);
+        }
+        if (pendingCreation || pendingMove || pendingDelete || (tombstonedGeneration && kind != CloudLocalChangeKind.Move))
         {
             long generation = SignalLoss();
             // Do not assign or relocate a local identity while native remote work is pending. Retain
@@ -770,7 +790,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
                 Directory.Exists(path.FullPath), observedAt);
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
-                (pendingMove ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
+                (pendingMove || pendingDelete || tombstonedGeneration ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -788,13 +808,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             CloudLocalChangeKind.Delete => CloudStateOperationKind.Delete,
             _ => throw new ArgumentOutOfRangeException(nameof(kind)),
         };
-        CloudItemState? current = await transaction.Items
-            .GetByRelativePathAsync(path.RelativePath, cancellationToken).ConfigureAwait(false);
-        CloudItemState? previous = previousPath is null
-            ? null
-            : await transaction.Items
-                .GetByRelativePathAsync(previousPath.Value.RelativePath, cancellationToken)
-                .ConfigureAwait(false);
         CloudItemState? observedState = kind == CloudLocalChangeKind.Delete
             ? current
             : previous ?? current;

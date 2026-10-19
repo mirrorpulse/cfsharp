@@ -81,8 +81,19 @@ internal static class CloudItemPathResolver
                 continue;
             }
 
-            FileSystemInfo? resolved = fileSystemInfo.ResolveLinkTarget(returnFinalTarget: true);
-            current = resolved?.FullName ?? next;
+            try
+            {
+                FileSystemInfo? resolved = fileSystemInfo.ResolveLinkTarget(returnFinalTarget: true);
+                current = resolved?.FullName ?? next;
+            }
+            catch (IOException exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // Watcher paths and their ancestors may disappear after the existence check.
+                // Treat them like an initially missing component, not a failed feed. This
+                // lexical resolution is not a native mutation guard; callers still bind
+                // existing ancestry and the actual object before namespace mutations.
+                current = next;
+            }
         }
 
         return Path.TrimEndingDirectorySeparator(Path.GetFullPath(current));
