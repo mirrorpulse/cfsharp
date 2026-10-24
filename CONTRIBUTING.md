@@ -85,6 +85,10 @@ output, or IDE state. Keep the working tree clean before committing.
 
 ## Local gates
 
+Use the exact SDK patch selected by `global.json`. The Native AOT compiler and linker are
+locked with that validated SDK; an independently newer preinstalled SDK can select incompatible
+runtime packs. Update the SDK and its pinned toolchain together after validating both architectures.
+
 Run the smallest applicable gate first, then the full Release checks when practical:
 
 ```powershell
