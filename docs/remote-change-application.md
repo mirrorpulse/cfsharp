@@ -355,7 +355,13 @@ resolver or allocating another copy identity. Preparation reserves the later nat
 encoding capacity before creating an object. Parent namespace guards cover creation and
 projection. After native success, a separate durable native
 receipt binds the actual file object, identity, kind, times and logical length before item
-projection. Retrying across owner reopen uses that original receipt, never a new path-derived ID.
+projection, together with the actual native attributes. Recovery compares this snapshot even
+when Windows still reports InSync; an explicit authorization does not permit ignoring later
+local journal changes. Preparation seals the original item's operation IDs, sequences, kinds,
+creation times and payloads. Existing authorized work is retained without acknowledgement, but
+later work leaves recovery unresolved. Local observations remain fenced after item projection
+until the original outcome transaction consumes the preparation.
+Retrying across owner reopen uses that original receipt, never a new path-derived ID.
 A matching identity blob on another file object, a hard-link alias, changed parents or dirty
 original object cannot substitute for that proof. Final outcome publication checks the original
 native object and public projection inside the transaction before consuming the intent and

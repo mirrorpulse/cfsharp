@@ -30,6 +30,7 @@ public sealed partial class CloudFileSystem
                 intent.RelativePath != change.RelativePath || intent.Identity.RemoteId != change.RemoteId)) ||
             (copy && (intent.Identity.RemoteId == change.RemoteId || intent.Identity.ItemId == change.ItemId)) ||
             intent.Kind != change.ItemKind || intent.Identity.RemoteRevision != change.RemoteRevision ||
+            intent.LocalOperationsFingerprint is not { Length: 32 } || (intent.CreatedObject is not null && !intent.Attributes.HasValue) ||
             intent.Parents is null || !string.Equals(intent.RootPath, SyncRootPath, StringComparison.OrdinalIgnoreCase) ||
             intent.StoreScope != await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false))
         {
@@ -63,7 +64,9 @@ public sealed partial class CloudFileSystem
                 new CloudPlaceholderIdentity(itemId, change.RemoteId, change.RemoteRevision),
                 RemoteCreationIntent.GetFingerprint(original), Committed: false,
                 await CloudDirectoryMoveEvidence.GetScopeAsync(preparation, true, cancellationToken).ConfigureAwait(false),
-                SyncRootPath, parents.Parents, PreserveContent: options.PreserveUnsynchronizedLocalContent, Resolution: resolution);
+                SyncRootPath, parents.Parents, PreserveContent: options.PreserveUnsynchronizedLocalContent, Resolution: resolution,
+                LocalOperationsFingerprint: RemoteNamespaceEvidence.FingerprintOperations(
+                    await preparation.Operations.ListByItemIdAsync(itemId, int.MaxValue, cancellationToken).ConfigureAwait(false)));
             await preparation.Checkpoints.UpsertAsync(new(name, intent.Encode(), DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
             await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -150,7 +153,8 @@ public sealed partial class CloudFileSystem
                 intent = intent with
                 {
                     CreatedObject = ObserveRemoteNamespaceObject(handle,
-                    change.ItemKind == CloudItemKind.Directory, intent.PreserveContent, intent.PreserveContent)
+                    change.ItemKind == CloudItemKind.Directory, intent.PreserveContent, intent.PreserveContent),
+                    Attributes = WindowsFileMetadata.ReadBasic(handle.DangerousGetHandle()).Attributes,
                 };
                 ValidateRemoteCreationObject(change, intent, handle);
                 await transaction.Checkpoints.UpsertAsync(new(name, intent.Encode(), DateTimeOffset.UtcNow),
@@ -177,6 +181,8 @@ public sealed partial class CloudFileSystem
         CloudItemState? byPath = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
         CloudItemState? byId = await transaction.Items.GetByItemIdAsync(intent.Identity.ItemId, cancellationToken).ConfigureAwait(false);
         CloudItemState? byRemote = await transaction.Items.GetByRemoteIdAsync(change.RemoteId, cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations.ListByItemIdAsync(
+            intent.Identity.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
         return (byPath is { IsTombstone: false } && byPath.ItemId != intent.Identity.ItemId) ||
             (byRemote is not null && byRemote.ItemId != intent.Identity.ItemId) ||
             (byId is not null && (byId.RemoteId != change.RemoteId || byId.Kind != change.ItemKind ||
@@ -184,7 +190,8 @@ public sealed partial class CloudFileSystem
             (intent.Committed && (byId is null || byId.IsTombstone || byId.RemoteRevision != change.RemoteRevision)) ||
             (!intent.Committed && byId is not null && change.PreviousRemoteRevision is not null &&
                 byId.RemoteRevision != change.PreviousRemoteRevision) ||
-            (intent.PreserveContent && (await transaction.Operations.ListByItemIdAsync(intent.Identity.ItemId, 1, cancellationToken).ConfigureAwait(false)).Count != 0);
+            (intent.PreserveContent && operations.Count != 0) || intent.LocalOperationsFingerprint is null ||
+            !intent.LocalOperationsFingerprint.AsSpan().SequenceEqual(RemoteNamespaceEvidence.FingerprintOperations(operations));
     }
 
     private static void RequireRemoteCreationParents(RemoteCreationIntent intent, RemoteNamespaceObject[] parents)
@@ -206,6 +213,7 @@ public sealed partial class CloudFileSystem
         RemoteNamespaceObject actual = ObserveRemoteNamespaceObject(handle, change.ItemKind == CloudItemKind.Directory,
             intent.PreserveContent, intent.PreserveContent);
         if (intent.CreatedObject is null || !SameRemoteNamespaceObject(intent.CreatedObject, actual) ||
+            intent.Attributes != WindowsFileMetadata.ReadBasic(handle.DangerousGetHandle()).Attributes ||
             !actual.Identity.AsSpan().SequenceEqual(intent.Identity.Encode()) ||
             (change.ItemKind == CloudItemKind.File && actual.Length != change.Length))
         {

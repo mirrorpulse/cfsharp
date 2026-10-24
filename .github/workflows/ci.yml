@@ -252,9 +252,9 @@ jobs:
           [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/recreation-test-results.trx -Raw
           $counts = $report.TestRun.ResultSummary.Counters
           $cases = @($report.TestRun.Results.UnitTestResult)
-          if ([int]$counts.total -ne 71 -or [int]$counts.executed -ne 71 -or [int]$counts.passed -ne 71 -or
-              @($cases.testName | Sort-Object -Unique).Count -ne 71) {
-            throw 'All 71 distinct native recreation cases must execute and pass; skipped/missing/duplicated cases are failures.'
+          if ([int]$counts.total -ne 81 -or [int]$counts.executed -ne 81 -or [int]$counts.passed -ne 81 -or
+              @($cases.testName | Sort-Object -Unique).Count -ne 81) {
+            throw 'All 81 distinct native recreation cases must execute and pass; skipped/missing/duplicated cases are failures.'
           }
 
       - name: Verify recreation as a fresh ordinary user

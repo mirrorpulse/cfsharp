@@ -14,6 +14,8 @@ public sealed class RemoteCreationIntentTests
         Assert.Equal(intent.CreatedObject!.Binding, recovered.CreatedObject!.Binding);
         Assert.Equal(intent.Parents![0].Binding, Assert.Single(recovered.Parents!).Binding);
         Assert.True(recovered.Committed);
+        Assert.Equal(intent.Attributes, recovered.Attributes);
+        Assert.Equal(intent.LocalOperationsFingerprint, recovered.LocalOperationsFingerprint);
     }
 
     [Fact]
@@ -39,7 +41,7 @@ public sealed class RemoteCreationIntentTests
             Assert.Throws<InvalidDataException>(() => RemoteCreationIntent.Decode(encoded.AsMemory(0, length)));
         }
         Assert.Throws<InvalidDataException>(() => RemoteCreationIntent.Decode((byte[])[.. encoded, 1]));
-        BitConverter.GetBytes(4).CopyTo(encoded, 0);
+        BitConverter.GetBytes(5).CopyTo(encoded, 0);
         Assert.Throws<InvalidDataException>(() => RemoteCreationIntent.Decode(encoded));
     }
 
@@ -109,6 +111,7 @@ public sealed class RemoteCreationIntentTests
         CloudRemoteChange change = new("birth", CloudRemoteChangeKind.FileUpsert, identity.RemoteId, "v3",
             CloudItemKind.File, "Docs\\item.bin", identity.ItemId, length: 7, metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
         return new(change.RelativePath, change.ItemKind, identity, RemoteCreationIntent.GetFingerprint(change), true,
-            Guid.NewGuid(), Path.GetFullPath(Path.GetTempPath()), [ancestor], item);
+            Guid.NewGuid(), Path.GetFullPath(Path.GetTempPath()), [ancestor], item, Attributes: 0x20,
+            LocalOperationsFingerprint: RemoteNamespaceEvidence.FingerprintOperations([]));
     }
 }

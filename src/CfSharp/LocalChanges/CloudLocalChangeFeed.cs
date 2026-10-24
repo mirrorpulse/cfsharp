@@ -272,7 +272,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
-        if (creations.Any(value => !RemoteCreationIntent.Decode(value.Value).Committed) ||
+        if (creations.Count != 0 ||
             (await transaction.Checkpoints.ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0 ||
             (await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0)
         {
@@ -758,8 +758,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingCreation = creations.Select(value => RemoteCreationIntent.Decode(value.Value)).Any(intent =>
-            !intent.Committed && (string.Equals(intent.RelativePath, path.RelativePath, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(intent.RelativePath, previousPath?.RelativePath, StringComparison.OrdinalIgnoreCase)));
+            string.Equals(intent.RelativePath, path.RelativePath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(intent.RelativePath, previousPath?.RelativePath, StringComparison.OrdinalIgnoreCase));
         IReadOnlyList<CloudStateCheckpoint> moves = await transaction.Checkpoints
             .ListAsync(RemoteMoveIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingMove = moves.Select(value => RemoteMoveIntent.Decode(value.Value)).Any(intent =>

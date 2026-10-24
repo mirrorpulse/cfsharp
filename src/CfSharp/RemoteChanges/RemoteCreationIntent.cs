@@ -7,7 +7,7 @@ internal sealed record RemoteCreationIntent(
     string RelativePath, CloudItemKind Kind, CloudPlaceholderIdentity Identity, byte[] Fingerprint, bool Committed,
     Guid StoreScope = default, string? RootPath = null, IReadOnlyList<RemoteNamespaceObject>? Parents = null,
     RemoteNamespaceObject? CreatedObject = null, bool PreserveContent = true,
-    CloudRemoteConflictDecision? Resolution = null)
+    CloudRemoteConflictDecision? Resolution = null, uint? Attributes = null, byte[]? LocalOperationsFingerprint = null)
 {
     internal const string Prefix = "cfsharp/remote-creation/v1";
     internal const string ObservationsPrefix = "cfsharp/remote-creation-observations/v1";
@@ -35,7 +35,7 @@ internal sealed record RemoteCreationIntent(
     {
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, CloudDirectoryEvidenceCodec.Utf8, leaveOpen: true);
-        writer.Write(Parents is null ? 1 : 3);
+        writer.Write(Parents is null ? 1 : 4);
         writer.Write(RelativePath);
         writer.Write((int)Kind);
         writer.Write(Committed);
@@ -52,8 +52,14 @@ internal sealed record RemoteCreationIntent(
             writer.Write(Parents.Count);
             foreach (RemoteNamespaceObject parent in Parents) { RemoteNamespaceEvidence.WriteObject(writer, parent); }
             writer.Write(CreatedObject is not null);
-            if (CreatedObject is not null) { RemoteNamespaceEvidence.WriteObject(writer, CreatedObject); }
+            if (CreatedObject is not null)
+            {
+                RemoteNamespaceEvidence.WriteObject(writer, CreatedObject);
+                writer.Write(Attributes ?? throw new InvalidDataException("The creation receipt lacks its original attributes."));
+            }
             writer.Write(Resolution is null ? -1 : (int)Resolution.Value);
+            if (LocalOperationsFingerprint is not { Length: 32 }) { throw new InvalidDataException("The creation preparation lacks its local journal binding."); }
+            writer.Write(LocalOperationsFingerprint);
         }
         long preparedLength = stream.Length;
         if (Parents is not null && CreatedObject is null)
@@ -65,6 +71,7 @@ internal sealed record RemoteCreationIntent(
             string parent = Parents.MaxBy(value => value.RelativePath.Length)!.RelativePath;
             RemoteNamespaceEvidence.WriteObject(writer, new(Path.Combine(parent, Path.GetFileName(RelativePath)),
                 Parents[0].Binding, identity, 0, 0, 0));
+            writer.Write(0U);
         }
         if (stream.Length > 4 * 1024 * 1024) { throw new InvalidDataException("The creation evidence exceeds its bounded size including native receipt capacity."); }
         stream.SetLength(preparedLength);
@@ -82,7 +89,7 @@ internal sealed record RemoteCreationIntent(
             using MemoryStream stream = new(bytes.ToArray(), writable: false);
             using BinaryReader reader = new(stream, CloudDirectoryEvidenceCodec.Utf8);
             int version = reader.ReadInt32();
-            if (version is not 1 and not 2 and not 3)
+            if (version is < 1 or > 4)
             {
                 throw new InvalidDataException("Unsupported remote creation intent version.");
             }
@@ -110,6 +117,8 @@ internal sealed record RemoteCreationIntent(
             RemoteNamespaceObject? created = null;
             bool preserve = true;
             CloudRemoteConflictDecision? resolution = null;
+            uint? attributes = null;
+            byte[]? operations = null;
             if (version >= 2)
             {
                 scope = CloudDirectoryEvidenceCodec.ReadGuid(reader);
@@ -123,6 +132,7 @@ internal sealed record RemoteCreationIntent(
                 parents = new RemoteNamespaceObject[count];
                 for (int index = 0; index < count; index++) { parents[index] = RemoteNamespaceEvidence.ReadObject(reader); }
                 created = reader.ReadBoolean() ? RemoteNamespaceEvidence.ReadObject(reader) : null;
+                if (version >= 4 && created is not null) { attributes = reader.ReadUInt32(); }
                 if ((committed && created is null) || (created is not null &&
                     (created.RelativePath.Length == 0 || !created.Identity.AsSpan().SequenceEqual(identity.Encode()))) ||
                     parents.Select(parent => parent.RelativePath).Distinct(StringComparer.OrdinalIgnoreCase).Count() != count)
@@ -130,7 +140,7 @@ internal sealed record RemoteCreationIntent(
                     throw new InvalidDataException("Invalid original creation object evidence.");
                 }
             }
-            if (version == 3)
+            if (version >= 3)
             {
                 int decision = reader.ReadInt32();
                 if (decision != -1 && decision != (int)CloudRemoteConflictDecision.KeepRemote && decision != (int)CloudRemoteConflictDecision.KeepBoth)
@@ -140,11 +150,16 @@ internal sealed record RemoteCreationIntent(
                 resolution = decision == -1 ? null : (CloudRemoteConflictDecision)decision;
                 if (resolution.HasValue && preserve) { throw new InvalidDataException("A creation authorization has inconsistent preservation policy."); }
             }
+            if (version >= 4)
+            {
+                operations = reader.ReadBytes(32);
+                if (operations.Length != 32) { throw new InvalidDataException("Invalid creation journal binding length."); }
+            }
             if (stream.Position != stream.Length || fingerprint.Length != 32)
             {
                 throw new InvalidDataException("Invalid creation evidence boundary.");
             }
-            return new(path, kind, identity, fingerprint, committed, scope, root, parents, created, preserve, resolution);
+            return new(path, kind, identity, fingerprint, committed, scope, root, parents, created, preserve, resolution, attributes, operations);
         }
         catch (Exception exception) when (exception is EndOfStreamException or ArgumentException or NotSupportedException or FormatException)
         {
