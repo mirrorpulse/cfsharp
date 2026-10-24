@@ -397,6 +397,8 @@ public sealed partial class CloudFileSystem
                 transaction.Items,
                 destination.RelativePath,
                 cancellationToken).ConfigureAwait(false);
+        sourceEntries = CloudDirectoryStateProjection.CurrentGenerations(sourceEntries);
+        destinationEntries = CloudDirectoryStateProjection.CurrentGenerations(destinationEntries);
         HashSet<Guid> sourceIds = sourceEntries.Select(static entry => entry.ItemId).ToHashSet();
         bool hasUnrelatedDestinationState = destinationEntries.Any(entry =>
             !sourceIds.Contains(entry.ItemId));
@@ -470,7 +472,7 @@ public sealed partial class CloudFileSystem
         }
 
         DateTimeOffset updatedAt = DateTimeOffset.UtcNow;
-        foreach (CloudItemState item in existing)
+        foreach (CloudItemState item in existing.Where(item => !item.IsTombstone))
         {
             await transaction.Items.UpsertAsync(
                 new CloudItemState(

@@ -101,7 +101,7 @@ public sealed partial class CloudFileSystem
         }
 
         Dictionary<string, CloudItemState> stateByPath = new(StringComparer.OrdinalIgnoreCase);
-        foreach (CloudItemState state in durableItems)
+        foreach (CloudItemState state in CloudDirectoryStateProjection.CurrentGenerations(durableItems))
         {
             try
             {

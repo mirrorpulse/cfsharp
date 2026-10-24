@@ -99,6 +99,11 @@ Native or Windows-state changes also require the relevant ABI probe, integration
 or sample-provider tests. The 30-minute x64/ARM64 `LongSoak` is a manual workflow gate, not a
 substitute for the normal test suite.
 
+CI runs native `RemoteRecreation` cases in dedicated x64 and ARM64 jobs, including fresh
+ordinary-user execution. The main solution jobs execute the complementary category partition.
+Together they retain the full ordinary suite without extending existing job or test deadlines.
+The local full-suite command above executes both partitions.
+
 The integration test project can also be built and tested independently in either configuration:
 
 ```powershell

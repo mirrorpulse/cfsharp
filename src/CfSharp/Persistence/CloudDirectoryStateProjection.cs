@@ -4,6 +4,20 @@ namespace CfSharp;
 // performs native I/O, acknowledges journal rows, or infers native ownership from durable paths.
 internal static class CloudDirectoryStateProjection
 {
+    // Subtree snapshots include history for identity-based reconciliation. Namespace plans and
+    // views must use the same live-first path ownership as indexed single-path lookup; retired
+    // predecessors must not enter a successor's move manifest or become its displayed identity.
+    internal static IReadOnlyList<CloudItemState> CurrentGenerations(IReadOnlyList<CloudItemState> items) =>
+        items.GroupBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).Select(group =>
+        {
+            if (group.Count(item => !item.IsTombstone) > 1)
+            {
+                throw new InvalidDataException("Multiple live items own the same synchronized path.");
+            }
+            return group.OrderBy(item => item.IsTombstone).ThenByDescending(item => item.UpdatedAt)
+                .ThenBy(item => item.ItemId.ToString("D"), StringComparer.Ordinal).First();
+        }).ToArray();
+
     internal static async ValueTask<VerifiedDirectoryProjection> ProjectVerifiedAsync(ICloudStateTransaction transaction,
         CloudDirectoryMoveProof proof, IReadOnlyList<CloudDirectoryMember> members,
         DateTimeOffset updatedAt, CancellationToken cancellationToken)
@@ -11,7 +25,7 @@ internal static class CloudDirectoryStateProjection
         Dictionary<Guid, CloudDirectoryMember> known = members.ToDictionary(member => member.ItemId);
         IReadOnlyList<CloudItemState> source = await transaction.Items.ListSubtreeAsync(proof.SourceRelativePath, cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudItemState> target = await transaction.Items.ListSubtreeAsync(proof.DestinationRelativePath, cancellationToken).ConfigureAwait(false);
-        foreach (CloudItemState item in source.Concat(target))
+        foreach (CloudItemState item in CurrentGenerations(source).Concat(CurrentGenerations(target)))
         {
             if (!known.TryGetValue(item.ItemId, out CloudDirectoryMember? member) || !MatchesMember(item, member, proof))
             {

@@ -107,7 +107,12 @@ public sealed class CloudRemoteChange
     /// <param name="remoteRevision">New opaque revision represented by this change.</param>
     /// <param name="itemKind">Whether the remote object is a file or directory.</param>
     /// <param name="relativePath">Canonical destination path relative to the sync root.</param>
-    /// <param name="itemId">Known CfSharp item identifier, when the provider has one.</param>
+    /// <param name="itemId">
+    /// Known or explicitly requested CfSharp item identifier. A distinct upsert at a retired path
+    /// creates this identity while retaining the predecessor tombstone. A conflicting live identity
+    /// is not replaced or silently substituted. Without an ID, a matching remote identity is reused;
+    /// otherwise a new identity is allocated and retained before native creation.
+    /// </param>
     /// <param name="previousRemoteRevision">Revision expected before this change, when known.</param>
     /// <param name="previousRelativePath">Source path for a move, otherwise null.</param>
     /// <param name="length">Logical file length for a file upsert, otherwise null.</param>

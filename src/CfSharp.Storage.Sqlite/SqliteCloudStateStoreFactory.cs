@@ -777,7 +777,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
 
 internal static class SqliteSchema
 {
-    internal const int CurrentVersion = 8;
+    internal const int CurrentVersion = 9;
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
     internal static async Task InitializeAsync(
@@ -899,6 +899,11 @@ internal static class SqliteSchema
                 await upgrade.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            if (version < 9)
+            {
+                await MigrateVersionNineAsync(connection, cancellationToken).ConfigureAwait(false);
+            }
+
             await ValidateCurrentVersionAsync(
                 connection,
                 databasePath,
@@ -976,7 +981,7 @@ internal static class SqliteSchema
             CREATE TABLE IF NOT EXISTS items (
                 item_id TEXT NOT NULL PRIMARY KEY,
                 remote_id TEXT NOT NULL UNIQUE,
-                relative_path TEXT NOT NULL COLLATE CFSHARP_UNICODE_NOCASE UNIQUE,
+                relative_path TEXT NOT NULL COLLATE CFSHARP_UNICODE_NOCASE,
                 kind INTEGER NOT NULL,
                 remote_revision TEXT NULL,
                 local_file_id INTEGER NULL,
@@ -1040,7 +1045,10 @@ internal static class SqliteSchema
             CREATE INDEX IF NOT EXISTS ix_conflicts_created ON conflicts(created_at_ticks, conflict_id);
             CREATE INDEX IF NOT EXISTS ix_echo_expiration ON echo_suppressions(expires_at_ticks);
             CREATE UNIQUE INDEX IF NOT EXISTS ux_items_relative_path_unicode_nocase
-                ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE);
+                ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE) WHERE is_tombstone = 0;
+            CREATE INDEX IF NOT EXISTS ix_items_path_generation
+                ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE, is_tombstone,
+                    updated_at_ticks DESC, item_id);
 
             INSERT INTO cfsharp_schema(singleton, version, sync_root_path)
             VALUES (1, $version, $sync_root_path)
@@ -1196,6 +1204,79 @@ internal static class SqliteSchema
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    private static async Task MigrateVersionNineAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        if (!await TableExistsAsync(connection, "items", cancellationToken).ConfigureAwait(false))
+        {
+            // The schema validator reports the missing required table with its public error.
+            return;
+        }
+        // SQLite cannot remove the old inline UNIQUE path constraint. Rebuild only items,
+        // retaining its name and primary keys so journal/conflict/suppression FKs keep their
+        // original targets. Disable FK actions outside the transaction: DROP with them enabled
+        // would clear ON DELETE SET NULL references. Check every FK before the atomic commit.
+        await using (SqliteCommand disable = connection.CreateCommand())
+        {
+            disable.CommandText = "PRAGMA foreign_keys = OFF;";
+            await disable.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        try
+        {
+            await using SqliteTransaction transaction = (SqliteTransaction)await connection
+                .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            await using (SqliteCommand rebuild = connection.CreateCommand())
+            {
+                rebuild.Transaction = transaction;
+                rebuild.CommandText = """
+                    CREATE TABLE items_generation_upgrade (
+                        item_id TEXT NOT NULL PRIMARY KEY,
+                        remote_id TEXT NOT NULL UNIQUE,
+                        relative_path TEXT NOT NULL COLLATE CFSHARP_UNICODE_NOCASE,
+                        kind INTEGER NOT NULL,
+                        remote_revision TEXT NULL,
+                        local_file_id INTEGER NULL,
+                        is_tombstone INTEGER NOT NULL,
+                        updated_at_ticks INTEGER NOT NULL
+                    );
+                    INSERT INTO items_generation_upgrade
+                        SELECT item_id, remote_id, relative_path, kind, remote_revision,
+                               local_file_id, is_tombstone, updated_at_ticks FROM items;
+                    DROP TABLE items;
+                    ALTER TABLE items_generation_upgrade RENAME TO items;
+                    CREATE UNIQUE INDEX ux_items_relative_path_unicode_nocase
+                        ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE) WHERE is_tombstone = 0;
+                    CREATE INDEX ix_items_path_generation
+                        ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE, is_tombstone,
+                            updated_at_ticks DESC, item_id);
+                    UPDATE cfsharp_schema SET version = 9 WHERE singleton = 1;
+                    """;
+                await rebuild.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await using (SqliteCommand check = connection.CreateCommand())
+            {
+                check.Transaction = transaction;
+                check.CommandText = "PRAGMA foreign_key_check;";
+                await using SqliteDataReader reader = await check.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    throw new InvalidDataException("The generation migration found invalid item references.");
+                }
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await using SqliteCommand enable = connection.CreateCommand();
+            enable.CommandText = "PRAGMA foreign_keys = ON;";
+            await enable.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
     private static async Task EnableWalAsync(
         SqliteConnection connection,
         string databasePath,
@@ -1276,15 +1357,17 @@ internal static class SqliteSchema
                 "The echo_suppressions table is missing Phase 8 observation columns.");
         }
 
-        if (!await IndexExistsAsync(
-                connection,
-                "ux_items_relative_path_unicode_nocase",
+        if (!await HasIndexDefinitionAsync(connection, "ux_items_relative_path_unicode_nocase",
+                "CREATE UNIQUE INDEX ux_items_relative_path_unicode_nocase ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE) WHERE is_tombstone = 0",
+                cancellationToken).ConfigureAwait(false) ||
+            !await HasIndexDefinitionAsync(connection, "ix_items_path_generation",
+                "CREATE INDEX ix_items_path_generation ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE, is_tombstone, updated_at_ticks DESC, item_id)",
                 cancellationToken).ConfigureAwait(false))
         {
             throw new SqliteCloudStateStoreException(
                 SqliteCloudStateStoreError.InvalidSchema,
                 databasePath,
-                "The items table is missing the Unicode path uniqueness index.");
+                "The items table is missing the live-path uniqueness or indexed generation lookup contract.");
         }
 
         await using (SqliteCommand foreignKeyCommand = connection.CreateCommand())
@@ -1386,20 +1469,21 @@ internal static class SqliteSchema
         return false;
     }
 
-    private static async Task<bool> IndexExistsAsync(
+    private static async Task<bool> HasIndexDefinitionAsync(
         SqliteConnection connection,
         string indexName,
+        string expectedSql,
         CancellationToken cancellationToken)
     {
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
-            SELECT EXISTS(
-                SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = $name
-            );
+            SELECT sql FROM sqlite_master WHERE type = 'index' AND name = $name;
             """;
         command.Parameters.AddWithValue("$name", indexName);
         object? value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return Convert.ToInt64(value, CultureInfo.InvariantCulture) != 0;
+        static string Normalize(string sql) => string.Concat(sql.Where(character => !char.IsWhiteSpace(character)))
+            .Replace("IFNOTEXISTS", string.Empty, StringComparison.OrdinalIgnoreCase).TrimEnd(';');
+        return value is string sql && string.Equals(Normalize(sql), Normalize(expectedSql), StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<long> CountApplicationTablesAsync(

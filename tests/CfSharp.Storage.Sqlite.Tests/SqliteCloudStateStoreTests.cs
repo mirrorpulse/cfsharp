@@ -7,7 +7,7 @@ using Xunit.Sdk;
 
 namespace CfSharp.Storage.Sqlite.Tests;
 
-public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, IAsyncLifetime
+public sealed partial class SqliteCloudStateStoreTests : CloudStateStoreContractTests, IAsyncLifetime
 {
     private string _temporaryDirectory = null!;
     private string _syncRootPath = null!;
@@ -375,7 +375,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            8L,
+            9L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -402,7 +402,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            8L,
+            9L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -430,7 +430,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         }
 
         Assert.Equal(
-            8L,
+            9L,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -459,7 +459,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             Assert.Equal(new byte[] { 7 }, (await transaction.Checkpoints.GetAsync("existing/checkpoint"))!.Value.ToArray());
         }
 
-        Assert.Equal(8L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
@@ -467,6 +467,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
     [InlineData(5)]
     [InlineData(6)]
     [InlineData(7)]
+    [InlineData(8)]
     public async Task PreviousProtocolUpgradePreservesCoordinationRowsAndSequenceAllocation(int previousVersion)
     {
         Guid itemId = Guid.NewGuid();
@@ -525,12 +526,12 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
             await verify.CommitAsync();
         }
 
-        Assert.Equal(8L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
     [Fact]
-    public async Task VersionEightFenceSurvivesProcessExitBeforeApplicationCommit()
+    public async Task VersionNineFenceSurvivesProcessExitBeforeApplicationCommit()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
@@ -543,7 +544,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
         (int exitCode, _) = await RunCrashHarnessAsync("before-commit", _databasePath, _syncRootPath);
         Assert.NotEqual(0, exitCode);
         Assert.True(File.Exists(_databasePath + ".before-commit.started"));
-        Assert.Equal(8L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
         await using ICloudStateStore recovered = await CreateFactory().OpenAsync(CreateContext());
         await using ICloudStateTransaction verify = await recovered.BeginTransactionAsync();
@@ -561,7 +562,7 @@ public sealed class SqliteCloudStateStoreTests : CloudStateStoreContractTests, I
                 singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             );
-            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 9);
+            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 10);
             """);
 
         SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<

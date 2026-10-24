@@ -775,13 +775,18 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         // same path. Retain the observation without assigning an identity until reconciliation.
         bool tombstonedGeneration = kind != CloudLocalChangeKind.Delete &&
             (current?.IsTombstone == true || previous?.IsTombstone == true);
+        // Watcher deletes carry a path, not the retired object's identity. A successor may
+        // already occupy that location when an old notification is delivered. Its continued
+        // native presence cannot authorize tombstoning the current generation or retargeting ACKs.
+        bool supersededDelete = kind == CloudLocalChangeKind.Delete && current is { IsTombstone: false } &&
+            (File.Exists(path.FullPath) || Directory.Exists(path.FullPath));
         if (tombstonedGeneration && kind == CloudLocalChangeKind.Move)
         {
             // Preserve the existing unassigned move journal and its acknowledgement identity.
             // Neither historical endpoint can establish the replacement's current ownership.
             uncertainDirectory ??= (previous ?? current)?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath);
         }
-        if (pendingCreation || pendingMove || pendingDelete || (tombstonedGeneration && kind != CloudLocalChangeKind.Move))
+        if (pendingCreation || pendingMove || pendingDelete || supersededDelete || (tombstonedGeneration && kind != CloudLocalChangeKind.Move))
         {
             long generation = SignalLoss();
             // Do not assign or relocate a local identity while native remote work is pending. Retain
@@ -790,7 +795,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
                 Directory.Exists(path.FullPath), observedAt);
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
-                (pendingMove || pendingDelete || tombstonedGeneration ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
+                (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

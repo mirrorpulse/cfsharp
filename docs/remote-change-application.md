@@ -146,7 +146,7 @@ to settle a move after later edits instead of clearing or overwriting them.
 
 ### Compatibility and limits
 
-The official SQLite provider upgrades schemas 0–7 in place to **schema 8**, retaining existing
+The official SQLite provider upgrades schemas 0–8 in place to **schema 9**, retaining existing
 repositories and enforcing foreign keys. Older providers reject that version before ignoring
 pending file-move evidence. Use matching core/provider packages; never downgrade the schema marker.
 Custom stores use the existing public repositories and must atomically isolate transactions across
@@ -328,3 +328,72 @@ evidence. The account-creation harness runs only on disposable GitHub Actions ru
 
 
 
+
+## Distinct births at retired paths (CF-009)
+
+A completed retirement does not give its path authority over a new remote identity. For a file or
+empty-directory upsert with a distinct explicit `ItemId` and distinct opaque `RemoteId`, CfSharp
+creates the requested successor, retaining the predecessor's original ID, remote ID, retired
+revision, path and tombstone. The new native placeholder and live public row use the successor;
+canonical path lookup returns that live row. Replaying the original completed birth or Delete
+acknowledges its original batch without restoring or deleting a later generation.
+
+An explicit ID incompatible with an existing remote identity, item identity or kind produces a
+durable conflict. A live foreign placeholder or unmanaged occupant is preserved; a native object
+that cannot be bound to original evidence remains retryable and unresolved. Processed conflicts
+retain the existing safe-prefix contract: their cursor acknowledges a durable conflict, not a
+successful birth. A retained conflict receipt distinguishes those outcomes during later replay.
+A same-ID, same-remote-ID resurrection remains an intentional reuse of that identity. An upsert
+without an ID reuses a matching remote identity; otherwise it allocates a new identity, including
+when only a different remote identity's tombstone is known at that path.
+
+Before native creation, a versioned intent retains the complete original change fingerprint,
+requested identity, root/store scope, parent object bindings and preservation policy.
+The same record seals an inline KeepRemote/KeepBoth decision and its effective identity/path
+against the original immutable request. Reopen reuses that authorization without rerunning the
+resolver or allocating another copy identity. Preparation reserves the later native receipt's
+encoding capacity before creating an object. Parent namespace guards cover creation and
+projection. After native success, a separate durable native
+receipt binds the actual file object, identity, kind, times and logical length before item
+projection. Retrying across owner reopen uses that original receipt, never a new path-derived ID.
+A matching identity blob on another file object, a hard-link alias, changed parents or dirty
+original object cannot substitute for that proof. Final outcome publication checks the original
+native object and public projection inside the transaction before consuming the intent and
+advancing progress. These operations do not read provider content.
+Namespace read guards do not require DELETE permission on a newly created file or directory.
+
+Cancellation before native mutation leaves no successful prefix. After native success, receipt
+and projection commits ignore cancellation; the caller may need to replay outcome publication.
+Native creation and the state store are separate resources. A hard kill or lost native-receipt
+commit can leave a placeholder without durable original-object proof. That gap remains unresolved,
+even if its identity matches, instead of adopting a possibly substituted object or creating again.
+The guards authenticate namespace objects; they do not claim atomic exclusion of arbitrary future
+external metadata writes. Late path-only Delete notifications with a present successor require
+reconciliation instead of tombstoning the successor. Old journal and ACK identities remain bound
+to their original item IDs.
+
+### Upgrade and already affected preview.7 stores
+
+Schema 9 preserves valid old tombstones and allows their first distinct successor without changing
+history. Legacy version-1 pending creation intents lack root/native provenance, and some contain
+an identity inconsistent with their explicit change. They remain intact and fail with an
+`InvalidDataException` in the failed entry; they are not silently upgraded into new proof.
+
+A preview.7 store may already have acknowledged B's batch while A is live with B's remote metadata
+and B's public row is absent. Migration does not undo that accepted history. Replaying an accepted
+explicit upsert whose remote projection identifies another item throws `InvalidDataException`
+before changing the stored fingerprint, cursor or projection. Legacy records do not reliably
+separate that corruption from every historical conflict; incompatible legacy success remains
+fenced and requires the caller to inspect its original conflict and application evidence.
+This is a managed identity/provenance failure, not an invented Win32 error for a successful native call.
+
+Keep the protected product namespace fenced. Retain the original immutable batches, native
+placeholder identities/bindings, official identity-based rows, journal/ACK and application ownership
+proof. Compare the requested ID with both the actual native identity and the public remote/item
+projections. `AlreadyApplied` alone is not evidence of repair. Reconcile the true original and
+successor ownership explicitly using supported SDK/application operations; do not erase tombstones,
+rewrite accepted fingerprints, reinterpret private checkpoint payloads or adopt the predecessor ID
+as a workaround. If original ownership cannot be restored safely, reconcile application state
+first, then rebuild into a new caller-selected official store/root through supported APIs. This
+may require replaying earlier work and does not by itself advance product cursors or prove Host
+acceptance. Package publication and downstream locked-restore validation are separate release gates.

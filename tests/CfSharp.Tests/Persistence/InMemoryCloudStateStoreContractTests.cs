@@ -107,8 +107,12 @@ public sealed class InMemoryCloudStateStoreContractTests : CloudStateStoreContra
             CancellationToken cancellationToken = default)
         {
             CheckActive(cancellationToken);
-            CloudItemState? item = _state.Items.Values.SingleOrDefault(candidate =>
-                string.Equals(candidate.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase));
+            CloudItemState? item = _state.Items.Values.Where(candidate =>
+                    string.Equals(candidate.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(candidate => candidate.IsTombstone)
+                .ThenByDescending(candidate => candidate.UpdatedAt)
+                .ThenBy(candidate => candidate.ItemId.ToString("D"), StringComparer.Ordinal)
+                .FirstOrDefault();
             return ValueTask.FromResult(item);
         }
 
@@ -149,6 +153,12 @@ public sealed class InMemoryCloudStateStoreContractTests : CloudStateStoreContra
         {
             CheckActive(cancellationToken);
             ArgumentNullException.ThrowIfNull(item);
+            if (_state.Items.Values.Any(existing => existing.ItemId != item.ItemId &&
+                (existing.RemoteId == item.RemoteId || (!existing.IsTombstone && !item.IsTombstone &&
+                    string.Equals(existing.RelativePath, item.RelativePath, StringComparison.OrdinalIgnoreCase)))))
+            {
+                throw new InvalidOperationException("Another item owns the remote identity or live path.");
+            }
             _state.Items[item.ItemId] = item;
             return ValueTask.CompletedTask;
         }

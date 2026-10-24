@@ -279,7 +279,8 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
             // metadata limits must not fail an otherwise valid legacy namespace operation.
             binding = provenance.Encode();
             IReadOnlyList<CloudItemState> members = await transaction.Items.ListSubtreeAsync(provenance.RelativePath, cancellationToken).ConfigureAwait(false);
-            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath, members);
+            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath,
+                CloudDirectoryStateProjection.CurrentGenerations(members));
         }
         catch (CloudDirectoryEvidenceUnavailableException)
         {
@@ -299,7 +300,8 @@ internal sealed record CloudDirectoryProvenance(Guid EvidenceId, Guid StoreScope
         byte[] manifest;
         try
         {
-            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath, members);
+            manifest = CloudDirectoryMoveEvidence.EncodeMembers(provenance.EvidenceId, provenance.RootItemId, provenance.RelativePath,
+                CloudDirectoryStateProjection.CurrentGenerations(members));
         }
         catch (CloudDirectoryEvidenceUnavailableException)
         {

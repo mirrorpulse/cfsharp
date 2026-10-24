@@ -76,3 +76,30 @@ Custom stores keep the existing interfaces and may optionally implement journal 
 atomically retain directory preparation, membership, projection receipt, item rows, and feed
 checkpoint/journal updates when the core coordinates a move. Never inspect or overwrite CfSharp's
 private namespace checkpoint payloads to fabricate recovery provenance.
+
+### Schema 9: retired paths and distinct generations
+
+Schema 9 upgrades versions 0–8 and fences older core/provider recovery protocols. It removes both
+forms of the unconditional path constraint, retaining every original row and path. Item IDs and
+opaque remote IDs remain unique across all generations. A partial Unicode case-insensitive index
+permits exactly one **live** owner at a path; any number of historical tombstones can retain that
+same location. No historical path is cleared, renamed or invented to accommodate a new birth.
+
+`GetByRelativePathAsync` uses an indexed, bounded live-first lookup. If no live owner exists, it
+returns the latest tombstone by `UpdatedAt`, with ascending ordinal canonical item ID as a stable
+tie breaker. This compatibility fallback is history, not ownership of a present-day native object.
+Identity lookups retain each generation, and `ListSubtreeAsync` includes historical rows. Namespace
+views select one current generation per path rather than displaying or adopting a predecessor.
+
+SQLite rebuilds only `items` in a transaction to remove its old inline constraint. Foreign-key
+actions are disabled on that migration connection before the transaction and checked before
+commit; original operation/conflict/suppression references and sequence allocation are retained.
+No applied remote fingerprint, cursor, journal payload or item field is repaired by migration.
+Back up the store and use matching fixed core/SQLite packages. Older packages reject schema 9;
+do not force a downgrade by editing its marker.
+
+Custom stores must enforce the same live-path uniqueness, history retention and deterministic
+lookup contracts through the existing public repositories. They must also fence older runtimes
+from the new creation receipts and preserve processed-conflict receipts. No private SDK table
+editing or provider generation codec is required. See the remote-change guide for already affected
+preview.7 states and legacy preparations, which require explicit reconciliation.
