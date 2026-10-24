@@ -25,7 +25,8 @@ public sealed partial class CloudFileSystem
     /// <exception cref="ArgumentNullException">The batch is null.</exception>
     /// <exception cref="ArgumentException">The batch conflicts with existing durable progress.</exception>
     /// <exception cref="InvalidDataException">
-    /// A retained file-move preparation is corrupt or belongs to another policy, store, or root.
+    /// Retained recovery evidence is corrupt or incompatible, or an accepted explicit upsert
+    /// prefix references a different item identity and requires explicit reconciliation.
     /// </exception>
     /// <exception cref="InvalidOperationException">The file system has not started.</exception>
     /// <exception cref="CloudFilesException">Windows rejects a requested namespace mutation.</exception>
@@ -45,6 +46,12 @@ public sealed partial class CloudFileSystem
     /// revisions, including when both revisions are equal. Successful recovery reports
     /// <see cref="CloudRemoteApplyEntryStatus.Applied"/> after durable outcome publication;
     /// completed batch prefixes report <see cref="CloudRemoteApplyEntryStatus.AlreadyApplied"/>.
+    /// Explicit upsert identities survive recreation at retired paths. Historical tombstones and
+    /// their journal references remain available by identity. Creation retains store/root, ancestry
+    /// and native-object evidence across projection and outcome commits; unproven or incompatible
+    /// legacy creations remain fenced. Already-applied historical entries are acknowledgements,
+    /// not instructions to restore an old generation over the current occupant. Incompatible
+    /// accepted explicit identities are rejected without rewriting their original fingerprints.
     /// Changed objects, ancestry, or local work leave the entry failed and retryable with its
     /// preparation retained. Mismatched policy or preparation is rejected before progress changes.
     /// Storage failures during preparation reads or outcome publication propagate to the
@@ -314,7 +321,8 @@ public sealed partial class CloudFileSystem
                 retry,
                 resolutionOptions,
                 cancellationToken,
-                deleteRequest)
+                deleteRequest,
+                new(conflict.Change, resolution.Decision))
             .ConfigureAwait(false);
         if (outcome.Status is not CloudRemoteApplyEntryStatus.Applied)
         {
@@ -330,6 +338,8 @@ public sealed partial class CloudFileSystem
         using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
             ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
             : null;
+        using RemoteCreationOutcomeLease? creation = retry.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
+            ? await HoldRemoteCreationOutcomeAsync(transaction, conflict.Change, cancellationToken).ConfigureAwait(false) : null;
         if (deleteRequest is not null && deleteParents is not null)
         {
             await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
@@ -340,6 +350,11 @@ public sealed partial class CloudFileSystem
         if (deleteRequest is not null)
         {
             await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
+        }
+        if (creation is not null)
+        {
+            await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(conflict.Change), cancellationToken).ConfigureAwait(false);
+            creation.Validate();
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new CloudRemoteApplyEntryResult(
@@ -373,6 +388,29 @@ public sealed partial class CloudFileSystem
             {
                 throw new InvalidOperationException(
                     $"Remote batch '{batch.BatchId}' has invalid durable progress.");
+            }
+
+            // preview.7 could acknowledge an explicit successor while projecting its remote
+            // metadata onto a predecessor ID. An accepted fingerprint cannot repair that
+            // ambiguity. Fence incompatible historical success without rewriting any evidence.
+            for (int completedIndex = 0; completedIndex < existing.AppliedEntryCount; completedIndex++)
+            {
+                CloudRemoteChange completed = batch.Changes[completedIndex];
+                if (completed.ItemId is Guid requestedId &&
+                    completed.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
+                {
+                    CloudStateCheckpoint? conflictReceipt = await transaction.Checkpoints.GetAsync(
+                        RemoteCreationIntent.IdentityConflictName(batch.BatchId, completedIndex), cancellationToken).ConfigureAwait(false);
+                    if (conflictReceipt is not null && conflictReceipt.Value.Span.SequenceEqual(batch.Fingerprint.Span))
+                    {
+                        continue;
+                    }
+                    CloudItemState? projected = await transaction.Items.GetByRemoteIdAsync(completed.RemoteId, cancellationToken).ConfigureAwait(false);
+                    if (projected is not null && projected.ItemId != requestedId)
+                    {
+                        throw new InvalidDataException("The accepted remote prefix has an incompatible explicit item identity; retain the original batch and reconcile native and durable ownership before resuming.");
+                    }
+                }
             }
 
             if (existing.AppliedEntryCount < batch.Changes.Count &&
@@ -496,7 +534,8 @@ public sealed partial class CloudFileSystem
                     ConflictResolver = null,
                 },
                 cancellationToken,
-                request)
+                request,
+                new(change, resolution.Decision))
             .ConfigureAwait(false);
     }
 
@@ -504,7 +543,8 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         CloudRemoteApplyOptions options,
         CancellationToken cancellationToken,
-        RemoteChangeRequest? request = null)
+        RemoteChangeRequest? request = null,
+        RemoteCreationResolution? creationResolution = null)
     {
         if (change.Kind == CloudRemoteChangeKind.Delete && request is not null)
         {
@@ -517,17 +557,32 @@ public sealed partial class CloudFileSystem
 
         if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
         {
-            RemoteCreationIntent? pending = await ReadRemoteCreationIntentAsync(change, cancellationToken)
+            CloudRemoteChange original = creationResolution?.Original ?? change;
+            RemoteCreationIntent? pending = await ReadRemoteCreationIntentAsync(original, cancellationToken)
                 .ConfigureAwait(false);
             if (pending is not null)
             {
-                return await CreateRemotePlaceholderCoordinatedAsync(change, pending.Identity.ItemId,
-                    options, pending, cancellationToken).ConfigureAwait(false);
+                if (creationResolution is not null && (pending.Resolution != creationResolution.Decision ||
+                    (pending.Resolution == CloudRemoteConflictDecision.KeepBoth && pending.RelativePath != change.RelativePath)))
+                {
+                    throw new InvalidDataException("The requested conflict decision differs from the original retained creation authorization.");
+                }
+                return await CreateRemotePlaceholderCoordinatedAsync(pending.EffectiveChange(original), pending.Identity.ItemId,
+                    options, pending, original, pending.Resolution, cancellationToken).ConfigureAwait(false);
             }
         }
 
         RemoteEntryContext context = await ReadRemoteEntryContextAsync(change, cancellationToken)
             .ConfigureAwait(false);
+        if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert &&
+            ((change.ItemId is Guid explicitId && context.LocalState is not null &&
+                context.LocalState.ItemId != explicitId) ||
+            (context.ByItemId is not null && context.ByItemId.RemoteId != change.RemoteId) ||
+            (context.LocalState is not null && context.LocalState.Kind != change.ItemKind)))
+        {
+            return RemoteEntryOutcome.ConflictResult(CreateConflict(
+                change, context.LocalState, CloudRemoteConflictReason.PathCollision));
+        }
         if (change.Kind is CloudRemoteChangeKind.Move)
         {
             return await ApplyRemoteMoveAsync(change, context, options, request, cancellationToken)
@@ -613,7 +668,7 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.Move));
         }
 
-        Guid itemId = context.LocalState?.ItemId ?? change.ItemId ?? Guid.NewGuid();
+        Guid itemId = change.ItemId ?? context.LocalState?.ItemId ?? Guid.NewGuid();
         bool localExists = change.ItemKind is CloudItemKind.Directory
             ? Directory.Exists(ToFullPath(change.RelativePath))
             : File.Exists(ToFullPath(change.RelativePath));
@@ -658,7 +713,7 @@ public sealed partial class CloudFileSystem
         if (upsert && (context.LocalState is null || !localExists))
         {
             return await CreateRemotePlaceholderCoordinatedAsync(change, itemId, options, pending: null,
-                cancellationToken).ConfigureAwait(false);
+                creationResolution?.Original ?? change, creationResolution?.Decision, cancellationToken).ConfigureAwait(false);
         }
 
         // Register suppression only after all conflict checks that can return
@@ -857,7 +912,11 @@ public sealed partial class CloudFileSystem
             : await transaction.Items
                 .GetByRelativePathAsync(change.PreviousRelativePath, cancellationToken)
                 .ConfigureAwait(false);
-        CloudItemState? localState = byRemoteId ?? byItemId ?? byPreviousPath ?? byPath;
+        // A retired path is history, not an identity match for a distinct birth. Explicit
+        // identity/remote lookup still permits intentional resurrection of that same item.
+        bool birth = change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert;
+        CloudItemState? pathState = birth && byPath?.IsTombstone == true ? null : byPath;
+        CloudItemState? localState = byRemoteId ?? byItemId ?? byPreviousPath ?? pathState;
         IReadOnlyList<CloudOperationJournalEntry> operations = localState is null
             ? []
             : await transaction.Operations.ListByItemIdAsync(
@@ -1090,6 +1149,9 @@ public sealed partial class CloudFileSystem
         using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
             ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)
             : null;
+        using RemoteCreationOutcomeLease? creation = outcome.Conflict is null &&
+            change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
+            ? await HoldRemoteCreationOutcomeAsync(transaction, change, cancellationToken).ConfigureAwait(false) : null;
         if (deleteParents is not null)
         {
             await ValidateRemoteDeleteOutcomeAsync(transaction, batch, appliedEntryCount - 1, deleteParents.Parents, cancellationToken)
@@ -1106,6 +1168,14 @@ public sealed partial class CloudFileSystem
                     EncodeConflict(outcome.Conflict),
                     outcome.Conflict.DetectedAt),
                 cancellationToken).ConfigureAwait(false);
+            if (change.ItemId.HasValue && change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
+            {
+                // A processed conflict is not a successful birth. Keep this bounded lookup
+                // receipt even after explicit resolution so legacy-corruption detection cannot
+                // misclassify a legitimately acknowledged conflict during historical replay.
+                await transaction.Checkpoints.UpsertAsync(new(RemoteCreationIntent.IdentityConflictName(batch.BatchId, appliedEntryCount - 1),
+                    batch.Fingerprint.Span, outcome.Conflict.DetectedAt), cancellationToken).ConfigureAwait(false);
+            }
         }
 
         CloudRemoteBatchState next = new(
@@ -1118,6 +1188,11 @@ public sealed partial class CloudFileSystem
             DateTimeOffset.UtcNow,
             batch.Fingerprint,
             change.ChangeId);
+        if (creation?.IsResolved == true)
+        {
+            await transaction.Checkpoints.UpsertAsync(new(RemoteCreationIntent.IdentityConflictName(batch.BatchId, appliedEntryCount - 1),
+                batch.Fingerprint.Span, DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
+        }
         await transaction.RemoteBatches.UpsertAsync(next, cancellationToken).ConfigureAwait(false);
         await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(change), cancellationToken)
             .ConfigureAwait(false);
@@ -1125,6 +1200,7 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(batch.BatchId, appliedEntryCount - 1), cancellationToken)
             .ConfigureAwait(false);
+        creation?.Validate();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return next;
     }
@@ -1369,6 +1445,8 @@ public sealed partial class CloudFileSystem
         CloudItemState? ByPath,
         CloudItemState? ByPreviousPath,
         IReadOnlyList<CloudOperationJournalEntry> LocalOperations);
+
+    private sealed record RemoteCreationResolution(CloudRemoteChange Original, CloudRemoteConflictDecision Decision);
 
     private sealed record RemoteEntryOutcome(
         CloudRemoteApplyEntryStatus Status,

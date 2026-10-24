@@ -81,6 +81,7 @@ public sealed partial class CloudFileSystem
         CloudDirectoryMoveProof proof = new(Guid.NewGuid(), scope, actualSourceRelativePath, target.RelativePath,
             root.ItemId, captured.Binding, captured.Identity);
         IReadOnlyList<CloudItemState> members = await transaction.Items.ListSubtreeAsync(source.RelativePath, cancellationToken).ConfigureAwait(false);
+        members = CloudDirectoryStateProjection.CurrentGenerations(members);
         await CloudDirectoryMoveEvidence.PrepareAsync(transaction, proof, members, cancellationToken).ConfigureAwait(false);
         // The bounded pair index selects the latest preparation for legacy MoveTo retry. It may
         // change without overwriting any immutable proof, member manifest, or completion receipt.

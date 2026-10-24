@@ -116,6 +116,14 @@ public interface ICloudItemStateRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>Finds an item by its normalized path relative to the sync root.</summary>
+    /// <remarks>
+    /// Returns the live owner when present. Otherwise returns the most recently updated tombstone,
+    /// breaking timestamp ties by ordinal ascending item ID in its canonical D format, or null
+    /// when no generation is known. Path comparison is ordinal case-insensitive. Implementations
+    /// must support indexed, bounded lookup and at most one live owner per normalized path while
+    /// retaining historical generations at their original paths. Identity lookups include history.
+    /// A returned tombstone is historical evidence, not authority over a later native occupant.
+    /// </remarks>
     ValueTask<CloudItemState?> GetByRelativePathAsync(
         string relativePath,
         CancellationToken cancellationToken = default);
@@ -127,13 +135,20 @@ public interface ICloudItemStateRepository
     /// <param name="cancellationToken">Token that cancels the transactional read.</param>
     /// <returns>
     /// A caller-owned snapshot ordered by path depth and then ordinal case-insensitive path.
-    /// Matching is ordinal case-insensitive and observes directory-segment boundaries.
+    /// Matching is ordinal case-insensitive and observes directory-segment boundaries. The snapshot
+    /// includes retired generations; paths need not be unique. Identity queries retain each row,
+    /// while namespace views must distinguish the live owner from historical tombstones.
     /// </returns>
     ValueTask<IReadOnlyList<CloudItemState>> ListSubtreeAsync(
         string relativePath,
         CancellationToken cancellationToken = default);
 
     /// <summary>Inserts a new item or replaces the record with the same item identifier.</summary>
+    /// <remarks>
+    /// Item and remote identifiers remain unique across live and retired records. Only live items
+    /// require unique normalized paths; tombstones retain their paths and may share them with
+    /// other generations. Incompatible live ownership must fail within the caller's transaction.
+    /// </remarks>
     ValueTask UpsertAsync(
         CloudItemState item,
         CancellationToken cancellationToken = default);

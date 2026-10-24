@@ -77,11 +77,14 @@ internal static unsafe partial class WindowsFileMetadata
         internal byte DeleteFile;
     }
 
-    internal static SafeFileHandle OpenDirectoryGuard(string path)
+    internal static SafeFileHandle OpenDirectoryGuard(string path) => OpenNamespaceGuard(path);
+
+    internal static SafeFileHandle OpenNamespaceGuard(string path)
     {
-        // FILE_LIST_DIRECTORY makes no-delete sharing effective for a directory. An
-        // attribute-only directory opener does not prevent all ancestor rename races.
-        // Opening this access performs no enumeration and never requests file content.
+        // FILE_READ_DATA/LIST_DIRECTORY makes no-delete sharing effective for files and
+        // directories; attribute-only opens do not participate in all sharing checks.
+        // This queries metadata without reading/enumerating bytes or requiring DELETE access
+        // on a newly created object. Inherited ACLs may allow creation/read but forbid deletion.
         SafeFileHandle handle = CreateFile(path, 0x81, 3, 0, 3, 0x02200000, 0);
         if (handle.IsInvalid)
         {

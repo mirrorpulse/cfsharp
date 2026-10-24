@@ -285,7 +285,8 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         {
             ArgumentNullException.ThrowIfNull(relativePath);
             return GetSingleAsync(
-                SelectColumns + " WHERE relative_path = $value COLLATE CFSHARP_UNICODE_NOCASE;",
+                SelectColumns + " WHERE relative_path = $value COLLATE CFSHARP_UNICODE_NOCASE " +
+                "ORDER BY is_tombstone, updated_at_ticks DESC, item_id LIMIT 1;",
                 relativePath,
                 cancellationToken);
         }

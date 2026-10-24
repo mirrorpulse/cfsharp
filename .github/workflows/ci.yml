@@ -75,7 +75,7 @@ jobs:
           if-no-files-found: error
 
       - name: Test
-        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
+        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
 
       - name: Verify Delete recovery as a fresh ordinary user
         shell: pwsh
@@ -174,7 +174,7 @@ jobs:
         run: ./eng/verify-runtime-boundaries.ps1 -Configuration Release
 
       - name: Test ARM64 solution
-        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
+        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
 
       - name: Verify Delete recovery as a fresh ordinary ARM64 user
         shell: pwsh
@@ -202,6 +202,74 @@ jobs:
             artifacts/package-capabilities/*/consumer-smoke/packages.lock.json
             artifacts/package-capabilities/*/packages/*.nupkg
             artifacts/package-capabilities/*/packages/*.snupkg
+          if-no-files-found: error
+
+  test-recreation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2022
+          - architecture: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CFSHARP_EXPECTED_TEST_ARCHITECTURE: ${{ matrix.architecture }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          global-json-file: global.json
+
+      - name: Verify native runner architecture
+        shell: pwsh
+        run: |
+          $expected = '${{ matrix.architecture }}'
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ine $expected -or
+              [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -ine $expected) {
+            throw 'The recreation job requires the selected native architecture.'
+          }
+          dotnet --info
+
+      - name: Restore recreation tests
+        run: dotnet restore tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj
+
+      - name: Build recreation tests
+        run: dotnet build tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-restore --disable-build-servers -m:1
+
+      - name: Test retired-path recreation and recovery
+        run: dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category=RemoteRecreation" --logger "trx;LogFileName=recreation-test-results.trx" --blame-hang-timeout 2m --collect "XPlat Code Coverage"
+
+      - name: Verify complete recreation coverage
+        shell: pwsh
+        run: |
+          [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/recreation-test-results.trx -Raw
+          $counts = $report.TestRun.ResultSummary.Counters
+          $cases = @($report.TestRun.Results.UnitTestResult)
+          if ([int]$counts.total -ne 81 -or [int]$counts.executed -ne 81 -or [int]$counts.passed -ne 81 -or
+              @($cases.testName | Sort-Object -Unique).Count -ne 81) {
+            throw 'All 81 distinct native recreation cases must execute and pass; skipped/missing/duplicated cases are failures.'
+          }
+
+      - name: Verify recreation as a fresh ordinary user
+        shell: pwsh
+        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite Recreation
+
+      - name: Upload recreation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: recreation-results-${{ matrix.architecture }}
+          path: |
+            tests/CfSharp.IntegrationTests/TestResults/**/*.trx
+            tests/CfSharp.IntegrationTests/TestResults/**/*.xml
+            artifacts/ordinary-user-recreation/**
           if-no-files-found: error
 
   native-abi-x64:

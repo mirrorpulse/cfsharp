@@ -85,6 +85,10 @@ output, or IDE state. Keep the working tree clean before committing.
 
 ## Local gates
 
+Use the exact SDK patch selected by `global.json`. The Native AOT compiler and linker are
+locked with that validated SDK; an independently newer preinstalled SDK can select incompatible
+runtime packs. Update the SDK and its pinned toolchain together after validating both architectures.
+
 Run the smallest applicable gate first, then the full Release checks when practical:
 
 ```powershell
@@ -98,6 +102,11 @@ pwsh ./eng/verify-runtime-boundaries.ps1 -Configuration Release
 Native or Windows-state changes also require the relevant ABI probe, integration, SQLite recovery,
 or sample-provider tests. The 30-minute x64/ARM64 `LongSoak` is a manual workflow gate, not a
 substitute for the normal test suite.
+
+CI runs native `RemoteRecreation` cases in dedicated x64 and ARM64 jobs, including fresh
+ordinary-user execution. The main solution jobs execute the complementary category partition.
+Together they retain the full ordinary suite without extending existing job or test deadlines.
+The local full-suite command above executes both partitions.
 
 The integration test project can also be built and tested independently in either configuration:
 

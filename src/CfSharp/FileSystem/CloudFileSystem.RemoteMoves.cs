@@ -295,7 +295,7 @@ public sealed partial class CloudFileSystem
             (metadata.ReparseTag != 0 && !placeholder) || (requireInSync && !metadata.InSync) ||
             (!directory && preserveContent && metadata.ModifiedDataSize != 0))
         {
-            throw new IOException("Remote move recovery requires the unchanged original object and safe ancestry.");
+            throw new IOException("Remote namespace recovery requires the unchanged original object and safe ancestry.");
         }
 
         string path = WindowsFileMetadata.ReadFinalPath(handle.DangerousGetHandle());

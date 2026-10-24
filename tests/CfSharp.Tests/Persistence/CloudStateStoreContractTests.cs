@@ -5,6 +5,46 @@ public abstract class CloudStateStoreContractTests
     protected abstract ICloudStateStoreFactory CreateFactory();
 
     [Fact]
+    public async Task PathLookupPrefersLiveOwnerAndRetainsDeterministicRetiredHistory()
+    {
+        await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        CloudItemState first = new(Guid.NewGuid(), "retired-first", "Docs\\Ä.txt", CloudItemKind.File, "v2", 12, true, now);
+        CloudItemState second = new(Guid.Parse("00000000-0000-0000-0000-000000000002"), "retired-second", "docs\\ä.TXT", CloudItemKind.File, "v4", 34, true, now.AddMinutes(1));
+        CloudItemState tied = new(Guid.Parse("00000000-0000-0000-0000-000000000001"), "retired-tied", "Docs\\ä.txt", CloudItemKind.File, "v4-tied", 35, true, second.UpdatedAt);
+        CloudItemState live = new(Guid.NewGuid(), "live", "DOCS\\Ä.TXT", CloudItemKind.File, "v5", 56, false, now.AddMinutes(-1));
+        Guid operationId = Guid.NewGuid();
+        await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
+        {
+            await write.Items.UpsertAsync(first);
+            await write.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.Delete, first.ItemId, [1, 2], now));
+            await write.Items.UpsertAsync(second);
+            Assert.Equal(second.ItemId, (await write.Items.GetByRelativePathAsync("Docs\\ä.txt"))!.ItemId);
+            await write.Items.UpsertAsync(tied);
+            Assert.Equal(tied.ItemId, (await write.Items.GetByRelativePathAsync("Docs\\ä.txt"))!.ItemId);
+            await write.Items.UpsertAsync(live);
+            await write.CommitAsync();
+        }
+
+        await using ICloudStateTransaction verify = await store.BeginTransactionAsync();
+        Assert.Equal(live.ItemId, (await verify.Items.GetByRelativePathAsync("Docs\\ä.txt"))!.ItemId);
+        foreach (CloudItemState retired in new[] { first, second, tied })
+        {
+            CloudItemState row = (await verify.Items.GetByItemIdAsync(retired.ItemId))!;
+            Assert.True(row.IsTombstone);
+            Assert.Equal(retired.RelativePath, row.RelativePath);
+            Assert.Equal(retired.RemoteRevision, row.RemoteRevision);
+            Assert.Equal(retired.LocalFileId, row.LocalFileId);
+            Assert.Equal(retired.UpdatedAt, row.UpdatedAt);
+            Assert.Equal(retired.ItemId, (await verify.Items.GetByRemoteIdAsync(retired.RemoteId))!.ItemId);
+        }
+        Assert.Equal(4, (await verify.Items.ListSubtreeAsync("Docs")).Count);
+        Assert.Equal(first.ItemId, (await verify.Operations.GetAsync(operationId))!.ItemId);
+        await verify.Items.RemoveAsync(live.ItemId);
+        Assert.Equal(tied.ItemId, (await verify.Items.GetByRelativePathAsync("Docs\\ä.txt"))!.ItemId);
+    }
+
+    [Fact]
     public async Task JournalPagingTraversesBacklogWithoutAcknowledgingOrIncludingLaterWrites()
     {
         await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
