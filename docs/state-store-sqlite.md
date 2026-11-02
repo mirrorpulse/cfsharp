@@ -16,6 +16,27 @@ C:\ProgramData\ExampleProvider\Accounts\account-42\cfsharp.db
 One database is bound to one sync root and one active CfSharp owner. Do not open the same database
 from two unrelated provider sessions.
 
+Main, WAL (`-wal`), shared-memory (`-shm`) and `.cfsharp.lock` files must each be regular,
+single-hard-link files. A pre-existing multiple-link layout is rejected with `InvalidPath` before
+SQLite initialization or migration. The provider does not remove aliases, reset journals or repair
+such layouts automatically. Preserve the complete database/sidecar set and resolve its ownership
+offline before reopening. Valid existing single-link stores need no schema or data migration.
+
+Ownership also holds a non-waiting exclusive kernel byte-range lock on each retained main/WAL/SHM
+file handle. This lock identifies the physical file across names and processes; a hard link added
+after validation cannot admit a second provider owner. The protocol byte at offset `2^62` is beyond
+SQLite's data and normal lock ranges and does not allocate or alter file content. A competing lock
+returns `AlreadyInUse` with the underlying Win32 error. Existing no-delete parent/main/sidecar
+handles, reparse checks, root containment and permanent root binding remain in force. Shared or
+retargeted sidecars and lock aliases are likewise rejected; genuinely independent databases remain
+independent. The physical locks outlive pooled SQLite connections and are released on failed open
+or store disposal; an unsuccessful contender cannot release another owner's locks.
+
+This is a cooperative official-provider ownership protocol. It does not attest arbitrary database
+integrity or exclude unrelated SQLite clients, direct file writes or mapped I/O. In particular,
+older provider versions lack this physical-lock protocol: upgrade all participating owners and
+keep application state protected rather than mixing versions to access an aliased database.
+
 ## Transaction semantics
 
 The provider uses transactions, foreign keys, WAL mode, bounded lock waits, and durable checkpoints.

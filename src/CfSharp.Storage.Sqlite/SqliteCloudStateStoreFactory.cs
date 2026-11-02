@@ -20,6 +20,14 @@ namespace CfSharp.Storage.Sqlite;
 /// returned store to release process ownership.
 /// </para>
 /// <para>
+/// Main, WAL, shared-memory and ownership-lock files must each have exactly one hard link.
+/// Unsafe layouts fail with <see cref="SqliteCloudStateStoreError.InvalidPath"/> before SQLite
+/// initialization. Retained main/sidecar handles also hold non-waiting physical ownership locks,
+/// so an alias added during an open lifetime cannot admit a second provider owner. Contention
+/// fails with <see cref="SqliteCloudStateStoreError.AlreadyInUse"/> independently of root context.
+/// This cooperative provider protocol does not exclude arbitrary direct SQLite clients.
+/// </para>
+/// <para>
 /// The factory is immutable and safe for concurrent calls, although concurrent opens for the same
 /// database deterministically allow only one owner. The returned store serializes SQLite writes;
 /// each transaction and its repositories remain single-consumer objects as required by the core
@@ -147,9 +155,15 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
                 "The SQLite database path could not be bound to verified handles.",
                 exception);
         }
+        catch
+        {
+            await ownerLock.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             ValidateSafeLocation(context.SyncRootPath);
             await SqliteSchema.InitializeAsync(
                 connectionString,
@@ -166,13 +180,13 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         }
         catch
         {
-            databaseLease?.Dispose();
             try
             {
                 SqliteConnectionPool.Clear(connectionString);
             }
             finally
             {
+                databaseLease?.Dispose();
                 await ownerLock.DisposeAsync().ConfigureAwait(false);
             }
 
@@ -311,6 +325,7 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         try
         {
             SqlitePathHandleLease.EnsureNotReparsePoint(handle, lockPath);
+            SqliteFileOwnership.EnsureSingleLink(handle, lockPath);
         }
         catch (IOException exception)
         {
@@ -546,6 +561,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
             try
             {
                 EnsureNotReparsePoint(database, fullDatabasePath);
+                SqliteFileOwnership.Acquire(database, fullDatabasePath, fullDatabasePath);
                 handles.Add(database);
                 foreach (string sidecarPath in new[] { fullDatabasePath + "-wal", fullDatabasePath + "-shm" })
                 {
@@ -569,6 +585,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
                     try
                     {
                         EnsureNotReparsePoint(sidecar, sidecarPath);
+                        SqliteFileOwnership.Acquire(sidecar, fullDatabasePath, sidecarPath);
                         handles.Add(sidecar);
                     }
                     catch
