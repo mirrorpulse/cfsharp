@@ -107,6 +107,9 @@ CI runs native `RemoteRecreation` cases in dedicated x64 and ARM64 jobs, includi
 ordinary-user execution. The main solution jobs execute the complementary category partition.
 Together they retain the full ordinary suite without extending existing job or test deadlines.
 The local full-suite command above executes both partitions.
+The same dedicated jobs execute all native `PhysicalOwnership` SQLite cases, including child
+processes and retained-handle acquisition boundaries; main jobs exclude only that new category.
+Their original SQLite suite remains intact. Original TRXs must prove both partitions passed.
 
 The integration test project can also be built and tested independently in either configuration:
 

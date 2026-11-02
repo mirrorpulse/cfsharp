@@ -1,13 +1,13 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-
 using CfSharp.Tests.Persistence;
 using Microsoft.Data.Sqlite;
+using Xunit.Abstractions;
 using Xunit.Sdk;
 
 namespace CfSharp.Storage.Sqlite.Tests;
 
-public sealed partial class SqliteCloudStateStoreTests : CloudStateStoreContractTests, IAsyncLifetime
+public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output) : CloudStateStoreContractTests, IAsyncLifetime
 {
     private string _temporaryDirectory = null!;
     private string _syncRootPath = null!;

@@ -1,6 +1,11 @@
 using CfSharp;
 using CfSharp.Storage.Sqlite;
 
+if (args.Length is 3 or 5 && args[2].StartsWith("ownership-", StringComparison.Ordinal))
+{
+    return await SqliteOwnershipProcess.RunAsync(args);
+}
+
 if (args.Length == 2 && args[0] == "delete-directory-hidden")
 {
     File.SetAttributes(args[1], File.GetAttributes(args[1]) | FileAttributes.Hidden);
