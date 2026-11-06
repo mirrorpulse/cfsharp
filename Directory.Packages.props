@@ -7,8 +7,8 @@
   <ItemGroup>
     <PackageVersion Include="coverlet.collector" Version="6.0.0" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="8.0.31" />
-    <PackageVersion Include="Microsoft.DotNet.ILCompiler" Version="10.0.12" />
-    <PackageVersion Include="Microsoft.NET.ILLink.Tasks" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.DotNet.ILCompiler" Version="10.0.14" />
+    <PackageVersion Include="Microsoft.NET.ILLink.Tasks" Version="10.0.14" />
     <PackageVersion Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.9169" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageVersion Include="xunit" Version="2.5.3" />
