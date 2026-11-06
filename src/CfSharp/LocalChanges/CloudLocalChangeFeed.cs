@@ -636,6 +636,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     previousRelativePath: null,
                     cancellationToken).ConfigureAwait(false);
                 break;
+            case LocalChangeSourceAction.SecurityModified:
+                await PersistChangeAsync(
+                    CloudLocalChangeKind.MetadataUpdate,
+                    sourceEvent.RelativePath,
+                    previousRelativePath: null,
+                    cancellationToken).ConfigureAwait(false);
+                break;
             case LocalChangeSourceAction.Deleted:
                 await PersistChangeAsync(
                     CloudLocalChangeKind.Delete,

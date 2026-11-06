@@ -1,5 +1,26 @@
 # Local change feed
 
+Windows security-descriptor notifications use a separate native subscription from data and name
+notifications. A security-only change, including a protected Access descriptor write, is delivered
+as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
+Applications distinguish it from content work using the public kind before ACK; no private payload
+or timestamp comparison is required. Directory metadata retains the same public classification.
+
+The metadata observation is not a protected-operation success receipt or proof of a particular
+callback. Failed, canceled and late security writes use the same classification. Content writes,
+truncations and namespace changes still arrive independently, including same-length writes racing
+with a security write. The feed does not consume a suppression ticket, erase a pending row, or
+attribute a later object's data to an earlier Access operation. Generic ambiguous modifications
+remain content candidates; loss/error on either subscription requires reconciliation.
+
+Both subscriptions are started and disposed with the feed. Their observations are serialized into
+the existing durable journal, preserving each retained ID, sequence and payload across restart.
+Across subscriptions, sequence order is the order observed by the feed, not a global Windows
+transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
+infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and
+ACK contracts are unchanged. A feed that was stopped while Windows events occurred still requires
+the application's existing reconciliation policy; no complete offline change history is implied.
+
 The local change feed turns Windows directory notifications into an explicit, bounded application
 queue. It is a coordination aid, not a lossless replacement for reconciliation.
 

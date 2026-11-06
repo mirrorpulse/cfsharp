@@ -12,7 +12,13 @@ public enum CloudLocalChangeKind
     /// <summary>The content of an existing file changed.</summary>
     ContentUpdate = 1,
 
-    /// <summary>Metadata of an existing item changed.</summary>
+    /// <summary>Metadata of an existing item changed, including a security-only Windows notification.</summary>
+    /// <remarks>
+    /// Security notifications are captured independently of data/name notifications and persist as
+    /// metadata operations for files and directories. This is an observation, not proof of a
+    /// particular protected callback or remote acceptance. A simultaneous data change can produce
+    /// a separate ContentUpdate. Older retained operations keep their original classification.
+    /// </remarks>
     MetadataUpdate = 2,
 
     /// <summary>An item moved or was renamed within the sync root.</summary>
@@ -182,6 +188,7 @@ internal enum LocalChangeSourceAction
     RenamedNewName,
     Overflow,
     Error,
+    SecurityModified,
 }
 
 internal readonly record struct LocalChangeSourceEvent(

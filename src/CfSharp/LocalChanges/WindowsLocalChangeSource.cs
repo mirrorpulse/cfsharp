@@ -17,6 +17,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private readonly int _bufferCapacity;
     private readonly object _gate = new();
     private FileSystemWatcher? _watcher;
+    private FileSystemWatcher? _securityWatcher;
     private Func<LocalChangeSourceEvent, ValueTask>? _eventHandler;
     private int _disposed;
 
@@ -48,8 +49,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                     NotifyFilters.Attributes |
                     NotifyFilters.Size |
                     NotifyFilters.LastWrite |
-                    NotifyFilters.CreationTime |
-                    NotifyFilters.Security,
+                    NotifyFilters.CreationTime,
                 InternalBufferSize = _bufferCapacity,
                 Filter = "*",
             };
@@ -58,9 +58,36 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             watcher.Deleted += OnDeleted;
             watcher.Renamed += OnRenamed;
             watcher.Error += OnError;
+            // FILE_ACTION_MODIFIED does not carry the triggering filter. Keep security on a
+            // separate native subscription so a DACL write cannot masquerade as file data.
+            // Never suppress an event by path, timestamp or protected-operation completion:
+            // the data watcher must still deliver any simultaneous or later ordinary write.
+            FileSystemWatcher security = new(_rootPath)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.Security,
+                InternalBufferSize = _bufferCapacity,
+                Filter = "*",
+            };
+            security.Changed += OnSecurityChanged;
+            security.Error += OnError;
             _eventHandler = eventHandler;
             _watcher = watcher;
-            watcher.EnableRaisingEvents = true;
+            _securityWatcher = security;
+            try
+            {
+                watcher.EnableRaisingEvents = true;
+                security.EnableRaisingEvents = true;
+            }
+            catch
+            {
+                _watcher = null;
+                _securityWatcher = null;
+                _eventHandler = null;
+                security.Dispose();
+                watcher.Dispose();
+                throw;
+            }
         }
 
         return Task.CompletedTask;
@@ -74,17 +101,23 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         }
 
         FileSystemWatcher? watcher;
+        FileSystemWatcher? security;
         lock (_gate)
         {
             watcher = _watcher;
             _watcher = null;
+            security = _securityWatcher;
+            _securityWatcher = null;
             _eventHandler = null;
         }
 
-        if (watcher is not null)
+        try
         {
-            watcher.EnableRaisingEvents = false;
-            watcher.Dispose();
+            security?.Dispose();
+        }
+        finally
+        {
+            watcher?.Dispose();
         }
 
         return ValueTask.CompletedTask;
@@ -95,6 +128,9 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 
     private void OnChanged(object sender, FileSystemEventArgs args) =>
         Publish(new(LocalChangeSourceAction.Modified, GetRelativePath(args.FullPath)));
+
+    private void OnSecurityChanged(object sender, FileSystemEventArgs args) =>
+        Publish(new(LocalChangeSourceAction.SecurityModified, GetRelativePath(args.FullPath)));
 
     private void OnDeleted(object sender, FileSystemEventArgs args) =>
         Publish(new(LocalChangeSourceAction.Deleted, GetRelativePath(args.FullPath)));
