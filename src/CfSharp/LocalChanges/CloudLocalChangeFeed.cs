@@ -866,9 +866,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
         // Echo matching can inspect the native path. Uncertainty cannot be suppressed and
         // must not revisit the object after its association or path guard was rejected.
+        // A creation echo does not establish provenance for an independent security write.
         CloudEchoSuppressionState? suppression = uncertainDirectory is null ? suppressions.FirstOrDefault(candidate =>
             RemoteCreationIntent.IsCreationEcho(candidate)
-                ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
+                ? securityObservation is null && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
                 : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)) : null;
         if (suppression is not null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
         {

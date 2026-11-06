@@ -7,6 +7,59 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InSyncSecurityNotificationDoesNotConsumeRemoteCreationEcho(bool directory)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        string path = Path.Combine(fixture.Root, "before");
+        if (directory) { Directory.CreateDirectory(path); }
+        else { await File.WriteAllTextAsync(path, "resident-original"); }
+        CloudItem item = directory ? fixture.System.GetDirectory("before") : fixture.System.GetFile("before");
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "security-creation-echo", "v1");
+        await item.ConvertToPlaceholderAsync(identity);
+        await item.SetInSyncAsync(true);
+        CloudItemSnapshot before = await item.InspectAsync();
+        Guid echoId = Guid.NewGuid();
+        byte[] echoPayload = RemoteCreationIntent.EchoPayload(identity);
+        await using (ICloudStateTransaction seed = await factory!.Store!.BeginTransactionAsync())
+        {
+            await seed.EchoSuppressions.UpsertAsync(new(echoId, identity.ItemId, CloudStateOperationKind.Create,
+                "before", echoPayload, DateTimeOffset.UtcNow.AddMinutes(10), remainingObservations: 2));
+            await seed.CommitAsync();
+        }
+        DelayedSecuritySource source = new(fixture.Root, line => output.WriteLine(line));
+        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source,
+            acquireOperation: async (scopes, stop) => await fixture.System.AcquireOperationAsync(scopes, stop));
+        await feed.StartAsync();
+        await WriteSecurityObservationAsync(item, before);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
+        CloudItemSnapshot after = await item.InspectAsync(deadline.Token);
+        Assert.Equal(CloudSynchronizationState.InSync, after.SynchronizationState);
+        Assert.Equal(identity.Encode(), after.PlaceholderIdentity.ToArray());
+        Assert.Equal(unchecked((ulong)after.LocalFileId!.Value), security.SecurityIdentity!.Value.FileId);
+        await source.DeliverAsync(security);
+        await feed.DisposeAsync();
+        await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
+        CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+        Assert.Equal(echoId, echo.SuppressionId);
+        Assert.Equal(2, echo.RemainingObservations);
+        Assert.Equal(echoPayload, echo.Payload.ToArray());
+        CloudOperationJournalEntry entry = Assert.Single(await verify.Operations.ListAsync(100));
+        Assert.Equal(CloudStateOperationKind.MetadataUpdate, entry.Kind);
+        Assert.Equal(identity.ItemId, entry.ItemId);
+        LocalChangePayload payload = LocalChangePayload.Decode(entry.Payload);
+        Assert.Equal("before", payload.RelativePath);
+        Assert.Equal(directory, payload.IsDirectory);
+        Assert.False(LocalChangeCheckpoint.Decode((await verify.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value).RequiresFullRescan);
+        Assert.Equal(0, fixture.Provider.Fetches);
+        output.WriteLine($"In-sync security: directory={directory}; nativeFile={after.LocalFileId}; bound={entry.ItemId}; echoRemaining={echo.RemainingObservations}.");
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
     [InlineData(false, true, false)]
     [InlineData(true, true, false)]
     [InlineData(false, false, false)]
@@ -181,5 +234,17 @@ public sealed partial class CloudContentConfirmationTests
             Assert.Equal(1, echo.RemainingObservations);
         }
         Assert.Equal(0, fixture.Provider.Fetches);
+    }
+
+    private static async Task WriteSecurityObservationAsync(CloudItem item, CloudItemSnapshot before)
+    {
+        CloudProtectedLocalOperationResult applied = await item.RunProtectedLocalOperationAsync(new(before.LocalBinding!,
+            item.Kind == CloudItemKind.Directory ? CloudProtectedLocalOperationMode.DirectoryMetadata : CloudProtectedLocalOperationMode.ExclusiveFile), async (scope, stop) =>
+        {
+            FileSystemSecurity access = await scope.ReadAccessDescriptorAsync(stop);
+            access.AddAccessRule(AccessTestRule());
+            await scope.ApplyAccessDescriptorAsync(access, stop);
+        });
+        Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
     }
 }
