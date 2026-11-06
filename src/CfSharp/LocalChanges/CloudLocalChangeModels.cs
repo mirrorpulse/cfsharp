@@ -18,6 +18,8 @@ public enum CloudLocalChangeKind
     /// metadata operations for files and directories. This is an observation, not proof of a
     /// particular protected callback or remote acceptance. A simultaneous data change can produce
     /// a separate ContentUpdate. Older retained operations keep their original classification.
+    /// A missing or mismatched native identity remains unbound and requires reconciliation;
+    /// a security observation never discovers a new item from its historical path.
     /// </remarks>
     MetadataUpdate = 2,
 
@@ -194,7 +196,10 @@ internal enum LocalChangeSourceAction
 internal readonly record struct LocalChangeSourceEvent(
     LocalChangeSourceAction Action,
     string RelativePath,
-    int ErrorCode = 0);
+    int ErrorCode = 0,
+    LocalSecurityChangeIdentity? SecurityIdentity = null);
+
+internal readonly record struct LocalSecurityChangeIdentity(ulong VolumeSerialNumber, Guid RootFileId, ulong FileId, ulong ParentFileId, bool IsDirectory);
 
 internal sealed record LocalChangePayload(
     string RelativePath,

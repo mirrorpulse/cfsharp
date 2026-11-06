@@ -93,9 +93,16 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     /// <summary>Starts the native watcher and the durable normalization worker.</summary>
     /// <param name="cancellationToken">Token that cancels startup before the watcher is opened.</param>
-    /// <remarks>Background notification consumption does not require pumping the starting synchronization context.</remarks>
+    /// <remarks>
+    /// Background notification consumption does not require pumping the starting synchronization context.
+    /// Security notifications use the NTFS extended directory API on Windows 10 version 1709 / Windows
+    /// Server 2019 or later. The feed owns its security read issuer until native cancellation completes;
+    /// callers do not need to retain the startup thread. Unprovable security associations require reconciliation.
+    /// </remarks>
     /// <exception cref="InvalidOperationException">The feed has already been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    /// <exception cref="System.ComponentModel.Win32Exception">Windows cannot open or start the native directory subscription; the native error is retained.</exception>
+    /// <exception cref="EntryPointNotFoundException">Windows does not provide the required extended directory API.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate)
@@ -641,7 +648,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     CloudLocalChangeKind.MetadataUpdate,
                     sourceEvent.RelativePath,
                     previousRelativePath: null,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, sourceEvent).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.Deleted:
                 await PersistChangeAsync(
@@ -679,7 +686,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudLocalChangeKind kind,
         string relativePath,
         string? previousRelativePath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        LocalChangeSourceEvent? securityObservation = null)
     {
         CloudItemPath path;
         try
@@ -716,10 +724,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         using IDisposable? operation = kind == CloudLocalChangeKind.Move && previousPath is not null && _acquireOperation is not null
             ? await _acquireOperation([CloudItemOperationScope.Subtree(previousPath.Value.FullPath),
                 CloudItemOperationScope.Subtree(path.FullPath)], cancellationToken).ConfigureAwait(false)
-            : null;
+            : securityObservation is not null && _acquireOperation is not null
+                ? await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false)
+                : null;
         try
         {
-            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, null, cancellationToken).ConfigureAwait(false);
+            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, null, cancellationToken, securityObservation).ConfigureAwait(false);
         }
         catch (CloudNamespaceObservationUncertainException exception)
         {
@@ -727,7 +737,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // check failed). Reuse its acknowledgement identity when retaining uncertainty.
             SignalLoss();
             await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, securityObservation).ConfigureAwait(false);
         }
         catch (IOException) when (kind == CloudLocalChangeKind.Move)
         {
@@ -749,7 +759,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PersistChangeCoreAsync(CloudLocalChangeKind kind, CloudItemPath path,
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
     {
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -762,6 +772,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemState? previous = previousPath is null
             ? null
             : await transaction.Items.GetByRelativePathAsync(previousPath.Value.RelativePath, cancellationToken).ConfigureAwait(false);
+        using SecurityFeedProjection? securityProjection = securityObservation is not null && uncertainDirectory is null
+            ? TryBindSecurityObservation(path, current, securityObservation.Value.SecurityIdentity) : null;
+        if (securityObservation is not null && securityProjection is null)
+        {
+            // Separate native subscriptions have no common delivery order. Never discover an
+            // item or associate a replacement from the path of a historical security record.
+            uncertainDirectory ??= securityObservation.Value.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory;
+        }
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingCreation = creations.Select(value => RemoteCreationIntent.Decode(value.Value)).Any(intent =>
@@ -896,7 +914,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 observedAt);
         }
 
-        if (uncertainDirectory is null && directoryProjection is null && state is not null)
+        if (securityObservation is null && uncertainDirectory is null && directoryProjection is null && state is not null)
         {
             CloudItemState updated = new(
                 state.ItemId,
@@ -952,6 +970,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             observedAt,
             cancellationToken).ConfigureAwait(false);
         directoryProjection?.Validate();
+        securityProjection?.Validate();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (requiresRescan)
         {
@@ -959,6 +978,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
 
         directoryProjection?.Validate();
+        securityProjection?.Validate();
         SignalAvailable();
 
         async ValueTask<DirectoryFeedProjection?> TryProjectDirectoryAsync()

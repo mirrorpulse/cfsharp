@@ -1,10 +1,25 @@
 # Local change feed
 
-Windows security-descriptor notifications use a separate native subscription from data and name
-notifications. A security-only change, including a protected Access descriptor write, is delivered
+Windows security-descriptor notifications use a separate NTFS extended native subscription from data and name
+notifications, retaining the kernel's file ID and volume rather than reopening the event's path to infer origin.
+A security-only change, including a protected Access descriptor write, is delivered
 as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
 Applications distinguish it from content work using the public kind before ACK; no private payload
 or timestamp comparison is required. Directory metadata retains the same public classification.
+
+Before binding a security observation, the feed verifies its kernel ID against the existing durable
+item and the current native placeholder identity, holding the object and ancestor namespace guards
+through the journal transaction. Security observations never discover or rewrite an item row.
+An absent path, replacement, untracked ordinary object, unavailable binding or denied guard remains
+an unbound `MetadataUpdate` with a durable full-rescan fence. This also covers security records
+delivered after a rename from the independent name subscription. The original path, kind and
+operation ID survive restart; after explicit reconciliation, public pages expose that unbound
+observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
+
+The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
+or later. Unsupported native subscription startup reports the original Windows failure. Overflow
+or failure during either subscription requires reconciliation. Disposal cancels pending native I/O
+and observes its completion before releasing its buffer, event, directory handle and overlapped state.
 
 The metadata observation is not a protected-operation success receipt or proof of a particular
 callback. Failed, canceled and late security writes use the same classification. Content writes,

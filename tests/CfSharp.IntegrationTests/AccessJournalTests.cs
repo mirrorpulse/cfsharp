@@ -43,6 +43,10 @@ public sealed partial class CloudContentConfirmationTests
         await fixture.File.ConvertToPlaceholderAsync(identity);
         string directoryPath = Path.Combine(fixture.Root, "directory");
         Directory.CreateDirectory(directoryPath);
+        if (scenario == "directory")
+        {
+            await fixture.System.GetDirectory("directory").ConvertToPlaceholderAsync(new(Guid.NewGuid(), "access-directory", "v1"));
+        }
         if (restartBeforeObservation) { await fixture.RestartAsync(); }
         CloudItem item = scenario == "directory" ? fixture.System.GetDirectory("directory") : fixture.File;
         CloudItemSnapshot before = await item.InspectAsync();
