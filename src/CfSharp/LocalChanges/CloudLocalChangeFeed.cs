@@ -728,11 +728,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         using IDisposable? operation = kind == CloudLocalChangeKind.Move && previousPath is not null && _acquireOperation is not null
             ? await _acquireOperation([CloudItemOperationScope.Subtree(previousPath.Value.FullPath),
                 CloudItemOperationScope.Subtree(path.FullPath)], cancellationToken).ConfigureAwait(false)
-            : securityObservation is not null && _acquireOperation is not null
-                ? await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false)
-                : null;
+            : null;
         try
         {
+            using IDisposable? securityOperation = securityObservation is not null
+                ? await AcquireSecurityOperationAsync(path, securityObservation.Value, cancellationToken).ConfigureAwait(false)
+                : null;
             await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, null, cancellationToken, securityObservation).ConfigureAwait(false);
         }
         catch (CloudNamespaceObservationUncertainException exception)

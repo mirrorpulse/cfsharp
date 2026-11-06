@@ -115,7 +115,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(0, fixture.Provider.Fetches);
     }
 
-    private sealed class DelayedSecuritySource(string root, Action<string> trace) : ILocalChangeSource
+    private sealed class DelayedSecuritySource(string root, Action<string> trace, string securityPath = "before") : ILocalChangeSource
     {
         private readonly WindowsLocalChangeSource _native = new(root, 64 * 1024);
         private Func<LocalChangeSourceEvent, ValueTask>? _handler;
@@ -133,7 +133,7 @@ public sealed partial class CloudContentConfirmationTests
                 {
                     Security.TrySetException(new IOException($"Native security source error: {change.ErrorCode}."));
                 }
-                if (change.Action == LocalChangeSourceAction.SecurityModified && change.RelativePath == "before") { Security.TrySetResult(change); }
+                if (change.Action == LocalChangeSourceAction.SecurityModified && change.RelativePath == securityPath) { Security.TrySetResult(change); }
                 if (change.Action == LocalChangeSourceAction.RenamedNewName && change.RelativePath == "after") { Rename.TrySetResult(); }
                 return ValueTask.CompletedTask;
             }, stop);

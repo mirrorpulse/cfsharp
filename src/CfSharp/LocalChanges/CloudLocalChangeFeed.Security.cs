@@ -8,6 +8,22 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
+    private async ValueTask<IDisposable?> AcquireSecurityOperationAsync(CloudItemPath path,
+        LocalChangeSourceEvent observation, CancellationToken cancellationToken)
+    {
+        if (_acquireOperation is null) { return null; }
+        try
+        {
+            return await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
+        }
+        catch (CloudPathReparsePointException exception)
+        {
+            // Resolution is only a snapshot. A replaced ancestor can reject the facade's
+            // guard before any transaction begins; retain the event without traversing it.
+            throw new CloudNamespaceObservationUncertainException(observation.SecurityIdentity?.IsDirectory ?? false, exception);
+        }
+    }
+
     private SecurityFeedProjection? TryBindSecurityObservation(CloudItemPath path, CloudItemState? state,
         LocalSecurityChangeIdentity? identity)
     {
@@ -39,7 +55,7 @@ public sealed partial class CloudLocalChangeFeed
             parents = null;
             return result;
         }
-        catch (Exception exception) when (exception is CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
         {
             // Missing/replaced objects, denied metadata access and unavailable bindings are
             // observations to reconcile, not permission to create an item from a stale path.
@@ -67,7 +83,7 @@ public sealed partial class CloudLocalChangeFeed
                     !current.PlaceholderIdentity.AsSpan().SequenceEqual(expected.PlaceholderIdentity))
                 { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
             }
-            catch (Exception exception) when (exception is CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+            catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
             { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory, exception); }
         }
 
