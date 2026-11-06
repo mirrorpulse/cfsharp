@@ -36,6 +36,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private readonly ILocalChangeSource _source;
     private readonly Action<CloudLocalChangeFeed>? _onDisposed;
     private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireOperation;
+    private readonly CloudSecurityInspection? _securityInspection;
     private readonly Channel<LocalChangeSourceEvent> _sourceEvents;
     private readonly Channel<bool> _availability = Channel.CreateUnbounded<bool>(
         new UnboundedChannelOptions
@@ -64,7 +65,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudLocalChangeFeedOptions options,
         ILocalChangeSource source,
         Action<CloudLocalChangeFeed>? onDisposed = null,
-        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null)
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null,
+        CloudSecurityInspection? securityInspection = null)
     {
         _syncRootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(syncRootPath));
         _stateStore = stateStore;
@@ -73,6 +75,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         _source = source;
         _onDisposed = onDisposed;
         _acquireOperation = acquireOperation;
+        _securityInspection = securityInspection;
         _sourceEvents = Channel.CreateBounded<LocalChangeSourceEvent>(
             new BoundedChannelOptions(options.BufferCapacity)
             {
@@ -526,8 +529,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         string syncRootPath,
         ICloudStateStore stateStore,
         CloudLocalChangeFeedOptions options,
-        ILocalChangeSource source) =>
-        new(syncRootPath, stateStore, options, source);
+        ILocalChangeSource source,
+        CloudSecurityInspection? securityInspection = null) =>
+        new(syncRootPath, stateStore, options, source, securityInspection: securityInspection);
 
     private async Task ProcessEventsAsync()
     {

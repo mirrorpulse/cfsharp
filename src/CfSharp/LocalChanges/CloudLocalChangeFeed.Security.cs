@@ -26,22 +26,24 @@ public sealed partial class CloudLocalChangeFeed
         {
             parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]);
             guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
-            LocalCloudItemInspection observed = CloudItemInspector.Inspect(guard, path.FullPath, state.Kind, _syncRootPath);
+            LocalCloudItemInspection observed = _securityInspection?.Invoke(guard, path.FullPath, state.Kind, _syncRootPath)
+                ?? CloudItemInspector.Inspect(guard, path.FullPath, state.Kind, _syncRootPath);
             if (observed.LocalFileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
                 observed.LocalBinding?.VolumeSerialNumber != identity.Value.VolumeSerialNumber ||
                 observed.LocalBinding?.SyncRootFileId != identity.Value.RootFileId ||
                 !CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
                 placeholder.ItemId != state.ItemId || !string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal))
             { return null; }
-            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents);
+            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection);
             guard = null;
             parents = null;
             return result;
         }
-        catch (Exception exception) when (exception is Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception exception) when (exception is CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
         {
             // Missing/replaced objects, denied metadata access and unavailable bindings are
             // observations to reconcile, not permission to create an item from a stale path.
+            // CfGetPlaceholderInfo can fail after attributes were read if the object reverted.
             return null;
         }
         finally
@@ -52,19 +54,20 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private sealed class SecurityFeedProjection(string root, CloudItemPath path, CloudItemKind kind,
-        LocalCloudItemInspection expected, SafeFileHandle guard, IDisposable parents) : IDisposable
+        LocalCloudItemInspection expected, SafeFileHandle guard, IDisposable parents, CloudSecurityInspection? inspection) : IDisposable
     {
         internal void Validate()
         {
             if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { throw new PlatformNotSupportedException(); }
             try
             {
-                LocalCloudItemInspection current = CloudItemInspector.Inspect(guard, path.FullPath, kind, root);
+                LocalCloudItemInspection current = inspection?.Invoke(guard, path.FullPath, kind, root)
+                    ?? CloudItemInspector.Inspect(guard, path.FullPath, kind, root);
                 if (current.LocalBinding != expected.LocalBinding || current.LocalFileId != expected.LocalFileId ||
                     !current.PlaceholderIdentity.AsSpan().SequenceEqual(expected.PlaceholderIdentity))
                 { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
             }
-            catch (Exception exception) when (exception is Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+            catch (Exception exception) when (exception is CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
             { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory, exception); }
         }
 
@@ -75,3 +78,5 @@ public sealed partial class CloudLocalChangeFeed
         }
     }
 }
+
+internal delegate LocalCloudItemInspection CloudSecurityInspection(SafeFileHandle handle, string path, CloudItemKind kind, string root);

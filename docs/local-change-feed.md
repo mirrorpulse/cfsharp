@@ -16,6 +16,13 @@ delivered after a rename from the independent name subscription. The original pa
 operation ID survive restart; after explicit reconciliation, public pages expose that unbound
 observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
 
+A cloud metadata query can fail while an object is reverting from placeholder to ordinary file,
+including between the attribute query and `CfGetPlaceholderInfo`. This inspection uncertainty
+requires reconciliation and does not stop the notification worker. Initial or pre-commit failures
+retain an unbound observation. A post-commit failure retains the already committed operation ID,
+sequence and association, fences dispatch, and requires reconciliation without duplicating the
+observation. Later independent notifications continue to be journaled in either case.
+
 The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
 or failure during either subscription requires reconciliation. Disposal cancels pending native I/O
