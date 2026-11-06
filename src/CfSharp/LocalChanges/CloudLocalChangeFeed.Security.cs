@@ -12,6 +12,22 @@ public sealed partial class CloudLocalChangeFeed
         LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {
         bool isDirectory = observation.SecurityIdentity?.IsDirectory ?? false;
+        bool contained;
+        try
+        {
+            contained = CloudItemPathResolver.IsPhysicallyContained(_syncRootPath, path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            throw new CloudNamespaceObservationUncertainException(isDirectory, exception);
+        }
+
+        if (!contained)
+        {
+            // Keep the lexically valid historical path without acquiring a lease on the target.
+            throw new CloudNamespaceObservationUncertainException(isDirectory);
+        }
+
         if (_acquireOperation is null) { return null; }
         try
         {

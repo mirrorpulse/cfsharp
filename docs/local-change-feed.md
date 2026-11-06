@@ -18,13 +18,12 @@ delivered after a rename from the independent name subscription. The original pa
 operation ID survive restart; after explicit reconciliation, public pages expose that unbound
 observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
 
-If an ancestor becomes a junction between path resolution and security-lease acquisition or
-identity inspection, or a native sharing conflict prevents acquisition of the ancestor lease,
-its path-protection rejection uses the same unbound observation and durable
-reconciliation fence. Recovery does not reacquire the rejected path or inspect the linked object;
-native echo matching and path-based reclassification also remain disabled for uncertain observations,
-preserving pending echo records. Later independent notifications continue through the same worker.
-Unrelated store and lifecycle failures retain their existing error behavior.
+The feed validates a security notification's historical path before checking the live namespace.
+A valid relative path is retained when a junction already redirects it outside the root at delivery,
+when a junction appears during guard acquisition or identity inspection, or when a native sharing
+conflict prevents acquiring the ancestor lease. These observations remain unbound behind a durable
+reconciliation fence. Recovery uses the retained path and kind, leaving pending echoes intact and
+allowing independent notifications to continue through the same worker.
 
 A cloud metadata query can fail while an object is reverting from placeholder to ordinary file,
 including between the attribute query and `CfGetPlaceholderInfo`. This inspection uncertainty

@@ -72,6 +72,10 @@ public sealed partial class CloudContentConfirmationTests
     [InlineData(true, SecurityAncestorFailure.JunctionAtAcquisition, true)]
     [InlineData(false, SecurityAncestorFailure.JunctionAtBinding, true)]
     [InlineData(true, SecurityAncestorFailure.JunctionAtBinding, true)]
+    [InlineData(false, SecurityAncestorFailure.JunctionBeforeDelivery, false)]
+    [InlineData(true, SecurityAncestorFailure.JunctionBeforeDelivery, false)]
+    [InlineData(false, SecurityAncestorFailure.JunctionBeforeDelivery, true)]
+    [InlineData(true, SecurityAncestorFailure.JunctionBeforeDelivery, true)]
     [InlineData(false, SecurityAncestorFailure.SharingViolation, true)]
     [InlineData(true, SecurityAncestorFailure.SharingViolation, true)]
     public async Task SecurityAncestorFailureRetainsObservationAndProcessesLaterEvents(bool directory, SecurityAncestorFailure failure, bool creationEcho)
@@ -153,6 +157,7 @@ public sealed partial class CloudContentConfirmationTests
                             new Win32Exception(guardError.Value));
                     }
 
+                    Assert.NotEqual(SecurityAncestorFailure.JunctionBeforeDelivery, failure);
                     await ReplaceAncestorWithJunctionAsync(stop);
                     // Hold only the root for the binding case so TryBind must guard parent.
                     return await fixture.System.AcquireOperationAsync(failure == SecurityAncestorFailure.JunctionAtBinding
@@ -166,6 +171,7 @@ public sealed partial class CloudContentConfirmationTests
             await WriteSecurityObservationAsync(item, before);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
             LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
+            if (failure == SecurityAncestorFailure.JunctionBeforeDelivery) { await ReplaceAncestorWithJunctionAsync(deadline.Token); }
             await source.DeliverAsync(security);
             while (!(await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan) { await Task.Delay(20, deadline.Token); }
             await File.WriteAllTextAsync(Path.Combine(fixture.Root, "later.bin"), "genuine-later-bytes", deadline.Token);
@@ -179,7 +185,7 @@ public sealed partial class CloudContentConfirmationTests
             await source.DeliverAsync(created.Value);
             await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => row.Kind == CloudStateOperationKind.Create));
             await feed.DisposeAsync();
-            Assert.Equal(1, acquisitions);
+            Assert.Equal(failure == SecurityAncestorFailure.JunctionBeforeDelivery ? 0 : 1, acquisitions);
             Assert.Equal(failure == SecurityAncestorFailure.SharingViolation ? 32 : (int?)null, guardError);
             Assert.Equal(0, inspections);
             Assert.Equal("outside-unchanged", await File.ReadAllTextAsync(sentinel));
@@ -280,6 +286,7 @@ public sealed partial class CloudContentConfirmationTests
     {
         JunctionAtAcquisition,
         JunctionAtBinding,
+        JunctionBeforeDelivery,
         SharingViolation,
     }
 

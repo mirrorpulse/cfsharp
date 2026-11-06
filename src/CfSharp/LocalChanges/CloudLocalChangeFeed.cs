@@ -696,7 +696,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemPath path;
         try
         {
-            path = CloudItemPathResolver.Resolve(_syncRootPath, relativePath, allowRoot: false);
+            path = securityObservation is null
+                ? CloudItemPathResolver.Resolve(_syncRootPath, relativePath, allowRoot: false)
+                : CloudItemPathResolver.ResolveLexically(_syncRootPath, relativePath, allowRoot: false);
         }
         catch (ArgumentException)
         {
