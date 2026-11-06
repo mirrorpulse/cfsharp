@@ -7,11 +7,15 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    public async Task SecurityAncestorJunctionRetainsObservationAndProcessesLaterEvents(bool directory, bool failAcquisition)
+    [InlineData(false, true, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, true)]
+    [InlineData(false, false, true)]
+    [InlineData(true, false, true)]
+    public async Task SecurityAncestorJunctionRetainsObservationAndProcessesLaterEvents(bool directory, bool failAcquisition, bool creationEcho)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -24,21 +28,31 @@ public sealed partial class CloudContentConfirmationTests
         string relativePath = Path.Combine("parent", "before");
         string path = Path.Combine(fixture.Root, relativePath);
         string target = Path.Combine(outside, "before");
-        if (directory) { Directory.CreateDirectory(path); Directory.CreateDirectory(target); }
+        if (directory) { Directory.CreateDirectory(path); }
         else { await File.WriteAllTextAsync(path, "resident-original"); }
-        string sentinel = directory ? Path.Combine(target, "sentinel.bin") : target;
+        // A mismatched external target makes any unsafe echo inspection fail in the
+        // real inspector. The rejected namespace must never reach that probe.
+        bool targetDirectory = directory != creationEcho;
+        if (targetDirectory) { Directory.CreateDirectory(target); }
+        string sentinel = targetDirectory ? Path.Combine(target, "sentinel.bin") : target;
         await File.WriteAllTextAsync(sentinel, "outside-unchanged");
         CloudItem item = directory ? fixture.System.GetDirectory(relativePath) : fixture.System.GetFile(relativePath);
         CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "security-path-protection", "v1");
         await item.ConvertToPlaceholderAsync(identity);
         CloudItemSnapshot before = await item.InspectAsync();
         Guid retainedId = Guid.NewGuid();
+        Guid echoId = Guid.NewGuid();
         CloudItemState originalState;
         await using (ICloudStateTransaction seed = await factory!.Store!.BeginTransactionAsync())
         {
             originalState = (await seed.Items.GetByItemIdAsync(identity.ItemId))!;
             await seed.Operations.EnqueueAsync(new(retainedId, CloudStateOperationKind.MetadataUpdate, identity.ItemId,
                 new LocalChangePayload(relativePath, null, directory, DateTimeOffset.UtcNow).Encode(), DateTimeOffset.UtcNow));
+            if (creationEcho)
+            {
+                await seed.EchoSuppressions.UpsertAsync(new(echoId, identity.ItemId, CloudStateOperationKind.Create,
+                    relativePath, RemoteCreationIntent.EchoPayload(identity), DateTimeOffset.UtcNow.AddMinutes(10)));
+            }
             await seed.CommitAsync();
         }
         IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
@@ -129,7 +143,14 @@ public sealed partial class CloudContentConfirmationTests
             Assert.True(LocalChangeCheckpoint.Decode((await verify.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value).RequiresFullRescan);
             Assert.Equivalent(originalState, await verify.Items.GetByItemIdAsync(identity.ItemId), strict: true);
             Assert.Equal(2, (await verify.Items.ListSubtreeAsync(string.Empty)).Count);
-            output.WriteLine($"Security junction: directory={directory}; acquisition={failAcquisition}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
+            if (creationEcho)
+            {
+                CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+                Assert.Equal(echoId, echo.SuppressionId);
+                Assert.Equal(1, echo.RemainingObservations);
+                Assert.Equal(RemoteCreationIntent.EchoPayload(identity), echo.Payload.ToArray());
+            }
+            output.WriteLine($"Security junction: directory={directory}; acquisition={failAcquisition}; creationEcho={creationEcho}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
         }
         finally
         {
@@ -152,6 +173,13 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudLocalChangeKind.MetadataUpdate, observationAfterRestart.Kind);
         await reopened.AcknowledgeAsync([observationId]);
         AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
+        if (creationEcho)
+        {
+            await using ICloudStateTransaction verify = await factory!.Store!.BeginTransactionAsync();
+            CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+            Assert.Equal(echoId, echo.SuppressionId);
+            Assert.Equal(1, echo.RemainingObservations);
+        }
         Assert.Equal(0, fixture.Provider.Fetches);
     }
 }

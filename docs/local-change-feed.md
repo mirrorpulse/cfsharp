@@ -19,8 +19,9 @@ observation for acknowledgement. Earlier operations and replacement item rows re
 If an ancestor becomes a junction between path resolution and security-lease acquisition or
 identity inspection, its path-protection rejection uses the same unbound observation and durable
 reconciliation fence. Recovery does not reacquire the rejected path or inspect the linked object;
-later independent notifications continue through the same worker. Unrelated store and lifecycle
-failures retain their existing error behavior.
+native echo matching and path-based reclassification also remain disabled for uncertain observations,
+preserving pending echo records. Later independent notifications continue through the same worker.
+Unrelated store and lifecycle failures retain their existing error behavior.
 
 A cloud metadata query can fail while an object is reverting from placeholder to ordinary file,
 including between the attribute query and `CfGetPlaceholderInfo`. This inspection uncertainty

@@ -823,7 +823,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
-                Directory.Exists(path.FullPath), observedAt);
+                uncertainDirectory ?? Directory.Exists(path.FullPath), observedAt);
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
                 (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
@@ -846,7 +846,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemState? observedState = kind == CloudLocalChangeKind.Delete
             ? current
             : previous ?? current;
-        bool directory = observedState?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath);
+        // A retained uncertain kind must not be reclassified through a rejected namespace.
+        bool directory = uncertainDirectory ?? (observedState?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath));
         using DirectoryFeedProjection? directoryProjection = uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previousPath is not null
             ? await TryProjectDirectoryAsync().ConfigureAwait(false) : null;
         if (uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previous is not null && current is not null &&
@@ -863,10 +864,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
         IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
             .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
-        CloudEchoSuppressionState? suppression = suppressions.FirstOrDefault(candidate =>
+        // Echo matching can inspect the native path. Uncertainty cannot be suppressed and
+        // must not revisit the object after its association or path guard was rejected.
+        CloudEchoSuppressionState? suppression = uncertainDirectory is null ? suppressions.FirstOrDefault(candidate =>
             RemoteCreationIntent.IsCreationEcho(candidate)
                 ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
-                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId));
+                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)) : null;
         if (suppression is not null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
         {
             if (suppression.RemainingObservations == 1)
