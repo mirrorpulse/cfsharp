@@ -11,16 +11,17 @@ public sealed partial class CloudLocalChangeFeed
     private async ValueTask<IDisposable?> AcquireSecurityOperationAsync(CloudItemPath path,
         LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {
+        bool isDirectory = observation.SecurityIdentity?.IsDirectory ?? false;
         if (_acquireOperation is null) { return null; }
         try
         {
             return await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
         }
-        catch (CloudPathReparsePointException exception)
+        catch (Exception exception) when (exception is CloudPathReparsePointException or IOException { InnerException: Win32Exception })
         {
-            // Resolution is only a snapshot. A replaced ancestor can reject the facade's
-            // guard before any transaction begins; retain the event without traversing it.
-            throw new CloudNamespaceObservationUncertainException(observation.SecurityIdentity?.IsDirectory ?? false, exception);
+            // A replacement or sharing conflict can prevent the facade from guarding an
+            // ancestor before any transaction begins. Keep the observation for reconciliation.
+            throw new CloudNamespaceObservationUncertainException(isDirectory, exception);
         }
     }
 

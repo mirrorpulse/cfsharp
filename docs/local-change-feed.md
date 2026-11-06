@@ -19,7 +19,8 @@ operation ID survive restart; after explicit reconciliation, public pages expose
 observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
 
 If an ancestor becomes a junction between path resolution and security-lease acquisition or
-identity inspection, its path-protection rejection uses the same unbound observation and durable
+identity inspection, or a native sharing conflict prevents acquisition of the ancestor lease,
+its path-protection rejection uses the same unbound observation and durable
 reconciliation fence. Recovery does not reacquire the rejected path or inspect the linked object;
 native echo matching and path-based reclassification also remain disabled for uncertain observations,
 preserving pending echo records. Later independent notifications continue through the same worker.

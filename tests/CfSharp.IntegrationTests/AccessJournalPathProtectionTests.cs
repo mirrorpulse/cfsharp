@@ -1,5 +1,9 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+
+using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp.IntegrationTests;
 
@@ -60,15 +64,17 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(false, true, false)]
-    [InlineData(true, true, false)]
-    [InlineData(false, false, false)]
-    [InlineData(true, false, false)]
-    [InlineData(false, true, true)]
-    [InlineData(true, true, true)]
-    [InlineData(false, false, true)]
-    [InlineData(true, false, true)]
-    public async Task SecurityAncestorJunctionRetainsObservationAndProcessesLaterEvents(bool directory, bool failAcquisition, bool creationEcho)
+    [InlineData(false, SecurityAncestorFailure.JunctionAtAcquisition, false)]
+    [InlineData(true, SecurityAncestorFailure.JunctionAtAcquisition, false)]
+    [InlineData(false, SecurityAncestorFailure.JunctionAtBinding, false)]
+    [InlineData(true, SecurityAncestorFailure.JunctionAtBinding, false)]
+    [InlineData(false, SecurityAncestorFailure.JunctionAtAcquisition, true)]
+    [InlineData(true, SecurityAncestorFailure.JunctionAtAcquisition, true)]
+    [InlineData(false, SecurityAncestorFailure.JunctionAtBinding, true)]
+    [InlineData(true, SecurityAncestorFailure.JunctionAtBinding, true)]
+    [InlineData(false, SecurityAncestorFailure.SharingViolation, true)]
+    [InlineData(true, SecurityAncestorFailure.SharingViolation, true)]
+    public async Task SecurityAncestorFailureRetainsObservationAndProcessesLaterEvents(bool directory, SecurityAncestorFailure failure, bool creationEcho)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -111,6 +117,7 @@ public sealed partial class CloudContentConfirmationTests
         IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
         int acquisitions = 0;
         int inspections = 0;
+        int? guardError = null;
         bool junctionCreated = false;
         Guid observationId;
         long observationSequence;
@@ -122,51 +129,44 @@ public sealed partial class CloudContentConfirmationTests
                 {
                     Assert.Equal(Path.Combine(fixture.Root, relativePath), Assert.Single(scopes).Path);
                     Assert.Equal(1, ++acquisitions);
-                    // This callback runs after lexical path resolution and before either
-                    // native guard. Replace the actual ancestor, not the guard's result.
-                    Directory.Move(parent, retired);
-                    ProcessStartInfo start = new("cmd.exe")
+                    if (failure == SecurityAncestorFailure.SharingViolation)
                     {
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-                    start.ArgumentList.Add("/c");
-                    start.ArgumentList.Add("mklink");
-                    start.ArgumentList.Add("/J");
-                    // Cloud Files can reject setting a mount-point tag inside the root.
-                    // Create it outside first, then rename the real junction into place.
-                    start.ArgumentList.Add(staging);
-                    start.ArgumentList.Add(outside);
-                    using Process link = Process.Start(start)!;
-                    await link.WaitForExitAsync(stop);
-                    output.WriteLine(await link.StandardOutput.ReadToEndAsync(stop));
-                    output.WriteLine(await link.StandardError.ReadToEndAsync(stop));
-                    Assert.Equal(0, link.ExitCode);
-                    Directory.Move(staging, parent);
-                    junctionCreated = true;
-                    Assert.True((File.GetAttributes(parent) & FileAttributes.ReparsePoint) != 0);
-                    Assert.Equal(outside, new DirectoryInfo(parent).ResolveLinkTarget(true)!.FullName);
-                    // The acquisition case uses the production facade lease. The binding
-                    // case holds only the root so TryBind must independently guard parent.
-                    return await fixture.System.AcquireOperationAsync(failAcquisition ? scopes : [CloudItemOperationScope.Exact(fixture.Root)], stop);
+                        const uint delete = 0x00010000;
+                        const uint listDirectoryAndReadAttributes = 0x81;
+                        const uint shareReadWriteDelete = 7;
+                        const uint shareReadWrite = 3;
+                        const uint openExisting = 3;
+                        const uint backupSemanticsAndOpenReparsePoint = 0x02200000;
+                        using SafeFileHandle competing = OpenSecurityTestDirectory(parent, delete, shareReadWriteDelete,
+                            0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
+                        if (competing.IsInvalid) { throw new Win32Exception(Marshal.GetLastPInvokeError()); }
+                        // A metadata-only open can be exempt from NTFS sharing checks. Request
+                        // directory-list access here to reliably exercise the native failure
+                        // at the lease boundary without changing the production guard's access.
+                        using SafeFileHandle guard = OpenSecurityTestDirectory(parent, listDirectoryAndReadAttributes, shareReadWrite,
+                            0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
+                        guardError = Marshal.GetLastPInvokeError();
+                        Assert.True(guard.IsInvalid);
+                        Assert.Equal(32, guardError);
+                        output.WriteLine($"Native parent open rejected the competing handle: {guardError}.");
+                        throw new IOException("The parent directory guard could not be opened without delete sharing.",
+                            new Win32Exception(guardError.Value));
+                    }
+
+                    await ReplaceAncestorWithJunctionAsync(stop);
+                    // Hold only the root for the binding case so TryBind must guard parent.
+                    return await fixture.System.AcquireOperationAsync(failure == SecurityAncestorFailure.JunctionAtBinding
+                        ? [CloudItemOperationScope.Exact(fixture.Root)] : scopes, stop);
                 }, securityInspection: (handle, nativePath, kind, root) =>
                 {
                     inspections++;
                     return CloudItemInspector.Inspect(handle, nativePath, kind, root);
                 });
             await feed.StartAsync();
-            CloudProtectedLocalOperationResult applied = await item.RunProtectedLocalOperationAsync(new(before.LocalBinding!,
-                directory ? CloudProtectedLocalOperationMode.DirectoryMetadata : CloudProtectedLocalOperationMode.ExclusiveFile), async (scope, stop) =>
-            {
-                FileSystemSecurity access = await scope.ReadAccessDescriptorAsync(stop);
-                access.AddAccessRule(AccessTestRule());
-                await scope.ApplyAccessDescriptorAsync(access, stop);
-            });
-            Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
+            await WriteSecurityObservationAsync(item, before);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
-            await source.DeliverAsync(await source.Security.Task.WaitAsync(deadline.Token));
+            LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
+            await source.DeliverAsync(security);
             while (!(await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan) { await Task.Delay(20, deadline.Token); }
             await File.WriteAllTextAsync(Path.Combine(fixture.Root, "later.bin"), "genuine-later-bytes", deadline.Token);
             LocalChangeSourceEvent? created = null;
@@ -180,6 +180,7 @@ public sealed partial class CloudContentConfirmationTests
             await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => row.Kind == CloudStateOperationKind.Create));
             await feed.DisposeAsync();
             Assert.Equal(1, acquisitions);
+            Assert.Equal(failure == SecurityAncestorFailure.SharingViolation ? 32 : (int?)null, guardError);
             Assert.Equal(0, inspections);
             Assert.Equal("outside-unchanged", await File.ReadAllTextAsync(sentinel));
             await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
@@ -203,7 +204,7 @@ public sealed partial class CloudContentConfirmationTests
                 Assert.Equal(1, echo.RemainingObservations);
                 Assert.Equal(RemoteCreationIntent.EchoPayload(identity), echo.Payload.ToArray());
             }
-            output.WriteLine($"Security junction: directory={directory}; acquisition={failAcquisition}; creationEcho={creationEcho}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
+            output.WriteLine($"Security ancestor: directory={directory}; failure={failure}; guardError={guardError}; creationEcho={creationEcho}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
         }
         finally
         {
@@ -234,6 +235,33 @@ public sealed partial class CloudContentConfirmationTests
             Assert.Equal(1, echo.RemainingObservations);
         }
         Assert.Equal(0, fixture.Provider.Fetches);
+
+        async Task ReplaceAncestorWithJunctionAsync(CancellationToken stop)
+        {
+            Directory.Move(parent, retired);
+            ProcessStartInfo start = new("cmd.exe")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            start.ArgumentList.Add("/c");
+            start.ArgumentList.Add("mklink");
+            start.ArgumentList.Add("/J");
+            // Create the mount point outside the connected root before moving it into place.
+            start.ArgumentList.Add(staging);
+            start.ArgumentList.Add(outside);
+            using Process link = Process.Start(start)!;
+            await link.WaitForExitAsync(stop);
+            output.WriteLine(await link.StandardOutput.ReadToEndAsync(stop));
+            output.WriteLine(await link.StandardError.ReadToEndAsync(stop));
+            Assert.Equal(0, link.ExitCode);
+            Directory.Move(staging, parent);
+            junctionCreated = true;
+            Assert.True((File.GetAttributes(parent) & FileAttributes.ReparsePoint) != 0);
+            Assert.Equal(outside, new DirectoryInfo(parent).ResolveLinkTarget(true)!.FullName);
+        }
     }
 
     private static async Task WriteSecurityObservationAsync(CloudItem item, CloudItemSnapshot before)
@@ -247,4 +275,15 @@ public sealed partial class CloudContentConfirmationTests
         });
         Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
     }
+
+    public enum SecurityAncestorFailure
+    {
+        JunctionAtAcquisition,
+        JunctionAtBinding,
+        SharingViolation,
+    }
+
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial SafeFileHandle OpenSecurityTestDirectory(string path, uint access, uint share, nint security,
+        uint disposition, uint flags, nint template);
 }
