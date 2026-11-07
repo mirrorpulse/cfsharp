@@ -114,12 +114,14 @@ public sealed partial class CloudContentConfirmationTests
         }
         if (applied)
         {
-            await WaitForAccessRowsAsync(factory!, rows => rows.Count > original.Count);
-            await Task.Delay(200);
+            // Name/data and security subscriptions deliver independently. A callback can
+            // create another item before the DACL observation reaches the journal.
+            await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => row.Kind == CloudStateOperationKind.MetadataUpdate &&
+                row.ItemId == before.ItemId && original.All(old => old.OperationId != row.OperationId)));
             IReadOnlyList<CloudOperationJournalEntry> observed = await AccessRowsAsync(factory!);
             AssertOriginalAccessRows(original, observed);
             CloudOperationJournalEntry[] accessOnly = observed.Where(row => original.All(old => old.OperationId != row.OperationId) &&
-                (scenario == "directory" || row.ItemId == before.ItemId)).ToArray();
+                row.ItemId == before.ItemId).ToArray();
             Assert.NotEmpty(accessOnly);
             Assert.All(accessOnly, row => Assert.Equal(CloudStateOperationKind.MetadataUpdate, row.Kind));
             if (scenario == "namespace")
