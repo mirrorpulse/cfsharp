@@ -109,16 +109,23 @@ public sealed partial class CloudContentConfirmationTests
             await WaitForReadyAsync(competitor);
             competitor.Go.Set();
             await Task.Delay(100);
-            // Some Cloud Files states reject the write open with ERROR_SHARING_VIOLATION
-            // instead of waiting for an oplock break. Both outcomes prevent mutation. Retry
-            // only an observed pre-release sharing conflict, while the original lease lives.
-            bool sharingConflict = action == "write" && competitor.HasExited && competitor.ExitCode == 32;
-            Assert.True(sharingConflict || !competitor.HasExited,
-                $"Competitor completed while the reference was held: action={action}; exit={(competitor.HasExited ? competitor.ExitCode : null)}");
+            // Some Cloud Files states reject the write open instead of queuing an oplock
+            // break. Either outcome must prevent mutation while the reference is held.
+            bool completedBeforeRelease = competitor.HasExited;
+            int? preReleaseExit = completedBeforeRelease ? competitor.ExitCode : null;
+            bool preReleaseSharingConflict = action == "write" && preReleaseExit == 32;
+            Assert.True(preReleaseSharingConflict || !completedBeforeRelease,
+                $"Competitor completed while the reference was held: action={action}; exit={preReleaseExit}");
             long released = Stopwatch.GetTimestamp();
             await reference.DisposeAsync();
+            await competitor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            bool sharingConflict = action == "write" && competitor.ExitCode == 32;
             if (sharingConflict)
             {
+                // Releasing a reference allows a queued break to complete. A rejected open
+                // need not break the share-none owner, so close that owner before retrying.
+                await lease.DisposeAsync();
+                await Assert.ThrowsAsync<ObjectDisposedException>(() => lease.BeginTransferAsync().AsTask());
                 using Competitor retry = StartCompetitor(fixture.File.FullPath, target, action);
                 try
                 {
@@ -138,13 +145,12 @@ public sealed partial class CloudContentConfirmationTests
             }
             else
             {
-                await competitor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
                 Assert.True(competitor.ExitCode == 0, $"Competitor exit={competitor.ExitCode}; Native=0x{competitor.ExitCode:X8}");
+                await Assert.ThrowsAsync<InvalidOperationException>(() => lease.BeginTransferAsync().AsTask());
+                await lease.DisposeAsync();
             }
 
-            output.WriteLine($"Competitor={action}; PreReleaseSharingConflict={sharingConflict}; WaitAfterReleaseMs={Stopwatch.GetElapsedTime(released).TotalMilliseconds}");
-            await Assert.ThrowsAsync<InvalidOperationException>(() => lease.BeginTransferAsync().AsTask());
-            await lease.DisposeAsync();
+            output.WriteLine($"Competitor={action}; PreReleaseSharingConflict={preReleaseSharingConflict}; WriterSharingConflict={sharingConflict}; WaitAfterReleaseMs={Stopwatch.GetElapsedTime(released).TotalMilliseconds}");
             if (action == "write")
             {
                 Assert.Equal(CloudSynchronizationState.NotInSync, (await fixture.File.InspectAsync()).SynchronizationState);
