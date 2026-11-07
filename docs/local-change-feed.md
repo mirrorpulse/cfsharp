@@ -17,6 +17,9 @@ an unbound `MetadataUpdate` with a durable full-rescan fence. This also covers s
 delivered after a rename from the independent name subscription. The original path, kind and
 operation ID survive restart; after explicit reconciliation, public pages expose that unbound
 observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
+When remote creation, move or deletion must be replayed, the feed also journals an unbound security
+observation. Completing remote replay and acknowledging reconciliation clears the fence while the
+journal entry remains available for individual acknowledgement.
 
 The feed validates a security notification's historical path before checking the live namespace.
 A valid relative path is retained when a junction already redirects it outside the root at delivery,

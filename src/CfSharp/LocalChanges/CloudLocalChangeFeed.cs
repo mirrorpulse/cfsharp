@@ -827,6 +827,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // origin cannot be proved solely from a path, timestamp, or notification kind.
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
                 uncertainDirectory ?? Directory.Exists(path.FullPath), observedAt);
+            if (securityObservation is not null)
+            {
+                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
+                    uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+            }
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
                 (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
