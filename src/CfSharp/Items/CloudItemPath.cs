@@ -6,6 +6,19 @@ internal static class CloudItemPathResolver
 {
     internal static CloudItemPath Resolve(string syncRootPath, string relativePath, bool allowRoot)
     {
+        CloudItemPath path = ResolveLexically(syncRootPath, relativePath, allowRoot);
+        if (!IsPhysicallyContained(syncRootPath, path))
+        {
+            throw new ArgumentException(
+                "The item path resolves outside the sync root through a file-system link.",
+                nameof(relativePath));
+        }
+
+        return path;
+    }
+
+    internal static CloudItemPath ResolveLexically(string syncRootPath, string relativePath, bool allowRoot)
+    {
         ArgumentNullException.ThrowIfNull(relativePath);
         if (Path.IsPathFullyQualified(relativePath))
         {
@@ -47,17 +60,11 @@ internal static class CloudItemPathResolver
             }
         }
 
-        string physicalRoot = ResolveExistingLinks(normalizedRoot);
-        string physicalItem = ResolveExistingLinks(fullPath);
-        if (!IsSameOrChild(physicalRoot, physicalItem))
-        {
-            throw new ArgumentException(
-                "The item path resolves outside the sync root through a file-system link.",
-                nameof(relativePath));
-        }
-
         return new CloudItemPath(fullPath, canonicalRelativePath);
     }
+
+    internal static bool IsPhysicallyContained(string syncRootPath, CloudItemPath path) =>
+        IsSameOrChild(ResolveExistingLinks(syncRootPath), ResolveExistingLinks(path.FullPath));
 
     private static string ResolveExistingLinks(string path)
     {

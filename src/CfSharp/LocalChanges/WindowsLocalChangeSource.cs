@@ -1,3 +1,5 @@
+using CfSharp.Native;
+
 namespace CfSharp;
 
 internal interface ILocalChangeSource : IAsyncDisposable
@@ -8,22 +10,29 @@ internal interface ILocalChangeSource : IAsyncDisposable
 }
 
 /// <summary>
-/// Adapts the Windows <c>ReadDirectoryChangesW</c>-backed <see cref="FileSystemWatcher"/> to the
-/// immutable local-change source contract.
+/// Combines the Windows data/name watcher and identity-bearing extended security notifications
+/// into the immutable local-change source contract.
 /// </summary>
 internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 {
     private readonly string _rootPath;
     private readonly int _bufferCapacity;
+    private readonly Action? _beforeSecurityRearm;
+    private readonly Action? _beforeTerminalSecurityDelivery;
     private readonly object _gate = new();
     private FileSystemWatcher? _watcher;
+    private WindowsSecurityChangeSource? _securityWatcher;
     private Func<LocalChangeSourceEvent, ValueTask>? _eventHandler;
     private int _disposed;
+    private Task? _disposal;
 
-    internal WindowsLocalChangeSource(string rootPath, int bufferCapacity)
+    internal WindowsLocalChangeSource(string rootPath, int bufferCapacity, Action? beforeSecurityRearm = null,
+        Action? beforeTerminalSecurityDelivery = null)
     {
         _rootPath = rootPath;
         _bufferCapacity = Math.Clamp(bufferCapacity, 4096, 64 * 1024);
+        _beforeSecurityRearm = beforeSecurityRearm;
+        _beforeTerminalSecurityDelivery = beforeTerminalSecurityDelivery;
     }
 
     public Task StartAsync(
@@ -48,8 +57,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                     NotifyFilters.Attributes |
                     NotifyFilters.Size |
                     NotifyFilters.LastWrite |
-                    NotifyFilters.CreationTime |
-                    NotifyFilters.Security,
+                    NotifyFilters.CreationTime,
                 InternalBufferSize = _bufferCapacity,
                 Filter = "*",
             };
@@ -58,9 +66,25 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             watcher.Deleted += OnDeleted;
             watcher.Renamed += OnRenamed;
             watcher.Error += OnError;
+            // FILE_ACTION_MODIFIED does not carry the triggering filter. Keep security on a
+            // separate native subscription so a DACL write cannot masquerade as file data.
+            // Never suppress an event by path, timestamp or protected-operation completion:
+            // the data watcher must still deliver any simultaneous or later ordinary write.
             _eventHandler = eventHandler;
             _watcher = watcher;
-            watcher.EnableRaisingEvents = true;
+            try
+            {
+                watcher.EnableRaisingEvents = true;
+                _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError, _beforeSecurityRearm);
+            }
+            catch
+            {
+                _watcher = null;
+                _securityWatcher = null;
+                _eventHandler = null;
+                watcher.Dispose();
+                throw;
+            }
         }
 
         return Task.CompletedTask;
@@ -68,26 +92,41 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 
     public ValueTask DisposeAsync()
     {
+        lock (_gate) { return new(_disposal ??= DisposeCoreAsync()); }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            return ValueTask.CompletedTask;
+            return;
         }
 
         FileSystemWatcher? watcher;
+        WindowsSecurityChangeSource? security;
         lock (_gate)
         {
             watcher = _watcher;
             _watcher = null;
-            _eventHandler = null;
+            security = _securityWatcher;
         }
 
-        if (watcher is not null)
+        try
         {
-            watcher.EnableRaisingEvents = false;
-            watcher.Dispose();
+            if (security is not null) { await security.DisposeAsync().ConfigureAwait(false); }
+        }
+        finally
+        {
+            // The pump can already have copied a batch or decided to report terminal loss.
+            // Keep its callbacks wired until the pump exits, before the feed closes its input.
+            lock (_gate)
+            {
+                _securityWatcher = null;
+                _eventHandler = null;
+            }
+            watcher?.Dispose();
         }
 
-        return ValueTask.CompletedTask;
     }
 
     private void OnCreated(object sender, FileSystemEventArgs args) =>
@@ -95,6 +134,17 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 
     private void OnChanged(object sender, FileSystemEventArgs args) =>
         Publish(new(LocalChangeSourceAction.Modified, GetRelativePath(args.FullPath)));
+
+    private void OnSecurityChanged(WindowsSecurityChange change)
+    {
+        lock (_gate)
+        {
+            if (_securityWatcher is null) { return; }
+            PublishCore(new(LocalChangeSourceAction.SecurityModified, change.RelativePath, SecurityIdentity:
+                new(_securityWatcher.VolumeSerialNumber, _securityWatcher.RootFileId, change.FileId, change.ParentFileId, change.IsDirectory)),
+                fromSecurityPump: true);
+        }
+    }
 
     private void OnDeleted(object sender, FileSystemEventArgs args) =>
         Publish(new(LocalChangeSourceAction.Deleted, GetRelativePath(args.FullPath)));
@@ -123,6 +173,20 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         Publish(new(action, string.Empty));
     }
 
+    internal void OnSecurityError(int error, bool terminal)
+    {
+        if (terminal) { _beforeTerminalSecurityDelivery?.Invoke(); }
+        LocalChangeSourceAction action = terminal ? LocalChangeSourceAction.SecuritySubscriptionFailed
+            : error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error;
+        lock (_gate)
+        {
+            if (_securityWatcher is not null)
+            {
+                PublishCore(new(action, string.Empty, error), fromSecurityPump: true);
+            }
+        }
+    }
+
     private void Publish(LocalChangeSourceEvent sourceEvent)
     {
         lock (_gate)
@@ -131,9 +195,9 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         }
     }
 
-    private void PublishCore(LocalChangeSourceEvent sourceEvent)
+    private void PublishCore(LocalChangeSourceEvent sourceEvent, bool fromSecurityPump = false)
     {
-        if (Volatile.Read(ref _disposed) != 0 || _eventHandler is null)
+        if (_eventHandler is null || (!fromSecurityPump && Volatile.Read(ref _disposed) != 0))
         {
             return;
         }

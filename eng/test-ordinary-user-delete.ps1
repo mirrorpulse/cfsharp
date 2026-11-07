@@ -2,7 +2,7 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
-    [ValidateSet('Delete', 'Recreation')]
+    [ValidateSet('Delete', 'Recreation', 'AccessJournal')]
     [string] $Suite = 'Delete'
 )
 
@@ -25,8 +25,9 @@ $userName = 'CfSharp-' + $id.Substring(0, 8)
 $executionRoot = Join-Path $env:PUBLIC "CfSharpOrdinaryTests/$id"
 $suiteName = $Suite.ToLowerInvariant()
 $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen' }
+    elseif ($Suite -eq 'AccessJournal') { 'FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
-$expectedCount = if ($Suite -eq 'Delete') { 14 } else { 2 }
+$expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'AccessJournal') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null
