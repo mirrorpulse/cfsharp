@@ -6,8 +6,8 @@ A security-only change, including a protected Access descriptor write, is delive
 as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
 Applications distinguish it from content work using the public kind before ACK; no private payload
 or timestamp comparison is required. Directory metadata retains the same public classification.
-Remote creation echoes never consume security notifications, even when the identified
-placeholder remains in sync and a matching creation echo is still active.
+Security notifications bypass provider echo suppression. The existing path and operation kind
+cannot establish that a provider write caused an independently reported DACL change.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards

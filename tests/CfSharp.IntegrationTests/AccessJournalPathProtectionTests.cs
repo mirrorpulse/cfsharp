@@ -11,9 +11,11 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task InSyncSecurityNotificationDoesNotConsumeRemoteCreationEcho(bool directory)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task InSyncSecurityNotificationDoesNotConsumeRemoteEcho(bool directory, bool metadataEcho)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -24,13 +26,28 @@ public sealed partial class CloudContentConfirmationTests
         CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "security-creation-echo", "v1");
         await item.ConvertToPlaceholderAsync(identity);
         await item.SetInSyncAsync(true);
+        if (metadataEcho)
+        {
+            CloudPlaceholderMetadata metadata = (directory ? CloudPlaceholderMetadata.CreateDirectoryBuilder()
+                : CloudPlaceholderMetadata.CreateFileBuilder()).WithAttributes(directory
+                    ? FileAttributes.Directory | FileAttributes.Hidden : FileAttributes.Hidden).Build();
+            CloudRemoteChange change = new("remote-metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "v2",
+                item.Kind, item.RelativePath, identity.ItemId, previousRemoteRevision: "v1", metadata: metadata);
+            CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(new("echo", Array.Empty<byte>(), [change], new byte[] { 1 }));
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+        }
         CloudItemSnapshot before = await item.InspectAsync();
-        Guid echoId = Guid.NewGuid();
-        byte[] echoPayload = RemoteCreationIntent.EchoPayload(identity);
+        CloudEchoSuppressionState expected;
         await using (ICloudStateTransaction seed = await factory!.Store!.BeginTransactionAsync())
         {
-            await seed.EchoSuppressions.UpsertAsync(new(echoId, identity.ItemId, CloudStateOperationKind.Create,
-                "before", echoPayload, DateTimeOffset.UtcNow.AddMinutes(10), remainingObservations: 2));
+            if (!metadataEcho)
+            {
+                await seed.EchoSuppressions.UpsertAsync(new(Guid.NewGuid(), identity.ItemId, CloudStateOperationKind.Create,
+                    "before", RemoteCreationIntent.EchoPayload(identity), DateTimeOffset.UtcNow.AddMinutes(10), remainingObservations: 2));
+            }
+            expected = Assert.Single(await seed.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+            Assert.Equal(metadataEcho ? CloudStateOperationKind.MetadataUpdate : CloudStateOperationKind.Create, expected.Kind);
+            Assert.Equal(identity.ItemId, expected.ItemId);
             await seed.CommitAsync();
         }
         DelayedSecuritySource source = new(fixture.Root, line => output.WriteLine(line));
@@ -42,15 +59,15 @@ public sealed partial class CloudContentConfirmationTests
         LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
         CloudItemSnapshot after = await item.InspectAsync(deadline.Token);
         Assert.Equal(CloudSynchronizationState.InSync, after.SynchronizationState);
-        Assert.Equal(identity.Encode(), after.PlaceholderIdentity.ToArray());
+        Assert.Equal(before.PlaceholderIdentity.ToArray(), after.PlaceholderIdentity.ToArray());
         Assert.Equal(unchecked((ulong)after.LocalFileId!.Value), security.SecurityIdentity!.Value.FileId);
         await source.DeliverAsync(security);
         await feed.DisposeAsync();
         await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
         CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
-        Assert.Equal(echoId, echo.SuppressionId);
-        Assert.Equal(2, echo.RemainingObservations);
-        Assert.Equal(echoPayload, echo.Payload.ToArray());
+        Assert.Equal(expected.SuppressionId, echo.SuppressionId);
+        Assert.Equal(expected.RemainingObservations, echo.RemainingObservations);
+        Assert.Equal(expected.Payload.ToArray(), echo.Payload.ToArray());
         CloudOperationJournalEntry entry = Assert.Single(await verify.Operations.ListAsync(100));
         Assert.Equal(CloudStateOperationKind.MetadataUpdate, entry.Kind);
         Assert.Equal(identity.ItemId, entry.ItemId);
@@ -59,7 +76,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(directory, payload.IsDirectory);
         Assert.False(LocalChangeCheckpoint.Decode((await verify.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value).RequiresFullRescan);
         Assert.Equal(0, fixture.Provider.Fetches);
-        output.WriteLine($"In-sync security: directory={directory}; nativeFile={after.LocalFileId}; bound={entry.ItemId}; echoRemaining={echo.RemainingObservations}.");
+        output.WriteLine($"In-sync security: directory={directory}; echoKind={echo.Kind}; nativeFile={after.LocalFileId}; bound={entry.ItemId}; echoRemaining={echo.RemainingObservations}.");
     }
 
     [Trait("Category", "AccessJournal")]

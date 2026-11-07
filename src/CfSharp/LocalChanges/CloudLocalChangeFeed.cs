@@ -362,6 +362,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// Number of matching watcher observations to consume before the suppression is removed.
     /// </param>
     /// <param name="cancellationToken">Token that cancels before the suppression commits.</param>
+    /// <remarks>Independent Windows security notifications do not consume these records.</remarks>
     public async ValueTask SuppressProviderEchoAsync(
         CloudStateOperationKind kind,
         string relativePath,
@@ -868,10 +869,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
         // Echo matching can inspect the native path. Uncertainty cannot be suppressed and
         // must not revisit the object after its association or path guard was rejected.
-        // A creation echo does not establish provenance for an independent security write.
-        CloudEchoSuppressionState? suppression = uncertainDirectory is null ? suppressions.FirstOrDefault(candidate =>
+        // Path and kind cannot attribute an independent security notification to a provider write.
+        CloudEchoSuppressionState? suppression = securityObservation is null && uncertainDirectory is null ? suppressions.FirstOrDefault(candidate =>
             RemoteCreationIntent.IsCreationEcho(candidate)
-                ? securityObservation is null && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
+                ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
                 : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)) : null;
         if (suppression is not null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
         {
