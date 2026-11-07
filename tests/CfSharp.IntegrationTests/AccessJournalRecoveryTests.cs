@@ -11,6 +11,7 @@ public sealed partial class CloudContentConfirmationTests
     [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData(false)]
+    [InlineData(true)]
     public async Task NativeSecurityRearmFailurePreservesCompletedWorkAndShutdownLoss(bool disposeBeforeTerminalCallback)
     {
         AccessJournalFactory? factory = null;

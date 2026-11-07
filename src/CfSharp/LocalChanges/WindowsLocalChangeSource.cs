@@ -109,8 +109,6 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             watcher = _watcher;
             _watcher = null;
             security = _securityWatcher;
-            _securityWatcher = null;
-            _eventHandler = null;
         }
 
         try
@@ -119,6 +117,13 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         }
         finally
         {
+            // The pump can already have copied a batch or decided to report terminal loss.
+            // Keep its callbacks wired until the pump exits, before the feed closes its input.
+            lock (_gate)
+            {
+                _securityWatcher = null;
+                _eventHandler = null;
+            }
             watcher?.Dispose();
         }
 
@@ -136,7 +141,8 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         {
             if (_securityWatcher is null) { return; }
             PublishCore(new(LocalChangeSourceAction.SecurityModified, change.RelativePath, SecurityIdentity:
-                new(_securityWatcher.VolumeSerialNumber, _securityWatcher.RootFileId, change.FileId, change.ParentFileId, change.IsDirectory)));
+                new(_securityWatcher.VolumeSerialNumber, _securityWatcher.RootFileId, change.FileId, change.ParentFileId, change.IsDirectory)),
+                fromSecurityPump: true);
         }
     }
 
@@ -172,7 +178,13 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         if (terminal) { _beforeTerminalSecurityDelivery?.Invoke(); }
         LocalChangeSourceAction action = terminal ? LocalChangeSourceAction.SecuritySubscriptionFailed
             : error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error;
-        Publish(new(action, string.Empty, error));
+        lock (_gate)
+        {
+            if (_securityWatcher is not null)
+            {
+                PublishCore(new(action, string.Empty, error), fromSecurityPump: true);
+            }
+        }
     }
 
     private void Publish(LocalChangeSourceEvent sourceEvent)
@@ -183,9 +195,9 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         }
     }
 
-    private void PublishCore(LocalChangeSourceEvent sourceEvent)
+    private void PublishCore(LocalChangeSourceEvent sourceEvent, bool fromSecurityPump = false)
     {
-        if (Volatile.Read(ref _disposed) != 0 || _eventHandler is null)
+        if (_eventHandler is null || (!fromSecurityPump && Volatile.Read(ref _disposed) != 0))
         {
             return;
         }

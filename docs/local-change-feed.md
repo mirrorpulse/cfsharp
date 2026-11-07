@@ -41,7 +41,8 @@ or later. Unsupported native subscription startup reports the original Windows f
 or a recoverable subscription error requires reconciliation. A terminal security subscription
 failure stops the feed, preserves the native error and fences the journal for the next feed.
 If the next native read fails to start, the decoded batch is delivered before the terminal
-notification.
+notification. Disposal keeps security callbacks active until the native pump exits, allowing the
+feed to persist terminal loss even when shutdown overlaps its delivery.
 Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
 I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
 
