@@ -14,6 +14,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private readonly ManualResetEvent _completed = new(false);
     private readonly Action<WindowsSecurityChange> _changed;
     private readonly Action<int, bool> _error;
+    private readonly Action? _beforeRearm;
     private readonly int _capacity;
     private readonly nint _buffer;
     private readonly nint _overlapped;
@@ -22,10 +23,12 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private bool _pending;
     private bool _stopping;
 
-    internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed, Action<int, bool> error)
+    internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed,
+        Action<int, bool> error, Action? beforeRearm = null)
     {
         _changed = changed;
         _error = error;
+        _beforeRearm = beforeRearm;
         _capacity = Math.Clamp(capacity, 4096, 64 * 1024);
         // FILE_LIST_DIRECTORY, all sharing, BACKUP_SEMANTICS | OVERLAPPED. No content read.
         _directory = CreateFile(path, 0x81, 7, 0, 3, 0x42000000, 0);
@@ -100,21 +103,21 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
                 if (error is 0 or 1022 or 13)
                 {
                     _completed.Reset();
+                    _beforeRearm?.Invoke();
                     try { IssueRead(); }
                     catch (Win32Exception exception) { error = exception.NativeErrorCode; }
                 }
                 terminal = !_pending;
                 if (terminal) { _stopping = true; }
             }
+            // Rearm before publishing managed copies. A failed rearm does not invalidate
+            // the completed batch, and publishing a terminal error closes the feed's input.
+            foreach (WindowsSecurityChange change in changes) { Deliver(() => _changed(change)); }
             if (terminal || error != 0)
             {
                 Deliver(() => _error(error, terminal));
-                if (terminal) { return; }
-                continue;
             }
-            // Rearm before publishing managed copies. Slow consumers cannot retain a native
-            // buffer or release it while Windows is still completing an outstanding request.
-            foreach (WindowsSecurityChange change in changes) { Deliver(() => _changed(change)); }
+            if (terminal) { return; }
         }
     }
 

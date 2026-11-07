@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Security.AccessControl;
 
@@ -7,6 +8,134 @@ namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    public async Task NativeSecurityRearmFailurePreservesCompletedWorkAndShutdownLoss(bool disposeBeforeTerminalCallback)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        // Keep the watched directory outside the connected root and SQLite store. The test
+        // removes it between decode and the next real ReadDirectoryChangesExW call.
+        string watched = Path.Combine(Path.GetDirectoryName(fixture.Root)!, "security-watch");
+        Directory.CreateDirectory(watched);
+        string path = Path.Combine(watched, "before.txt");
+        await File.WriteAllTextAsync(path, "unchanged");
+        TaskCompletionSource terminalDecided = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using ManualResetEventSlim resumeDelivery = new(false);
+        WindowsLocalChangeSource native = new(watched, 64 * 1024, beforeSecurityRearm: () =>
+        {
+            File.Delete(path);
+            Directory.Delete(watched);
+        }, beforeTerminalSecurityDelivery: () =>
+        {
+            terminalDecided.TrySetResult();
+            resumeDelivery.Wait(TimeSpan.FromSeconds(25));
+        });
+        ObservedSecuritySource source = new(native, forwardChanges: !disposeBeforeTerminalCallback);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await using (CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(watched, factory!.Store!, new(), source))
+        {
+            await feed.StartAsync(deadline.Token);
+            Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            Task? disposing = null;
+            try
+            {
+                FileInfo file = new(path);
+                FileSecurity access = file.GetAccessControl();
+                access.AddAccessRule(AccessTestRule());
+                file.SetAccessControl(access);
+                await terminalDecided.Task.WaitAsync(deadline.Token);
+                if (disposeBeforeTerminalCallback)
+                {
+                    // DisposeAsync runs synchronously through source teardown until it awaits
+                    // the paused native pump. Resume only after it reaches that boundary.
+                    disposing = feed.DisposeAsync().AsTask();
+                    Assert.False(disposing.IsCompleted);
+                }
+            }
+            finally { resumeDelivery.Set(); }
+
+            if (disposing is not null)
+            {
+                await disposing.WaitAsync(deadline.Token);
+            }
+            else
+            {
+                await source.TerminalDelivered.Task.WaitAsync(deadline.Token);
+                await feed.DisposeAsync();
+            }
+        }
+
+        Assert.False(Directory.Exists(watched));
+        if (disposeBeforeTerminalCallback)
+        {
+            // The observer forwarded only terminal loss in this case. A journaled or
+            // ambiguous ordinary notification cannot independently make the test pass.
+            Assert.Empty(await AccessRowsAsync(factory!));
+        }
+
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync(deadline.Token);
+        Assert.True((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudLocalChangePage page = await reopened.ReadPageAsync(await reopened.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        LocalChangeSourceEvent[] events = source.Events.ToArray();
+        if (disposeBeforeTerminalCallback)
+        {
+            Assert.Empty(page.Changes);
+        }
+        else
+        {
+            Assert.NotEmpty(page.Changes);
+            Assert.Equal(events.Length - 1, page.Changes.Count);
+            Assert.All(page.Changes, historical =>
+            {
+                Assert.Equal(CloudLocalChangeKind.MetadataUpdate, historical.Kind);
+                Assert.Equal("before.txt", historical.RelativePath);
+                Assert.Null(historical.ItemId);
+            });
+        }
+
+        Assert.True(events.Length >= 2);
+        Assert.All(events[..^1], security =>
+        {
+            Assert.Equal(LocalChangeSourceAction.SecurityModified, security.Action);
+            Assert.Equal("before.txt", security.RelativePath);
+            Assert.NotEqual(0ul, security.SecurityIdentity!.Value.FileId);
+        });
+        Assert.Equal(LocalChangeSourceAction.SecuritySubscriptionFailed, events[^1].Action);
+        Assert.NotEqual(0, events[^1].ErrorCode);
+        output.WriteLine($"Native security rearm failed with Win32 {events[^1].ErrorCode} after delivering the decoded batch. Disposal raced terminal delivery: {disposeBeforeTerminalCallback}. The restarted feed required reconciliation.");
+    }
+
+    private sealed class ObservedSecuritySource(WindowsLocalChangeSource native, bool forwardChanges) : ILocalChangeSource
+    {
+        internal ConcurrentQueue<LocalChangeSourceEvent> Events { get; } = new();
+        internal TaskCompletionSource TerminalDelivered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task StartAsync(Func<LocalChangeSourceEvent, ValueTask> handler, CancellationToken cancellationToken) =>
+            native.StartAsync(async change =>
+            {
+                if (change.Action is LocalChangeSourceAction.SecurityModified or LocalChangeSourceAction.SecuritySubscriptionFailed)
+                {
+                    Events.Enqueue(change);
+                    if (change.Action == LocalChangeSourceAction.SecuritySubscriptionFailed)
+                    {
+                        await handler(change);
+                        TerminalDelivered.TrySetResult();
+                    }
+                    else if (forwardChanges)
+                    {
+                        await handler(change);
+                    }
+                }
+            }, cancellationToken);
+
+        public ValueTask DisposeAsync() => native.DisposeAsync();
+    }
+
     [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData(false)]

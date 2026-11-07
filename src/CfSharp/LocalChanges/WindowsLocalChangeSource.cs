@@ -17,6 +17,8 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 {
     private readonly string _rootPath;
     private readonly int _bufferCapacity;
+    private readonly Action? _beforeSecurityRearm;
+    private readonly Action? _beforeTerminalSecurityDelivery;
     private readonly object _gate = new();
     private FileSystemWatcher? _watcher;
     private WindowsSecurityChangeSource? _securityWatcher;
@@ -24,10 +26,13 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private int _disposed;
     private Task? _disposal;
 
-    internal WindowsLocalChangeSource(string rootPath, int bufferCapacity)
+    internal WindowsLocalChangeSource(string rootPath, int bufferCapacity, Action? beforeSecurityRearm = null,
+        Action? beforeTerminalSecurityDelivery = null)
     {
         _rootPath = rootPath;
         _bufferCapacity = Math.Clamp(bufferCapacity, 4096, 64 * 1024);
+        _beforeSecurityRearm = beforeSecurityRearm;
+        _beforeTerminalSecurityDelivery = beforeTerminalSecurityDelivery;
     }
 
     public Task StartAsync(
@@ -70,7 +75,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             try
             {
                 watcher.EnableRaisingEvents = true;
-                _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError);
+                _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError, _beforeSecurityRearm);
             }
             catch
             {
@@ -164,6 +169,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 
     internal void OnSecurityError(int error, bool terminal)
     {
+        if (terminal) { _beforeTerminalSecurityDelivery?.Invoke(); }
         LocalChangeSourceAction action = terminal ? LocalChangeSourceAction.SecuritySubscriptionFailed
             : error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error;
         Publish(new(action, string.Empty, error));

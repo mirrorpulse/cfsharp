@@ -270,9 +270,9 @@ jobs:
           [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/access-journal.trx -Raw
           $counts = $report.TestRun.ResultSummary.Counters
           $cases = @($report.TestRun.Results.UnitTestResult)
-          if ([int]$counts.total -ne 64 -or [int]$counts.executed -ne 64 -or [int]$counts.passed -ne 64 -or
-              @($cases.testName | Sort-Object -Unique).Count -ne 64 -or @($cases | Where-Object outcome -ne 'Passed').Count -ne 0) {
-            throw 'All 64 distinct Access journal cases must execute and pass.'
+          if ([int]$counts.total -ne 65 -or [int]$counts.executed -ne 65 -or [int]$counts.passed -ne 65 -or
+              @($cases.testName | Sort-Object -Unique).Count -ne 65 -or @($cases | Where-Object outcome -ne 'Passed').Count -ne 0) {
+            throw 'All 65 distinct Access journal cases must execute and pass.'
           }
 
       - name: Build SQLite physical ownership tests

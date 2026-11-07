@@ -40,6 +40,8 @@ The extended security subscription requires NTFS and Windows 10 version 1709 / W
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
 or a recoverable subscription error requires reconciliation. A terminal security subscription
 failure stops the feed, preserves the native error and fences the journal for the next feed.
+If the next native read fails to start, the decoded batch is delivered before the terminal
+notification.
 Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
 I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
 
