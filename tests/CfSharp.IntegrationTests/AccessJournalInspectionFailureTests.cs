@@ -33,11 +33,22 @@ public sealed partial class CloudContentConfirmationTests
         IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
         CloudFilesException failure = CloudFilesException.FromHResult("CloudItem.Inspect.PlaceholderInfo", path, unchecked((int)0x80070178));
         int inspections = 0;
+        Guid? stagedId = null;
+        TaskCompletionSource validating = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using ManualResetEventSlim resumeValidation = new(false);
         CloudSecurityInspection inspect = (handle, nativePath, kind, root) =>
         {
             // Inject the exact managed failure from CfGetPlaceholderInfo at the I/O boundary.
             // Other reads, the directory source, protection handles and store are real.
-            if (++inspections == failingInspection) { throw failure; }
+            if (++inspections == failingInspection)
+            {
+                if (failingInspection == 3)
+                {
+                    validating.SetResult();
+                    if (!resumeValidation.Wait(TimeSpan.FromSeconds(25))) { throw new TimeoutException("Post-commit validation was not released."); }
+                }
+                throw failure;
+            }
             return CloudItemInspector.Inspect(handle, nativePath, kind, root);
         };
         Guid observationId;
@@ -56,6 +67,27 @@ public sealed partial class CloudContentConfirmationTests
             Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
             await source.DeliverAsync(await source.Security.Task.WaitAsync(deadline.Token));
+            if (failingInspection == 3)
+            {
+                try
+                {
+                    await validating.Task.WaitAsync(deadline.Token);
+                    CloudLocalChangeScan beforeValidation = await feed.BeginScanAsync(deadline.Token);
+                    Assert.False(beforeValidation.RequiresFullRescan);
+                    CloudLocalChangePage pageBeforeValidation = await feed.ReadPageAsync(beforeValidation, 0, 100, deadline.Token);
+                    Assert.Equal(originalId, Assert.Single(pageBeforeValidation.Changes).OperationId);
+                    Assert.Equal(originalId, Assert.Single((await feed.ReadBatchAsync(deadline.Token)).Changes).OperationId);
+                    await using (ICloudStateTransaction read = await factory.Store!.BeginTransactionAsync(deadline.Token))
+                    {
+                        CloudStateCheckpoint receipt = Assert.Single(await read.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix, deadline.Token));
+                        stagedId = Guid.ParseExact(receipt.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N");
+                        Assert.Null(await read.Operations.GetAsync(stagedId.Value, deadline.Token));
+                    }
+                    await feed.AcknowledgeAsync([stagedId.Value], deadline.Token);
+                    output.WriteLine($"Concurrent readers withheld staged operation {stagedId} while post-commit validation was paused.");
+                }
+                finally { resumeValidation.Set(); }
+            }
             while (!(await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan) { await Task.Delay(20, deadline.Token); }
             // A failed worker can also leave a loss marker. A later real create must commit
             // through this same feed, proving that the inspection failure did not stop it.
@@ -78,9 +110,9 @@ public sealed partial class CloudContentConfirmationTests
             CloudOperationJournalEntry observation = Assert.Single(rows.Where(row => row.Kind == CloudStateOperationKind.MetadataUpdate && row.OperationId != originalId));
             observationId = observation.OperationId;
             observationSequence = observation.Sequence;
-            // A failure after commit retains its already committed identity/sequence. The
-            // durable fence prevents dispatch; initial/pre-commit failures remain unbound.
-            Assert.Equal(failingInspection == 3 ? identity.ItemId : (Guid?)null, observation.ItemId);
+            Assert.Null(observation.ItemId);
+            if (stagedId.HasValue) { Assert.Equal(stagedId.Value, observation.OperationId); }
+            Assert.Empty(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix));
             Assert.Single(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix));
             Assert.Equal(2, (await verify.Items.ListSubtreeAsync(string.Empty)).Count);
             Assert.Equal(identity.ItemId, (await verify.Items.GetByRelativePathAsync("before"))!.ItemId);

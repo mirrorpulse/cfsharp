@@ -145,89 +145,116 @@ public sealed partial class CloudContentConfirmationTests
         DelayedSecuritySource source = new(fixture.Root, line => output.WriteLine(line), relativePath);
         try
         {
-            await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source,
-                acquireOperation: async (scopes, stop) =>
-                {
-                    Assert.Equal(Path.Combine(fixture.Root, relativePath), Assert.Single(scopes).Path);
-                    Assert.Equal(1, ++acquisitions);
-                    if (failure == SecurityAncestorFailure.SharingViolation)
-                    {
-                        const uint delete = 0x00010000;
-                        const uint listDirectoryAndReadAttributes = 0x81;
-                        const uint shareReadWriteDelete = 7;
-                        const uint shareReadWrite = 3;
-                        const uint openExisting = 3;
-                        const uint backupSemanticsAndOpenReparsePoint = 0x02200000;
-                        using SafeFileHandle competing = OpenSecurityTestDirectory(parent, delete, shareReadWriteDelete,
-                            0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
-                        if (competing.IsInvalid) { throw new Win32Exception(Marshal.GetLastPInvokeError()); }
-                        // A metadata-only open can be exempt from NTFS sharing checks. Request
-                        // directory-list access here to reliably exercise the native failure
-                        // at the lease boundary without changing the production guard's access.
-                        using SafeFileHandle guard = OpenSecurityTestDirectory(parent, listDirectoryAndReadAttributes, shareReadWrite,
-                            0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
-                        guardError = Marshal.GetLastPInvokeError();
-                        Assert.True(guard.IsInvalid);
-                        Assert.Equal(32, guardError);
-                        output.WriteLine($"Native parent open rejected the competing handle: {guardError}.");
-                        throw new IOException("The parent directory guard could not be opened without delete sharing.",
-                            new Win32Exception(guardError.Value));
-                    }
-
-                    Assert.NotEqual(SecurityAncestorFailure.JunctionBeforeDelivery, failure);
-                    await ReplaceAncestorWithJunctionAsync(stop);
-                    // Hold only the root for the binding case so TryBind must guard parent.
-                    return await fixture.System.AcquireOperationAsync(failure == SecurityAncestorFailure.JunctionAtBinding
-                        ? [CloudItemOperationScope.Exact(fixture.Root)] : scopes, stop);
-                }, securityInspection: (handle, nativePath, kind, root) =>
-                {
-                    inspections++;
-                    return CloudItemInspector.Inspect(handle, nativePath, kind, root);
-                });
-            await feed.StartAsync();
-            await WriteSecurityObservationAsync(item, before);
-            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
-            LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
-            if (failure == SecurityAncestorFailure.JunctionBeforeDelivery) { await ReplaceAncestorWithJunctionAsync(deadline.Token); }
-            await source.DeliverAsync(security);
-            while (!(await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan) { await Task.Delay(20, deadline.Token); }
-            await File.WriteAllTextAsync(Path.Combine(fixture.Root, "later.bin"), "genuine-later-bytes", deadline.Token);
-            LocalChangeSourceEvent? created = null;
-            while (created is null)
             {
-                created = source.Events.Where(change => change.Action == LocalChangeSourceAction.Created && change.RelativePath == "later.bin")
-                    .Select(change => (LocalChangeSourceEvent?)change).FirstOrDefault();
-                if (created is null) { await Task.Delay(20, deadline.Token); }
+                await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source,
+                    acquireOperation: async (scopes, stop) =>
+                    {
+                        Assert.Equal(Path.Combine(fixture.Root, relativePath), Assert.Single(scopes).Path);
+                        Assert.Equal(1, ++acquisitions);
+                        if (failure == SecurityAncestorFailure.SharingViolation)
+                        {
+                            const uint delete = 0x00010000;
+                            const uint listDirectoryAndReadAttributes = 0x81;
+                            const uint shareReadWriteDelete = 7;
+                            const uint shareReadWrite = 3;
+                            const uint openExisting = 3;
+                            const uint backupSemanticsAndOpenReparsePoint = 0x02200000;
+                            using SafeFileHandle competing = OpenSecurityTestDirectory(parent, delete, shareReadWriteDelete,
+                                0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
+                            if (competing.IsInvalid) { throw new Win32Exception(Marshal.GetLastPInvokeError()); }
+                            // A metadata-only open can be exempt from NTFS sharing checks. Request
+                            // directory-list access here to reliably exercise the native failure
+                            // at the lease boundary without changing the production guard's access.
+                            using SafeFileHandle guard = OpenSecurityTestDirectory(parent, listDirectoryAndReadAttributes, shareReadWrite,
+                                0, openExisting, backupSemanticsAndOpenReparsePoint, 0);
+                            guardError = Marshal.GetLastPInvokeError();
+                            Assert.True(guard.IsInvalid);
+                            Assert.Equal(32, guardError);
+                            output.WriteLine($"Native parent open rejected the competing handle: {guardError}.");
+                            throw new IOException("The parent directory guard could not be opened without delete sharing.",
+                                new Win32Exception(guardError.Value));
+                        }
+
+                        Assert.NotEqual(SecurityAncestorFailure.JunctionBeforeDelivery, failure);
+                        await ReplaceAncestorWithJunctionAsync(stop);
+                        // Hold only the root for the binding case so TryBind must guard parent.
+                        return await fixture.System.AcquireOperationAsync(failure == SecurityAncestorFailure.JunctionAtBinding
+                            ? [CloudItemOperationScope.Exact(fixture.Root)] : scopes, stop);
+                    }, securityInspection: (handle, nativePath, kind, root) =>
+                    {
+                        inspections++;
+                        return CloudItemInspector.Inspect(handle, nativePath, kind, root);
+                    });
+                await feed.StartAsync();
+                await WriteSecurityObservationAsync(item, before);
+                using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+                LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
+                if (failure == SecurityAncestorFailure.JunctionBeforeDelivery) { await ReplaceAncestorWithJunctionAsync(deadline.Token); }
+                await source.DeliverAsync(security);
+                while (!(await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan) { await Task.Delay(20, deadline.Token); }
+                await File.WriteAllTextAsync(Path.Combine(fixture.Root, "later.bin"), "genuine-later-bytes", deadline.Token);
+                LocalChangeSourceEvent? created = null;
+                while (created is null)
+                {
+                    created = source.Events.Where(change => change.Action == LocalChangeSourceAction.Created && change.RelativePath == "later.bin")
+                        .Select(change => (LocalChangeSourceEvent?)change).FirstOrDefault();
+                    if (created is null) { await Task.Delay(20, deadline.Token); }
+                }
+                await source.DeliverAsync(created.Value);
+                await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => row.Kind == CloudStateOperationKind.Create));
+                await feed.DisposeAsync();
+                Assert.Equal(failure == SecurityAncestorFailure.JunctionBeforeDelivery ? 0 : 1, acquisitions);
+                Assert.Equal(failure == SecurityAncestorFailure.SharingViolation ? 32 : (int?)null, guardError);
+                Assert.Equal(0, inspections);
+                Assert.Equal("outside-unchanged", await File.ReadAllTextAsync(sentinel));
+                await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
+                IReadOnlyList<CloudOperationJournalEntry> rows = await verify.Operations.ListAsync(100);
+                AssertOriginalAccessRows(originals, rows);
+                CloudOperationJournalEntry observation = Assert.Single(rows.Where(row => row.Kind == CloudStateOperationKind.MetadataUpdate && row.OperationId != retainedId));
+                Assert.Null(observation.ItemId);
+                LocalChangePayload payload = LocalChangePayload.Decode(observation.Payload);
+                Assert.Equal(relativePath, payload.RelativePath);
+                Assert.Equal(directory, payload.IsDirectory);
+                observationId = observation.OperationId;
+                observationSequence = observation.Sequence;
+                Assert.Single(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix));
+                Assert.True(LocalChangeCheckpoint.Decode((await verify.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value).RequiresFullRescan);
+                Assert.Equivalent(originalState, await verify.Items.GetByItemIdAsync(identity.ItemId), strict: true);
+                Assert.Equal(2, (await verify.Items.ListSubtreeAsync(string.Empty)).Count);
+                if (creationEcho)
+                {
+                    CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
+                    Assert.Equal(echoId, echo.SuppressionId);
+                    Assert.Equal(1, echo.RemainingObservations);
+                    Assert.Equal(RemoteCreationIntent.EchoPayload(identity), echo.Payload.ToArray());
+                }
+                output.WriteLine($"Security ancestor: directory={directory}; failure={failure}; guardError={guardError}; creationEcho={creationEcho}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
             }
-            await source.DeliverAsync(created.Value);
-            await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => row.Kind == CloudStateOperationKind.Create));
-            await feed.DisposeAsync();
-            Assert.Equal(failure == SecurityAncestorFailure.JunctionBeforeDelivery ? 0 : 1, acquisitions);
-            Assert.Equal(failure == SecurityAncestorFailure.SharingViolation ? 32 : (int?)null, guardError);
-            Assert.Equal(0, inspections);
-            Assert.Equal("outside-unchanged", await File.ReadAllTextAsync(sentinel));
-            await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
-            IReadOnlyList<CloudOperationJournalEntry> rows = await verify.Operations.ListAsync(100);
-            AssertOriginalAccessRows(originals, rows);
-            CloudOperationJournalEntry observation = Assert.Single(rows.Where(row => row.Kind == CloudStateOperationKind.MetadataUpdate && row.OperationId != retainedId));
-            Assert.Null(observation.ItemId);
-            LocalChangePayload payload = LocalChangePayload.Decode(observation.Payload);
-            Assert.Equal(relativePath, payload.RelativePath);
-            Assert.Equal(directory, payload.IsDirectory);
-            observationId = observation.OperationId;
-            observationSequence = observation.Sequence;
-            Assert.Single(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.NamespaceObservationsPrefix));
-            Assert.True(LocalChangeCheckpoint.Decode((await verify.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName))!.Value).RequiresFullRescan);
-            Assert.Equivalent(originalState, await verify.Items.GetByItemIdAsync(identity.ItemId), strict: true);
-            Assert.Equal(2, (await verify.Items.ListSubtreeAsync(string.Empty)).Count);
+
+            // Reconciliation may leave the junction in place. The historical observation
+            // must still be readable and acknowledgeable without following that path.
+            await fixture.RestartAsync();
+            await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+            await reopened.StartAsync();
+            CloudLocalChangeScan scan = await reopened.BeginScanAsync();
+            Assert.True(scan.RequiresFullRescan);
+            Assert.Empty((await reopened.ReadPageAsync(scan, 0, 100)).Changes);
+            await reopened.AcknowledgeFullRescanAsync();
+            CloudLocalChange observationAfterRestart = Assert.Single((await reopened.ReadPageAsync(await reopened.BeginScanAsync(), 0, 100)).Changes
+                .Where(row => row.OperationId == observationId));
+            Assert.Null(observationAfterRestart.ItemId);
+            Assert.Equal(observationSequence, observationAfterRestart.Sequence);
+            Assert.Equal(CloudLocalChangeKind.MetadataUpdate, observationAfterRestart.Kind);
+            await reopened.AcknowledgeAsync([observationId]);
+            AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
             if (creationEcho)
             {
+                await using ICloudStateTransaction verify = await factory!.Store!.BeginTransactionAsync();
                 CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
                 Assert.Equal(echoId, echo.SuppressionId);
                 Assert.Equal(1, echo.RemainingObservations);
-                Assert.Equal(RemoteCreationIntent.EchoPayload(identity), echo.Payload.ToArray());
             }
-            output.WriteLine($"Security ancestor: directory={directory}; failure={failure}; guardError={guardError}; creationEcho={creationEcho}; nativeFile={before.LocalFileId}; unbound={observationId}; continued=True; outsideUnchanged=True.");
+            Assert.Equal(0, fixture.Provider.Fetches);
         }
         finally
         {
@@ -236,28 +263,6 @@ public sealed partial class CloudContentConfirmationTests
             if (Directory.Exists(staging)) { Directory.Delete(staging); }
             if (Directory.Exists(retired)) { Directory.Move(retired, parent); }
         }
-        await fixture.RestartAsync();
-        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
-        await reopened.StartAsync();
-        CloudLocalChangeScan scan = await reopened.BeginScanAsync();
-        Assert.True(scan.RequiresFullRescan);
-        Assert.Empty((await reopened.ReadPageAsync(scan, 0, 100)).Changes);
-        await reopened.AcknowledgeFullRescanAsync();
-        CloudLocalChange observationAfterRestart = Assert.Single((await reopened.ReadPageAsync(await reopened.BeginScanAsync(), 0, 100)).Changes
-            .Where(row => row.OperationId == observationId));
-        Assert.Null(observationAfterRestart.ItemId);
-        Assert.Equal(observationSequence, observationAfterRestart.Sequence);
-        Assert.Equal(CloudLocalChangeKind.MetadataUpdate, observationAfterRestart.Kind);
-        await reopened.AcknowledgeAsync([observationId]);
-        AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
-        if (creationEcho)
-        {
-            await using ICloudStateTransaction verify = await factory!.Store!.BeginTransactionAsync();
-            CloudEchoSuppressionState echo = Assert.Single(await verify.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow));
-            Assert.Equal(echoId, echo.SuppressionId);
-            Assert.Equal(1, echo.RemainingObservations);
-        }
-        Assert.Equal(0, fixture.Provider.Fetches);
 
         async Task ReplaceAncestorWithJunctionAsync(CancellationToken stop)
         {

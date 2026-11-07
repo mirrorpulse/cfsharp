@@ -82,4 +82,37 @@ public sealed partial class CloudContentConfirmationTests
         await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync(deadline.Token);
         Assert.Null(await verify.Operations.GetAsync(operationId, deadline.Token));
     }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task RestartRecoversStagedSecurityObservationWithoutBinding()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        Guid operationId = Guid.NewGuid();
+        DateTimeOffset time = DateTimeOffset.UtcNow;
+        LocalChangePayload payload = new("historical.bin", null, false, time);
+        await using (ICloudStateTransaction stage = await factory!.Store!.BeginTransactionAsync())
+        {
+            await stage.Checkpoints.UpsertAsync(new(CloudLocalChangeFeed.SecurityValidationPrefix + operationId.ToString("N"), payload.Encode(), time));
+            await stage.CommitAsync();
+        }
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        CloudLocalChangeScan fenced = await feed.BeginScanAsync();
+        Assert.True(fenced.RequiresFullRescan);
+        Assert.Empty((await feed.ReadPageAsync(fenced, 0, 10)).Changes);
+        await feed.AcknowledgeFullRescanAsync();
+        CloudLocalChange entry = Assert.Single((await feed.ReadPageAsync(await feed.BeginScanAsync(), 0, 10)).Changes);
+        Assert.Equal(operationId, entry.OperationId);
+        Assert.Equal(CloudLocalChangeKind.MetadataUpdate, entry.Kind);
+        Assert.Equal(payload.RelativePath, entry.RelativePath);
+        Assert.Equal(time, entry.ObservedAt);
+        Assert.Null(entry.ItemId);
+        await feed.AcknowledgeAsync([operationId]);
+        await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
+        Assert.Empty(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix));
+        Assert.Null(await verify.Operations.GetAsync(operationId));
+    }
 }

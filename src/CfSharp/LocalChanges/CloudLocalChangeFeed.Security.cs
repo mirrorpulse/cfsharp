@@ -8,6 +8,62 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
+    internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
+
+    private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
+
+    private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry, CancellationToken cancellationToken)
+    {
+        await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        string receipt = SecurityValidationName(entry.OperationId);
+        if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
+        {
+            await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
+            await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            SignalAvailable();
+        }
+    }
+
+    private static async ValueTask RetainUnboundSecurityObservationAsync(ICloudStateTransaction transaction, Guid operationId,
+        ReadOnlyMemory<byte> payload, DateTimeOffset observedAt, CancellationToken cancellationToken)
+    {
+        if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        {
+            await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
+                payload.Span, observedAt), cancellationToken).ConfigureAwait(false);
+        }
+
+        await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async ValueTask<bool> RecoverStagedSecurityObservationsAsync(ICloudStateTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
+            cancellationToken).ConfigureAwait(false);
+        foreach (CloudStateCheckpoint receipt in receipts)
+        {
+            if (!Guid.TryParseExact(receipt.Name.AsSpan(SecurityValidationPrefix.Length), "N", out Guid operationId) || operationId == Guid.Empty)
+            {
+                throw new InvalidDataException("A staged security observation has an invalid operation identifier.");
+            }
+
+            LocalChangePayload payload = LocalChangePayload.Decode(receipt.Value);
+            await RetainUnboundSecurityObservationAsync(transaction, operationId, receipt.Value, payload.ObservedAt,
+                cancellationToken).ConfigureAwait(false);
+            await transaction.Checkpoints.UpsertAsync(new(NamespaceObservationsPrefix + "/" + operationId.ToString("N"),
+                receipt.Value.Span, payload.ObservedAt), cancellationToken).ConfigureAwait(false);
+        }
+
+        return receipts.Count != 0;
+    }
+
+    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection) : IDisposable
+    {
+        public void Dispose() => Projection.Dispose();
+    }
+
     private async ValueTask<IDisposable?> AcquireSecurityOperationAsync(CloudItemPath path,
         LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {

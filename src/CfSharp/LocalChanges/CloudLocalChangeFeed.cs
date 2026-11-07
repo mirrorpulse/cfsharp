@@ -737,14 +737,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             using IDisposable? securityOperation = securityObservation is not null
                 ? await AcquireSecurityOperationAsync(path, securityObservation.Value, cancellationToken).ConfigureAwait(false)
                 : null;
-            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, null, cancellationToken, securityObservation).ConfigureAwait(false);
+            await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt, null,
+                cancellationToken, securityObservation).ConfigureAwait(false);
         }
         catch (CloudNamespaceObservationUncertainException exception)
         {
-            // The original transaction has rolled back (or committed before a late native
-            // check failed). Reuse its acknowledgement identity when retaining uncertainty.
+            // Reuse the observation identity whether the original transaction rolled back
+            // or staged the observation before a late native check failed.
             SignalLoss();
-            await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
+            await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
                 cancellationToken, securityObservation).ConfigureAwait(false);
         }
         catch (IOException) when (kind == CloudLocalChangeKind.Move)
@@ -752,7 +753,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             SignalLoss();
             try
             {
-                await PersistChangeCoreAsync(kind, path, previousPath, operationId, observedAt,
+                await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt,
                     Directory.Exists(path.FullPath), cancellationToken).ConfigureAwait(false);
             }
             catch
@@ -765,12 +766,35 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
     }
 
-    private async ValueTask PersistChangeCoreAsync(CloudLocalChangeKind kind, CloudItemPath path,
+    private async ValueTask PersistChangeAttemptAsync(CloudLocalChangeKind kind, CloudItemPath path,
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
         CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
     {
-        await using ICloudStateTransaction transaction = await _stateStore
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        StagedSecurityObservation? staged = null;
+        try
+        {
+            await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
+            {
+                staged = await PersistChangeCoreAsync(transaction, kind, path, previousPath, operationId, observedAt,
+                    uncertainDirectory, securityObservation, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (staged is not null)
+            {
+                staged.Projection.Validate();
+                await PublishValidatedSecurityObservationAsync(staged.Entry, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            staged?.Dispose();
+        }
+    }
+
+    private async ValueTask<StagedSecurityObservation?> PersistChangeCoreAsync(ICloudStateTransaction transaction,
+        CloudLocalChangeKind kind, CloudItemPath path, CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt,
+        bool? uncertainDirectory, LocalChangeSourceEvent? securityObservation, CancellationToken cancellationToken)
+    {
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
         long observation = Math.Max(_nextObservation + 1, checkpoint.Observation + 1);
@@ -780,14 +804,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemState? previous = previousPath is null
             ? null
             : await transaction.Items.GetByRelativePathAsync(previousPath.Value.RelativePath, cancellationToken).ConfigureAwait(false);
-        using SecurityFeedProjection? securityProjection = securityObservation is not null && uncertainDirectory is null
-            ? TryBindSecurityObservation(path, current, securityObservation.Value.SecurityIdentity) : null;
-        if (securityObservation is not null && securityProjection is null)
-        {
-            // Separate native subscriptions have no common delivery order. Never discover an
-            // item or associate a replacement from the path of a historical security record.
-            uncertainDirectory ??= securityObservation.Value.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory;
-        }
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingCreation = creations.Select(value => RemoteCreationIntent.Decode(value.Value)).Any(intent =>
@@ -826,20 +842,54 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
-                uncertainDirectory ?? Directory.Exists(path.FullPath), observedAt);
+                uncertainDirectory ?? (securityObservation is { } security
+                    ? security.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory
+                    : Directory.Exists(path.FullPath)), observedAt);
             if (securityObservation is not null)
             {
-                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
-                    uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+                await RetainUnboundSecurityObservationAsync(transaction, operationId, uncertain.Encode(), observedAt,
+                    cancellationToken).ConfigureAwait(false);
             }
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
-                (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + Guid.NewGuid().ToString("N"),
+                (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + operationId.ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             Volatile.Write(ref _persistedLossGeneration, generation);
             SignalAvailable();
-            return;
+            return null;
+        }
+
+        if (securityObservation is { } securityEvent)
+        {
+            SecurityFeedProjection? projection = uncertainDirectory is null
+                ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity) : null;
+            if (projection is not null)
+            {
+                try
+                {
+                    // A committed receipt stays outside the journal until the post-commit
+                    // check succeeds. Retain both native guards until publication commits.
+                    LocalChangePayload bound = new(path.RelativePath, null, current!.Kind == CloudItemKind.Directory, observedAt);
+                    byte[] receipt = bound.Encode();
+                    CloudOperationJournalEntry boundEntry = new(operationId, CloudStateOperationKind.MetadataUpdate, current.ItemId, receipt, observedAt);
+                    await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), receipt, observedAt),
+                        cancellationToken).ConfigureAwait(false);
+                    await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt, cancellationToken).ConfigureAwait(false);
+                    projection.Validate();
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return new(boundEntry, projection);
+                }
+                catch
+                {
+                    projection.Dispose();
+                    throw;
+                }
+            }
+
+            // Independent native subscriptions have no common delivery order. A historical
+            // security record cannot discover or establish the identity of a replacement.
+            uncertainDirectory ??= securityEvent.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory;
         }
 
         CloudStateOperationKind operationKind = kind switch
@@ -870,16 +920,19 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             throw new CloudNamespaceObservationUncertainException(directory);
         }
 
-        IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
-            .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
-        // Echo matching can inspect the native path. Uncertainty cannot be suppressed and
-        // must not revisit the object after its association or path guard was rejected.
-        // Path and kind cannot attribute an independent security notification to a provider write.
-        CloudEchoSuppressionState? suppression = securityObservation is null && uncertainDirectory is null ? suppressions.FirstOrDefault(candidate =>
-            RemoteCreationIntent.IsCreationEcho(candidate)
+        // Path/kind echo records cannot attribute an independent DACL notification to a
+        // provider write. Uncertain observations also must not revisit a rejected path.
+        CloudEchoSuppressionState? suppression = null;
+        if (securityObservation is null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
+        {
+            IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
+                .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
+            suppression = suppressions.FirstOrDefault(candidate => RemoteCreationIntent.IsCreationEcho(candidate)
                 ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
-                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)) : null;
-        if (suppression is not null && uncertainDirectory is null && directoryProjection?.RequiresRescan != true)
+                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId));
+        }
+
+        if (suppression is not null)
         {
             if (suppression.RemainingObservations == 1)
             {
@@ -905,7 +958,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             directoryProjection?.Validate();
             SignalAvailable();
-            return;
+            return null;
         }
 
         // A pending operation may already be in an uploader's hands. Each subsequent
@@ -960,16 +1013,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             previousPath?.RelativePath,
             uncertainDirectory ?? (directoryProjection is not null || directory),
             observedAt);
-        if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        byte[] encoded = payload.Encode();
+        CloudOperationJournalEntry entry = new(operationId, operationKind, itemId, encoded, observedAt);
+        if (securityObservation is not null)
         {
-            await transaction.Operations.EnqueueAsync(
-            new CloudOperationJournalEntry(
-                operationId,
-                operationKind,
-                itemId,
-                payload.Encode(),
-                observedAt),
-            cancellationToken).ConfigureAwait(false);
+            await RetainUnboundSecurityObservationAsync(transaction, operationId, encoded, observedAt, cancellationToken).ConfigureAwait(false);
+        }
+        else if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        {
+            await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
         }
 
         bool requiresRescan = uncertainDirectory is not null || directoryProjection?.RequiresRescan == true;
@@ -977,7 +1029,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (requiresRescan)
         {
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(NamespaceObservationsPrefix + "/" + operationId.ToString("N"),
-                payload.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+                encoded, observedAt), cancellationToken).ConfigureAwait(false);
         }
 
         await UpsertCheckpointAsync(
@@ -987,7 +1039,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             observedAt,
             cancellationToken).ConfigureAwait(false);
         directoryProjection?.Validate();
-        securityProjection?.Validate();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (requiresRescan)
         {
@@ -995,8 +1046,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
 
         directoryProjection?.Validate();
-        securityProjection?.Validate();
         SignalAvailable();
+        return null;
 
         async ValueTask<DirectoryFeedProjection?> TryProjectDirectoryAsync()
         {
@@ -1081,7 +1132,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
-        await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        if (await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false))
+        {
+            await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        }
         _nextObservation = checkpoint.Observation;
         Volatile.Write(ref _rescanNoticeDelivered, 0);
     }

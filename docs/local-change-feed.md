@@ -30,10 +30,11 @@ allowing independent notifications to continue through the same worker.
 
 A cloud metadata query can fail while an object is reverting from placeholder to ordinary file,
 including between the attribute query and `CfGetPlaceholderInfo`. This inspection uncertainty
-requires reconciliation and does not stop the notification worker. Initial or pre-commit failures
-retain an unbound observation. A post-commit failure retains the already committed operation ID,
-sequence and association, fences dispatch, and requires reconciliation without duplicating the
-observation. Later independent notifications continue to be journaled in either case.
+requires reconciliation and does not stop the notification worker. The feed stages a bound
+observation outside the journal. Only successful post-commit validation publishes its binding,
+so concurrent consumers cannot read or acknowledge an unverified association. Failed validation
+or restart with an unfinished receipt journals the same operation ID without an item association.
+Later independent notifications continue to be journaled.
 
 The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
