@@ -19,7 +19,7 @@ public sealed class WindowsSecurityChangeSourceTests
         TaskCompletionSource<WindowsSecurityChangeSource> ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Thread starter = new(() =>
         {
-            try { ready.TrySetResult(new(root, 4096, change => observed.TrySetResult(change), error => observed.TrySetException(new System.ComponentModel.Win32Exception(error)))); }
+            try { ready.TrySetResult(new(root, 4096, change => observed.TrySetResult(change), (error, _) => observed.TrySetException(new System.ComponentModel.Win32Exception(error)))); }
             catch (Exception exception) { ready.TrySetException(exception); }
         });
         try
@@ -89,7 +89,7 @@ public sealed class WindowsSecurityChangeSourceTests
         try
         {
             System.Collections.Concurrent.ConcurrentQueue<int> unexpected = new();
-            WindowsSecurityChangeSource source = new(root, 4096, _ => unexpected.Enqueue(-1), error => unexpected.Enqueue(error));
+            WindowsSecurityChangeSource source = new(root, 4096, _ => unexpected.Enqueue(-1), (error, _) => unexpected.Enqueue(error));
             Assert.NotEqual(0ul, source.VolumeSerialNumber);
             Task first = source.DisposeAsync().AsTask();
             Task repeated = source.DisposeAsync().AsTask();

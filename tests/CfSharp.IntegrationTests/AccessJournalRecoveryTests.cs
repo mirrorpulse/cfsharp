@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Security.AccessControl;
 
 using CfSharp.Storage.Sqlite;
@@ -114,5 +115,48 @@ public sealed partial class CloudContentConfirmationTests
         await using ICloudStateTransaction verify = await factory.Store!.BeginTransactionAsync();
         Assert.Empty(await verify.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix));
         Assert.Null(await verify.Operations.GetAsync(operationId));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task TerminalSecuritySubscriptionFailureRequiresNewFeed()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        WindowsLocalChangeSource source = new(fixture.Root, 64 * 1024);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(25));
+        await using (CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(fixture.Root, factory!.Store!, new(), source))
+        {
+            await feed.StartAsync(deadline.Token);
+            source.OnSecurityError(1022, terminal: false);
+            Assert.True((await feed.ReadBatchAsync(deadline.Token)).RequiresFullRescan);
+            while (true)
+            {
+                try { await feed.AcknowledgeFullRescanAsync(deadline.Token); break; }
+                catch (InvalidOperationException) { await Task.Delay(10, deadline.Token); }
+            }
+            Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            Task<CloudLocalChangeBatch>[] waiting = Enumerable.Range(0, 3).Select(_ => feed.ReadBatchAsync(deadline.Token).AsTask()).ToArray();
+            // Use the same error code with a failed rearm. The native pump's terminal
+            // status, rather than the numeric overflow code, controls the feed lifetime.
+            source.OnSecurityError(1022, terminal: true);
+            foreach (Task<CloudLocalChangeBatch> reader in waiting)
+            {
+                InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(async () => { await reader; });
+                Assert.Equal(1022, Assert.IsType<Win32Exception>(failure.InnerException).NativeErrorCode);
+            }
+            await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => feed.BeginScanAsync(deadline.Token).AsTask());
+            await File.WriteAllTextAsync(Path.Combine(fixture.Root, "later.bin"), "after failure", deadline.Token);
+        }
+
+        Assert.Empty(await AccessRowsAsync(factory!));
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync(deadline.Token);
+        Assert.True((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "reopened.bin"), "after restart", deadline.Token);
+        CloudLocalChangeBatch resumed = await reopened.ReadBatchAsync(deadline.Token);
+        Assert.Contains(resumed.Changes, entry => entry.Kind == CloudLocalChangeKind.Create && entry.RelativePath == "reopened.bin");
     }
 }

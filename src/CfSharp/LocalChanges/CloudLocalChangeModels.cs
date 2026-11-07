@@ -191,6 +191,7 @@ internal enum LocalChangeSourceAction
     Overflow,
     Error,
     SecurityModified,
+    SecuritySubscriptionFailed,
 }
 
 internal readonly record struct LocalChangeSourceEvent(

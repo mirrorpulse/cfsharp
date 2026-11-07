@@ -38,8 +38,10 @@ Later independent notifications continue to be journaled.
 
 The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
-or failure during either subscription requires reconciliation. Disposal cancels pending native I/O
-and observes its completion before releasing its buffer, event, directory handle and overlapped state.
+or a recoverable subscription error requires reconciliation. A terminal security subscription
+failure stops the feed, preserves the native error and fences the journal for the next feed.
+Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
+I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
 
 The metadata observation is not a protected-operation success receipt or proof of a particular
 callback. Failed, canceled and late security writes use the same classification. Content writes,

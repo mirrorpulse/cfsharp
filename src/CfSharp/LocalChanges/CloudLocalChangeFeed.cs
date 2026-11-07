@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Text;
 using System.Threading.Channels;
 
@@ -14,8 +15,9 @@ namespace CfSharp;
 /// </para>
 /// <para>
 /// Windows directory notifications are advisory. Buffer overflow, watcher errors, and malformed
-/// rename pairs produce <see cref="CloudLocalChangeBatch.RequiresFullRescan"/>. Applications must
-/// perform a full reconciliation before acknowledging that condition; periodic reconciliation is
+/// rename pairs produce <see cref="CloudLocalChangeBatch.RequiresFullRescan"/>. A permanently
+/// failed security subscription stops this feed. Dispose and recreate it before resuming. Applications
+/// must perform a full reconciliation before acknowledging loss; periodic reconciliation is
 /// intentionally outside CfSharp.
 /// </para>
 /// <para>
@@ -143,7 +145,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// full reconciliation, even if the worker persists its marker before the read finishes.
     /// Reading does not clear that marker or acknowledge any pending operation.
     /// </remarks>
-    /// <exception cref="InvalidOperationException">The feed has not been started.</exception>
+    /// <exception cref="InvalidOperationException">The feed has not been started or has stopped with a failure.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
     public async ValueTask<CloudLocalChangeBatch> ReadBatchAsync(
         CancellationToken cancellationToken = default)
@@ -178,7 +180,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 return new CloudLocalChangeBatch(operations.Select(ToChange).ToArray(), requiresFullRescan: false);
             }
 
-            await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (ChannelClosedException)
+            {
+                ThrowIfFailed();
+                throw;
+            }
         }
     }
 
@@ -261,6 +271,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             }
         }
 
+        ThrowIfFailed();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -270,8 +281,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
     /// <exception cref="InvalidOperationException">
-    /// A remote creation, file move or Delete remains pending, a loss signal is not yet durable, or new
-    /// loss raced this acknowledgement.
+    /// The feed has not started or has stopped with a failure, a remote creation, file move or Delete
+    /// remains pending, a loss signal is not yet durable, or new loss raced this acknowledgement.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
     public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
@@ -309,6 +320,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             throw new InvalidOperationException("A new loss signal must be persisted and reconciled before acknowledging the rescan.");
         }
+        ThrowIfFailed();
 
         await transaction.Checkpoints.UpsertAsync(
             new CloudStateCheckpoint(
@@ -577,8 +589,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             {
                 // Preserve the worker's original failure when the store also cannot record loss.
             }
-            Volatile.Write(ref _failure, exception);
-            _availability.Writer.TryWrite(true);
+            Interlocked.CompareExchange(ref _failure, exception, null);
+            _availability.Writer.TryComplete();
         }
     }
 
@@ -1111,6 +1123,21 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PublishAsync(LocalChangeSourceEvent sourceEvent)
     {
+        if (Volatile.Read(ref _failure) is not null) { return; }
+
+        if (sourceEvent.Action == LocalChangeSourceAction.SecuritySubscriptionFailed)
+        {
+            // Complete out of band: a full notification buffer must not turn permanent
+            // subscription loss into an ordinary overflow. Accepted events drain before
+            // the worker persists the terminal loss; readers fail immediately.
+            Win32Exception failure = new(sourceEvent.ErrorCode);
+            SignalLoss();
+            Interlocked.CompareExchange(ref _failure, failure, null);
+            _sourceEvents.Writer.TryComplete(failure);
+            _availability.Writer.TryComplete();
+            return;
+        }
+
         if (sourceEvent.Action is LocalChangeSourceAction.Overflow or LocalChangeSourceAction.Error)
         {
             SignalLoss();
@@ -1199,6 +1226,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             throw new InvalidOperationException("The local-change feed has not been started.");
         }
+        ThrowIfFailed();
     }
 
     private void ThrowIfFailed()

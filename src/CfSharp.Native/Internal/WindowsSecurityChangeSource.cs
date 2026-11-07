@@ -13,7 +13,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private readonly SafeFileHandle _directory;
     private readonly ManualResetEvent _completed = new(false);
     private readonly Action<WindowsSecurityChange> _changed;
-    private readonly Action<int> _error;
+    private readonly Action<int, bool> _error;
     private readonly int _capacity;
     private readonly nint _buffer;
     private readonly nint _overlapped;
@@ -22,7 +22,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private bool _pending;
     private bool _stopping;
 
-    internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed, Action<int> error)
+    internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed, Action<int, bool> error)
     {
         _changed = changed;
         _error = error;
@@ -106,9 +106,9 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
                 terminal = !_pending;
                 if (terminal) { _stopping = true; }
             }
-            if (error != 0)
+            if (terminal || error != 0)
             {
-                Deliver(() => _error(error));
+                Deliver(() => _error(error, terminal));
                 if (terminal) { return; }
                 continue;
             }

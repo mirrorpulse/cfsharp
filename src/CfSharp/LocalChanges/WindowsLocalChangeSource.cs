@@ -70,8 +70,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             try
             {
                 watcher.EnableRaisingEvents = true;
-                _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged,
-                    error => Publish(new(error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error, string.Empty, error)));
+                _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError);
             }
             catch
             {
@@ -161,6 +160,13 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             ? LocalChangeSourceAction.Overflow
             : LocalChangeSourceAction.Error;
         Publish(new(action, string.Empty));
+    }
+
+    internal void OnSecurityError(int error, bool terminal)
+    {
+        LocalChangeSourceAction action = terminal ? LocalChangeSourceAction.SecuritySubscriptionFailed
+            : error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error;
+        Publish(new(action, string.Empty, error));
     }
 
     private void Publish(LocalChangeSourceEvent sourceEvent)
