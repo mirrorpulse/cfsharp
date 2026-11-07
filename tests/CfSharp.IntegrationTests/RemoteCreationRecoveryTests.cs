@@ -167,7 +167,7 @@ public sealed class RemoteCreationRecoveryTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class FailingFactory(ICloudStateStoreFactory inner) : ICloudStateStoreFactory
+    internal sealed class FailingFactory(ICloudStateStoreFactory inner) : ICloudStateStoreFactory
     {
         internal bool FailCreationCommit { get; set; }
         internal ICloudStateStore? Store { get; private set; }

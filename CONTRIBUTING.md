@@ -110,6 +110,9 @@ The local full-suite command above executes both partitions.
 The same dedicated jobs execute all native `PhysicalOwnership` SQLite cases, including child
 processes and retained-handle acquisition boundaries; main jobs exclude only that new category.
 Their original SQLite suite remains intact. Original TRXs must prove both partitions passed.
+The dedicated jobs also run all `AccessJournal` cases with actual Windows notification sources
+and resident placeholders. Main jobs exclude that additional category; the original integration
+suite remains intact and the combined evidence must include every category without skipped cases.
 
 The integration test project can also be built and tested independently in either configuration:
 

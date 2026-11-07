@@ -49,6 +49,9 @@ public sealed partial class CloudProtectedLocalOperationContext
     /// their data are not frozen. No owner, group or SACL is written. The receipt records application
     /// separately from readback; a readback is not independent permission verification or product
     /// readiness. The application owns original DACL evidence, policy, verification and recovery.
+    /// The Windows local-change feed records security-only notifications as MetadataUpdate, not
+    /// ContentUpdate. This classification does not suppress any separate content/name notification
+    /// and does not depend on this scope's success or readback receipt.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The descriptor is null.</exception>
     /// <exception cref="ArgumentException">The descriptor kind does not match the protected object.</exception>

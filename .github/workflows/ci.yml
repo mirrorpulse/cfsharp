@@ -75,7 +75,7 @@ jobs:
           if-no-files-found: error
 
       - name: Test
-        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
+        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership&Category!=AccessJournal" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
 
       - name: Verify Delete recovery as a fresh ordinary user
         shell: pwsh
@@ -174,7 +174,7 @@ jobs:
         run: ./eng/verify-runtime-boundaries.ps1 -Configuration Release
 
       - name: Test ARM64 solution
-        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
+        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership&Category!=AccessJournal" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
 
       - name: Verify Delete recovery as a fresh ordinary ARM64 user
         shell: pwsh
@@ -261,8 +261,26 @@ jobs:
         shell: pwsh
         run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite Recreation
 
+      - name: Test Access-only journal classification
+        run: dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-build --no-restore --filter "Category=AccessJournal" --logger "trx;LogFileName=access-journal.trx" --blame-hang-timeout 2m
+
+      - name: Verify complete Access journal coverage
+        shell: pwsh
+        run: |
+          [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/access-journal.trx -Raw
+          $counts = $report.TestRun.ResultSummary.Counters
+          $cases = @($report.TestRun.Results.UnitTestResult)
+          if ([int]$counts.total -ne 66 -or [int]$counts.executed -ne 66 -or [int]$counts.passed -ne 66 -or
+              @($cases.testName | Sort-Object -Unique).Count -ne 66 -or @($cases | Where-Object outcome -ne 'Passed').Count -ne 0) {
+            throw 'All 66 distinct Access journal cases must execute and pass.'
+          }
+
       - name: Build SQLite physical ownership tests
         run: dotnet build tests/CfSharp.Storage.Sqlite.Tests/CfSharp.Storage.Sqlite.Tests.csproj --configuration Release --disable-build-servers -m:1
+
+      - name: Verify Access journal as a fresh ordinary user
+        shell: pwsh
+        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite AccessJournal
 
       - name: Test SQLite physical ownership
         run: dotnet test tests/CfSharp.Storage.Sqlite.Tests/CfSharp.Storage.Sqlite.Tests.csproj --configuration Release --no-build --no-restore --filter "Category=PhysicalOwnership" --logger "trx;LogFileName=physical-ownership.trx" --blame-hang-timeout 2m
@@ -288,6 +306,7 @@ jobs:
             tests/CfSharp.IntegrationTests/TestResults/**/*.xml
             tests/CfSharp.Storage.Sqlite.Tests/TestResults/**/*.trx
             artifacts/ordinary-user-recreation/**
+            artifacts/ordinary-user-accessjournal/**
           if-no-files-found: error
 
   native-abi-x64:

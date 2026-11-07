@@ -1,5 +1,66 @@
 # Local change feed
 
+Windows security-descriptor notifications use a separate NTFS extended native subscription from data and name
+notifications, retaining the kernel's file ID and volume rather than reopening the event's path to infer origin.
+A security-only change, including a protected Access descriptor write, is delivered
+as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
+Applications distinguish it from content work using the public kind before ACK; no private payload
+or timestamp comparison is required. Directory metadata retains the same public classification.
+Security notifications bypass provider echo suppression. The existing path and operation kind
+cannot establish that a provider write caused an independently reported DACL change.
+
+Before binding a security observation, the feed verifies its kernel ID against the existing durable
+item and the current native placeholder identity, holding the object and ancestor namespace guards
+through the journal transaction. Security observations never discover or rewrite an item row.
+An absent path, replacement, untracked ordinary object, unavailable binding or denied guard remains
+an unbound `MetadataUpdate` with a durable full-rescan fence. This also covers security records
+delivered after a rename from the independent name subscription. The original path, kind and
+operation ID survive restart; after explicit reconciliation, public pages expose that unbound
+observation for acknowledgement. Earlier operations and replacement item rows remain unchanged.
+When remote creation, move or deletion must be replayed, the feed also journals an unbound security
+observation. Completing remote replay and acknowledging reconciliation clears the fence while the
+journal entry remains available for individual acknowledgement.
+
+The feed validates a security notification's historical path before checking the live namespace.
+A valid relative path is retained when a junction already redirects it outside the root at delivery,
+when a junction appears during guard acquisition or identity inspection, or when a native sharing
+conflict prevents acquiring the ancestor lease. These observations remain unbound behind a durable
+reconciliation fence. Recovery uses the retained path and kind, leaving pending echoes intact and
+allowing independent notifications to continue through the same worker.
+
+A cloud metadata query can fail while an object is reverting from placeholder to ordinary file,
+including between the attribute query and `CfGetPlaceholderInfo`. This inspection uncertainty
+requires reconciliation and does not stop the notification worker. The feed stages a bound
+observation outside the journal. Only successful post-commit validation publishes its binding,
+so concurrent consumers cannot read or acknowledge an unverified association. Failed validation
+or restart with an unfinished receipt journals the same operation ID without an item association.
+Later independent notifications continue to be journaled.
+
+The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
+or later. Unsupported native subscription startup reports the original Windows failure. Overflow
+or a recoverable subscription error requires reconciliation. A terminal security subscription
+failure stops the feed, preserves the native error and fences the journal for the next feed.
+If the next native read fails to start, the decoded batch is delivered before the terminal
+notification. Disposal keeps security callbacks active until the native pump exits, allowing the
+feed to persist terminal loss even when shutdown overlaps its delivery.
+Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
+I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
+
+The metadata observation is not a protected-operation success receipt or proof of a particular
+callback. Failed, canceled and late security writes use the same classification. Content writes,
+truncations and namespace changes still arrive independently, including same-length writes racing
+with a security write. The feed does not consume a suppression ticket, erase a pending row, or
+attribute a later object's data to an earlier Access operation. Generic ambiguous modifications
+remain content candidates; loss/error on either subscription requires reconciliation.
+
+Both subscriptions are started and disposed with the feed. Their observations are serialized into
+the existing durable journal, preserving each retained ID, sequence and payload across restart.
+Across subscriptions, sequence order is the order observed by the feed, not a global Windows
+transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
+infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and
+ACK contracts are unchanged. A feed that was stopped while Windows events occurred still requires
+the application's existing reconciliation policy; no complete offline change history is implied.
+
 The local change feed turns Windows directory notifications into an explicit, bounded application
 queue. It is a coordination aid, not a lossless replacement for reconciliation.
 

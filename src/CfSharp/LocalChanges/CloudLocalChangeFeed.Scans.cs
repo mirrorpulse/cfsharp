@@ -101,7 +101,16 @@ public sealed partial class CloudLocalChangeFeed
         try
         {
             CloudLocalChange change = ToChange(operation);
-            CloudItemPathResolver.Resolve(_syncRootPath, change.RelativePath, allowRoot: false);
+            if (change.Kind == CloudLocalChangeKind.MetadataUpdate)
+            {
+                // Metadata observations describe historical paths, even when associated with
+                // an item ID. Reconciliation can leave a junction in place at the old path.
+                CloudItemPathResolver.ResolveLexically(_syncRootPath, change.RelativePath, allowRoot: false);
+            }
+            else
+            {
+                CloudItemPathResolver.Resolve(_syncRootPath, change.RelativePath, allowRoot: false);
+            }
             if (change.PreviousRelativePath is not null)
             {
                 CloudItemPathResolver.Resolve(_syncRootPath, change.PreviousRelativePath, allowRoot: false);
