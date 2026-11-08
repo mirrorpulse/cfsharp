@@ -64,6 +64,12 @@ the application's existing reconciliation policy; no complete offline change his
 The local change feed turns Windows directory notifications into an explicit, bounded application
 queue. It is a coordination aid, not a lossless replacement for reconciliation.
 
+An unavailable ordinary notification path, including access denied during attribute or link
+inspection at either rename endpoint, durably requires full reconciliation. The feed keeps
+processing other paths without inventing an item, consuming that path's echo record, or changing
+its existing journal history. Applications must reconcile the affected namespace before clearing
+the marker. A failure to persist the marker or other state-store work still fails the worker.
+
 Disposal stops notification production and drains accepted events while the state store remains
 open, including queue-tail renames during owner shutdown. If draining times out or fails, the feed
 persists a full-rescan marker before canceling its worker. Persisting that fence can wait for an

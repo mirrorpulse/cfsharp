@@ -73,7 +73,7 @@ public sealed partial class CloudLocalChangeFeed
         {
             contained = CloudItemPathResolver.IsPhysicallyContained(_syncRootPath, path);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is CloudPathReparsePointException or IOException or UnauthorizedAccessException)
         {
             throw new CloudNamespaceObservationUncertainException(isDirectory, exception);
         }

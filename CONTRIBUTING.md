@@ -119,6 +119,10 @@ Formatting runs once with the pinned SDK. Each native architecture builds its ma
 trim/AOT targets; isolated package consumers still compile both RIDs on both hosts and execute the
 native RID. The runtime-boundary script defaults to both RIDs for local and release verification.
 
+Offline placeholder reference tests also run in the Content partition and under a fresh
+non-administrator account on both architectures. Their observer runs in a separate process after
+the provider has disposed, uses its own SQLite database, and restores placeholder compatibility mode.
+
 The local full-suite command above still runs every ordinary test. To reproduce CI after building:
 
 ```powershell

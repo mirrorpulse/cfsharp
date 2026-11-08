@@ -140,7 +140,7 @@ public sealed partial class CloudDirectory : CloudItem
     {
     }
 
-    /// <summary>Creates a file reference relative to this directory without opening it.</summary>
+    /// <summary>Creates a file reference relative to this directory without opening its content.</summary>
     /// <param name="relativePath">
     /// Path relative to this directory. Parent navigation is allowed only while it remains within
     /// the owning sync root. The item need not exist.
@@ -149,7 +149,7 @@ public sealed partial class CloudDirectory : CloudItem
     public CloudFile GetFile(string relativePath) =>
         Owner.GetFile(CombineRelativePath(relativePath));
 
-    /// <summary>Creates a directory reference relative to this directory without opening it.</summary>
+    /// <summary>Creates a directory reference relative to this directory without enumerating its content.</summary>
     /// <param name="relativePath">
     /// Path relative to this directory, or an empty string for this directory. Parent navigation
     /// is allowed only while it remains within the owning sync root.
