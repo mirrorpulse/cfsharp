@@ -14,7 +14,7 @@ namespace CfSharp;
 /// invokes remote-provider code.
 /// </para>
 /// <para>
-/// Windows directory notifications are advisory. Buffer overflow, watcher errors, and malformed
+/// Windows directory notifications are advisory. Buffer overflow, watcher errors, inaccessible paths, and malformed
 /// rename pairs produce <see cref="CloudLocalChangeBatch.RequiresFullRescan"/>. A permanently
 /// failed security subscription stops this feed. Dispose and recreate it before resuming. Applications
 /// must perform a full reconciliation before acknowledging loss; periodic reconciliation is
@@ -655,10 +655,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 break;
             case LocalChangeSourceAction.Modified:
                 await PersistChangeAsync(
-                    ClassifyModifiedChange(sourceEvent.RelativePath),
+                    CloudLocalChangeKind.ContentUpdate,
                     sourceEvent.RelativePath,
                     previousRelativePath: null,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken, classifyModified: true).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
                 await PersistChangeAsync(
@@ -681,30 +681,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
     }
 
-    private CloudLocalChangeKind ClassifyModifiedChange(string relativePath)
-    {
-        try
-        {
-            CloudItemPath path = CloudItemPathResolver.Resolve(
-                _syncRootPath,
-                relativePath,
-                allowRoot: false);
-            return Directory.Exists(path.FullPath)
-                ? CloudLocalChangeKind.MetadataUpdate
-                : CloudLocalChangeKind.ContentUpdate;
-        }
-        catch (ArgumentException)
-        {
-            return CloudLocalChangeKind.ContentUpdate;
-        }
-    }
-
     private async ValueTask PersistChangeAsync(
         CloudLocalChangeKind kind,
         string relativePath,
         string? previousRelativePath,
         CancellationToken cancellationToken,
-        LocalChangeSourceEvent? securityObservation = null)
+        LocalChangeSourceEvent? securityObservation = null,
+        bool classifyModified = false)
     {
         CloudItemPath path;
         try
@@ -713,8 +696,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 ? CloudItemPathResolver.Resolve(_syncRootPath, relativePath, allowRoot: false)
                 : CloudItemPathResolver.ResolveLexically(_syncRootPath, relativePath, allowRoot: false);
         }
-        catch (ArgumentException)
+        catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
         {
+            // A path query can lose access without invalidating the root subscription.
+            // Fence delivery for reconciliation before accepting another observation. The
+            // catch covers only resolution; durable-store failures must still stop the worker.
             await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -729,11 +715,18 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     previousRelativePath,
                     allowRoot: false);
             }
-            catch (ArgumentException)
+            catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
             {
                 await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
                 return;
             }
+        }
+
+        if (classifyModified)
+        {
+            // Resolve once before classifying. A separate preliminary walk could fail outside
+            // the recovery boundary, or disagree with the path validated for persistence.
+            kind = Directory.Exists(path.FullPath) ? CloudLocalChangeKind.MetadataUpdate : CloudLocalChangeKind.ContentUpdate;
         }
 
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
