@@ -80,7 +80,7 @@ jobs:
         shell: pwsh
         env:
           CFSHARP_ABI_PROBE_JSON: ${{ github.workspace }}\artifacts\abi-probe\x64.json
-        run: dotnet test tests/CfSharp.Native.Tests/CfSharp.Native.Tests.csproj --configuration Release --no-restore --logger "trx;LogFileName=preview-abi-results.trx"
+        run: dotnet test tests/CfSharp.Native.Tests/CfSharp.Native.Tests.csproj --configuration Release --no-restore --filter "Category=AbiProbe" --logger "trx;LogFileName=preview-abi-results.trx"
 
       - name: Resolve next preview version from NuGet
         id: version

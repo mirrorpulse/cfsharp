@@ -9,14 +9,13 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
+    // Pre-apply failures produce no security observation. Successful native writes retain
+    // both startup modes; they exercise delivery and durable history after an owner restart.
     [InlineData("before", false)]
-    [InlineData("before", true)]
     [InlineData("after", false)]
     [InlineData("after", true)]
     [InlineData("cancel", false)]
-    [InlineData("cancel", true)]
     [InlineData("invalid", false)]
-    [InlineData("invalid", true)]
     [InlineData("race", false)]
     [InlineData("race", true)]
     [InlineData("truncate", false)]

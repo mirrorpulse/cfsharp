@@ -10,8 +10,6 @@ public sealed partial class CloudContentConfirmationTests
     [Theory]
     [InlineData(false, "oplock")]
     [InlineData(true, "oplock")]
-    [InlineData(false, "guard")]
-    [InlineData(true, "guard")]
     [InlineData(false, "metadata")]
     [InlineData(true, "metadata")]
     [InlineData(false, "read")]

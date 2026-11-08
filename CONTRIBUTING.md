@@ -103,16 +103,30 @@ Native or Windows-state changes also require the relevant ABI probe, integration
 or sample-provider tests. The 30-minute x64/ARM64 `LongSoak` is a manual workflow gate, not a
 substitute for the normal test suite.
 
-CI runs native `RemoteRecreation` cases in dedicated x64 and ARM64 jobs, including fresh
-ordinary-user execution. The main solution jobs execute the complementary category partition.
-Together they retain the full ordinary suite without extending existing job or test deadlines.
-The local full-suite command above executes both partitions.
-The same dedicated jobs execute all native `PhysicalOwnership` SQLite cases, including child
-processes and retained-handle acquisition boundaries; main jobs exclude only that new category.
-Their original SQLite suite remains intact. Original TRXs must prove both partitions passed.
-The dedicated jobs also run all `AccessJournal` cases with actual Windows notification sources
-and resident placeholders. Main jobs exclude that additional category; the original integration
-suite remains intact and the combined evidence must include every category without skipped cases.
+CI runs the complete native integration suite in three isolated jobs per architecture: `Recovery`
+for remote Delete/Move recovery, `Namespace` for directory moves and retired-path recreation,
+and `Content` for the remaining cases, including native Access journal observations. Each job
+discovers all ordinary integration cases from the compiled assembly and verifies that the three
+partitions are disjoint and exhaustive. Its original TRX must contain every selected case exactly
+once, with no skipped or failed cases. Native tests remain serial within each Windows machine.
+
+Fresh ordinary-user Delete, recreation and Access journal checks run with their corresponding
+partitions on both x64 and ARM64. The main solution jobs run the other test projects, including
+the complete SQLite suite and its physical ownership cases. Existing required check names are
+terminal gates: failed, skipped or cancelled native partitions cannot produce a successful gate.
+ABI probes, API inventory, trim/AOT boundaries and isolated package consumers remain separate checks.
+Formatting runs once with the pinned SDK. Each native architecture builds its matching sample
+trim/AOT targets; isolated package consumers still compile both RIDs on both hosts and execute the
+native RID. The runtime-boundary script defaults to both RIDs for local and release verification.
+
+The local full-suite command above still runs every ordinary test. To reproduce CI after building:
+
+```powershell
+pwsh ./eng/test-integration-partition.ps1 -VerifyPlan
+pwsh ./eng/test-integration-partition.ps1 -Partition Recovery
+pwsh ./eng/test-integration-partition.ps1 -Partition Namespace
+pwsh ./eng/test-integration-partition.ps1 -Partition Content
+```
 
 The integration test project can also be built and tested independently in either configuration:
 
