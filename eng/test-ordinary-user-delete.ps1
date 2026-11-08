@@ -2,7 +2,7 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
-    [ValidateSet('Delete', 'Recreation', 'AccessJournal')]
+    [ValidateSet('Delete', 'Recreation', 'AccessJournal', 'OfflineReference')]
     [string] $Suite = 'Delete'
 )
 
@@ -26,6 +26,7 @@ $executionRoot = Join-Path $env:PUBLIC "CfSharpOrdinaryTests/$id"
 $suiteName = $Suite.ToLowerInvariant()
 $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen' }
     elseif ($Suite -eq 'AccessJournal') { 'FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit' }
+    elseif ($Suite -eq 'OfflineReference') { 'FullyQualifiedName~OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'AccessJournal') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
@@ -124,6 +125,14 @@ exit $LASTEXITCODE
         foreach ($kind in @('False', 'True')) {
             if (@($cases | Where-Object { $_.testName -match "ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen\(directory: $kind\)" -and $_.outcome -eq 'Passed' }).Count -ne 1) {
                 throw 'Each distinct file/directory recreation case must pass exactly once.'
+            }
+        }
+    }
+    if ($Suite -eq 'OfflineReference') {
+        $cases = @($report.TestRun.Results.UnitTestResult)
+        foreach ($mode in @('False', 'True')) {
+            if (@($cases | Where-Object { $_.testName -match "OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess\(exposeBeforeReference: $mode\)" -and $_.outcome -eq 'Passed' }).Count -ne 1) {
+                throw 'Both default and exposed-mode offline reference cases must pass exactly once.'
             }
         }
     }

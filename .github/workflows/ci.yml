@@ -273,6 +273,11 @@ jobs:
           }
           ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite $suite
 
+      - name: Verify offline placeholder references as a fresh ordinary user
+        if: matrix.partition == 'Content'
+        shell: pwsh
+        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite OfflineReference
+
       - name: Upload native partition evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

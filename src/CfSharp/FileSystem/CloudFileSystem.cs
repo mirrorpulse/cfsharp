@@ -139,13 +139,22 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         ICloudFileSystemRuntime runtime) =>
         new(syncRootPath, runtime);
 
-    /// <summary>Creates an immutable path-bound file reference without opening the item.</summary>
+    /// <summary>Creates an immutable path-bound file reference without opening its content.</summary>
     /// <param name="relativePath">Path relative to the sync root. It need not currently exist.</param>
     /// <returns>A file reference whose inspections read fresh state.</returns>
+    /// <remarks>
+    /// Path containment uses metadata-only queries and distinguishes Cloud Files placeholders
+    /// from name-redirecting links. Existing placeholders do not require a connected provider
+    /// merely to construct a reference, including when placeholder attributes are exposed.
+    /// Content reads and discovery beneath an unpopulated directory may still require a provider.
+    /// Reference construction does not reserve the namespace; operations validate it again.
+    /// </remarks>
     /// <exception cref="ArgumentException">
     /// The path is rooted, identifies the sync root, escapes it lexically, or resolves outside it
-    /// through an existing symbolic link or junction.
+    /// through an existing symbolic link or junction, or contains an unsupported reparse tag.
     /// </exception>
+    /// <exception cref="IOException">Path metadata cannot be read or a link chain cannot be resolved.</exception>
+    /// <exception cref="UnauthorizedAccessException">Access to path metadata is denied.</exception>
     /// <exception cref="InvalidOperationException">The file system has not finished starting.</exception>
     /// <exception cref="ObjectDisposedException">The file system is stopping or disposed.</exception>
     public CloudFile GetFile(string relativePath)
@@ -158,15 +167,23 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         return new CloudFile(this, path.FullPath, path.RelativePath);
     }
 
-    /// <summary>Creates an immutable path-bound directory reference without opening the item.</summary>
+    /// <summary>Creates an immutable path-bound directory reference without enumerating its content.</summary>
     /// <param name="relativePath">
     /// Path relative to the sync root, or an empty string for the root. It need not currently exist.
     /// </param>
     /// <returns>A directory reference whose inspections read fresh state.</returns>
+    /// <remarks>
+    /// Containment uses metadata-only queries and permits Cloud Files directory tags without
+    /// recalling the directory. This also applies to the root and populated cloud ancestors.
+    /// Discovery beneath an unpopulated directory may require a connected provider. Each operation
+    /// revalidates the namespace; a reference does not hold a directory handle or prevent renames.
+    /// </remarks>
     /// <exception cref="ArgumentException">
     /// The path is rooted, escapes the sync root lexically, or resolves outside it through an
-    /// existing symbolic link or junction.
+    /// existing symbolic link or junction, or contains an unsupported reparse tag.
     /// </exception>
+    /// <exception cref="IOException">Path metadata cannot be read or a link chain cannot be resolved.</exception>
+    /// <exception cref="UnauthorizedAccessException">Access to path metadata is denied.</exception>
     /// <exception cref="InvalidOperationException">The file system has not finished starting.</exception>
     /// <exception cref="ObjectDisposedException">The file system is stopping or disposed.</exception>
     public CloudDirectory GetDirectory(string relativePath)

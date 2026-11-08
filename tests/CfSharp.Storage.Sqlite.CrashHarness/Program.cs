@@ -1,6 +1,11 @@
 using CfSharp;
 using CfSharp.Storage.Sqlite;
 
+if (args.Length == 4 && args[0] == "offline-reference" && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17134))
+{
+    return await OfflineReferenceObserver.RunAsync(args[1], args[2], args[3]);
+}
+
 if (args.Length is 3 or 5 && args[2].StartsWith("ownership-", StringComparison.Ordinal))
 {
     return await SqliteOwnershipProcess.RunAsync(args);

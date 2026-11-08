@@ -64,24 +64,28 @@ internal static class CloudItemPathResolver
     }
 
     internal static bool IsPhysicallyContained(string syncRootPath, CloudItemPath path) =>
-        IsSameOrChild(ResolveExistingLinks(syncRootPath), ResolveExistingLinks(path.FullPath));
+        IsSameOrChild(ResolveExistingLinks(syncRootPath).FullPath, ResolveExistingLinks(path.FullPath).FullPath);
 
-    private static string ResolveExistingLinks(string path)
+    private static (string FullPath, bool Exists) ResolveExistingLinks(string path, HashSet<string>? activeLinks = null)
     {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
+        {
+            throw new PlatformNotSupportedException("Physical Cloud Files path validation requires Windows 10 version 1709 or later.");
+        }
         string fullPath = Path.GetFullPath(path);
         string root = Path.GetPathRoot(fullPath)!;
         string current = root;
+        bool exists = true;
         string remainder = fullPath[root.Length..];
         foreach (string segment in remainder.Split(
                      [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
                      StringSplitOptions.RemoveEmptyEntries))
         {
             string next = Path.Combine(current, segment);
-            FileSystemInfo? fileSystemInfo = Directory.Exists(next)
-                ? new DirectoryInfo(next)
-                : File.Exists(next)
-                    ? new FileInfo(next)
-                    : null;
+            // After the first missing component, the remaining suffix is purely lexical.
+            // Probing through that missing ancestor could request cloud directory population.
+            if (!exists) { current = next; continue; }
+            FileSystemInfo? fileSystemInfo = CloudItemInspector.ReadFileSystemLink(next, out exists);
             if (fileSystemInfo is null)
             {
                 current = next;
@@ -90,8 +94,30 @@ internal static class CloudItemPathResolver
 
             try
             {
-                FileSystemInfo? resolved = fileSystemInfo.ResolveLinkTarget(returnFinalTarget: true);
-                current = resolved?.FullName ?? next;
+                activeLinks ??= new(StringComparer.OrdinalIgnoreCase);
+                if (activeLinks.Count >= 64 || !activeLinks.Add(next))
+                {
+                    throw new IOException("The item path contains a cyclic or excessively deep file-system link chain.");
+                }
+                try
+                {
+                    // Resolve one name-surrogate hop, then classify every component again.
+                    // Final-target resolution can follow a genuine link into a Cloud Files
+                    // object and require its provider merely to construct a reference.
+                    FileSystemInfo? resolved = fileSystemInfo.ResolveLinkTarget(returnFinalTarget: false);
+                    // The BCL can strip the NT prefix from a volume-GUID mount target,
+                    // leaving "Volume{...}". FullName then silently roots it at the working
+                    // directory. Validate the original target spelling before trusting it.
+                    if (resolved is not null && !Path.IsPathFullyQualified(resolved.ToString()))
+                    {
+                        throw new IOException("The file-system link target cannot be represented as a fully qualified path.");
+                    }
+                    (current, exists) = resolved is null ? (next, true) : ResolveExistingLinks(resolved.FullName, activeLinks);
+                }
+                finally
+                {
+                    activeLinks.Remove(next);
+                }
             }
             catch (IOException exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
             {
@@ -100,10 +126,11 @@ internal static class CloudItemPathResolver
                 // lexical resolution is not a native mutation guard; callers still bind
                 // existing ancestry and the actual object before namespace mutations.
                 current = next;
+                exists = false;
             }
         }
 
-        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(current));
+        return (Path.TrimEndingDirectorySeparator(Path.GetFullPath(current)), exists);
     }
 
     private static bool IsSameOrChild(string parentPath, string candidatePath)

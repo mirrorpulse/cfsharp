@@ -187,8 +187,63 @@ internal static partial class CloudItemInspector
         };
     }
 
-    internal static unsafe bool IsCloudPlaceholder(string path)
+    internal static bool IsCloudPlaceholder(string path) =>
+        TryReadAttributeTag(path, out FileAttributeTagInfo info, out _) && IsCloudPlaceholder(info);
+
+    // Query the object itself, not a generic final-link target: even an enumeration used
+    // by ResolveLinkTarget can recall Cloud Files metadata when placeholders are exposed.
+    // Only name-surrogate tags understood by the BCL may enter link traversal. Unknown
+    // reparse points must not silently acquire the containment authority of ordinary files.
+    internal static FileSystemInfo? ReadFileSystemLink(string path, out bool exists)
     {
+        exists = true;
+        try
+        {
+            if (!File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint)) { return null; }
+        }
+        catch (IOException exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // Opening a missing name beneath a partial Cloud Files directory may request
+            // population. An attribute query can establish absence without that open.
+            exists = false;
+            return null;
+        }
+        if (!TryReadAttributeTag(path, out FileAttributeTagInfo info, out int error))
+        {
+            if (error is 2 or 3) { exists = false; return null; }
+            string message = $"The reparse attributes of path component '{path}' could not be read (native error 0x{unchecked((uint)error):X8}).";
+            if (error == 5) { throw new UnauthorizedAccessException(message); }
+            throw new IOException(message, error < 0 ? error : unchecked((int)(0x80070000u | (uint)error)));
+        }
+
+        if (((info.FileAttributes & (uint)FileAttributes.ReparsePoint) == 0 && info.ReparseTag == 0) ||
+            IsCloudPlaceholder(info))
+        {
+            return null;
+        }
+
+        // IO_REPARSE_TAG_SYMLINK and IO_REPARSE_TAG_MOUNT_POINT redirect names;
+        // Cloud Files tags describe the object and never supply a substitute pathname.
+        if (info.ReparseTag is not (0xA000000C or 0xA0000003))
+        {
+            throw new CloudPathReparsePointException(path);
+        }
+
+        return (info.FileAttributes & (uint)FileAttributes.Directory) != 0
+            ? new DirectoryInfo(path) : new FileInfo(path);
+    }
+
+    private static bool IsCloudPlaceholder(FileAttributeTagInfo info)
+    {
+        if ((info.FileAttributes & (uint)FileAttributes.ReparsePoint) == 0) { return false; }
+        CfPlaceholderState state = CfApi.CfGetPlaceholderStateFromAttributeTag(info.FileAttributes, info.ReparseTag);
+        return state != CfPlaceholderState.Invalid && state.HasFlag(CfPlaceholderState.Placeholder);
+    }
+
+    private static unsafe bool TryReadAttributeTag(string path, out FileAttributeTagInfo info, out int error)
+    {
+        info = default;
+        error = 0;
         using SafeFileHandle handle = CreateFile(
             path,
             desiredAccess: 0,
@@ -199,25 +254,23 @@ internal static partial class CloudItemInspector
             templateFile: 0);
         if (handle.IsInvalid)
         {
+            error = Marshal.GetLastPInvokeError();
             return false;
         }
 
-        FileAttributeTagInfo attributeTagInfo;
+        FileAttributeTagInfo attributeTagInfo = default;
         if (!GetFileInformationByHandleEx(
                 handle,
                 FileAttributeTagInformationClass,
                 &attributeTagInfo,
-                (uint)sizeof(FileAttributeTagInfo)) ||
-            !((FileAttributes)attributeTagInfo.FileAttributes).HasFlag(FileAttributes.ReparsePoint))
+                (uint)sizeof(FileAttributeTagInfo)))
         {
+            error = Marshal.GetLastPInvokeError();
             return false;
         }
 
-        CfPlaceholderState state = CfApi.CfGetPlaceholderStateFromAttributeTag(
-            attributeTagInfo.FileAttributes,
-            attributeTagInfo.ReparseTag);
-        return state != CfPlaceholderState.Invalid &&
-            state.HasFlag(CfPlaceholderState.Placeholder);
+        info = attributeTagInfo;
+        return true;
     }
 
     private static unsafe PlaceholderInformation ReadPlaceholderInformation(
