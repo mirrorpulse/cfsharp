@@ -20,7 +20,31 @@ permissions:
   contents: read
 
 jobs:
+  # Keep the protected check names as terminal gates. Native tests execute in separate
+  # jobs, but no failed, skipped or cancelled partition may make either gate succeed.
   build-test-pack:
+    if: always()
+    needs: [validate-x64, test-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all x64 and native checks
+        env:
+          VALIDATION_RESULT: ${{ needs.validate-x64.result }}
+          INTEGRATION_RESULT: ${{ needs.test-integration.result }}
+        run: test "$VALIDATION_RESULT" = success && test "$INTEGRATION_RESULT" = success
+
+  test-arm64:
+    if: always()
+    needs: [validate-arm64, test-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all ARM64 and native checks
+        env:
+          VALIDATION_RESULT: ${{ needs.validate-arm64.result }}
+          INTEGRATION_RESULT: ${{ needs.test-integration.result }}
+        run: test "$VALIDATION_RESULT" = success && test "$INTEGRATION_RESULT" = success
+
+  validate-x64:
     runs-on: windows-2022
     timeout-minutes: 45
 
@@ -64,7 +88,7 @@ jobs:
 
       - name: Verify trim and Native AOT boundaries
         shell: pwsh
-        run: ./eng/verify-runtime-boundaries.ps1
+        run: ./eng/verify-runtime-boundaries.ps1 -RuntimeIdentifiers win-x64
 
       - name: Upload runtime boundary evidence
         if: always()
@@ -75,11 +99,7 @@ jobs:
           if-no-files-found: error
 
       - name: Test
-        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership&Category!=AccessJournal" --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
-
-      - name: Verify Delete recovery as a fresh ordinary user
-        shell: pwsh
-        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release
+        run: dotnet test CfSharp.sln --configuration Release --no-build --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&FullyQualifiedName!~CfSharp.IntegrationTests." --logger "trx;LogFileName=test-results.trx" --collect "XPlat Code Coverage"
 
       - name: Pack native bindings
         run: dotnet pack src/CfSharp.Native/CfSharp.Native.csproj --configuration Release --no-build --output artifacts/packages -p:Version=0.0.0-ci.${{ github.run_number }} -p:PackageVersion=0.0.0-ci.${{ github.run_number }}
@@ -119,7 +139,6 @@ jobs:
           path: |
             **/TestResults/**/*.trx
             **/TestResults/**/*.xml
-            artifacts/ordinary-user-delete/**
           if-no-files-found: ignore
 
       - name: Upload packages
@@ -130,7 +149,7 @@ jobs:
             artifacts/packages/*.nupkg
             artifacts/packages/*.snupkg
 
-  test-arm64:
+  validate-arm64:
     runs-on: windows-11-arm
     timeout-minutes: 90
 
@@ -163,22 +182,15 @@ jobs:
       - name: Restore
         run: dotnet restore CfSharp.sln
 
-      - name: Verify formatting
-        run: dotnet format CfSharp.sln --verify-no-changes --no-restore
-
       - name: Build ARM64 solution
         run: dotnet build CfSharp.sln --configuration Release --no-restore --disable-build-servers -m:1
 
       - name: Verify trim and Native AOT boundaries
         shell: pwsh
-        run: ./eng/verify-runtime-boundaries.ps1 -Configuration Release
+        run: ./eng/verify-runtime-boundaries.ps1 -Configuration Release -RuntimeIdentifiers win-arm64
 
       - name: Test ARM64 solution
-        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&Category!=RemoteRecreation&Category!=PhysicalOwnership&Category!=AccessJournal" --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
-
-      - name: Verify Delete recovery as a fresh ordinary ARM64 user
-        shell: pwsh
-        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release
+        run: dotnet test CfSharp.sln --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category!=AbiProbe&Category!=ApiBaseline&Category!=LongSoak&FullyQualifiedName!~CfSharp.IntegrationTests." --logger "trx;LogFileName=arm64-test-results.trx" --blame-hang-timeout 2m
 
       - name: Verify isolated package capabilities on ARM64
         shell: pwsh
@@ -192,7 +204,6 @@ jobs:
           path: |
             **/TestResults/**/*.trx
             artifacts/runtime-boundaries/*/publish.log
-            artifacts/ordinary-user-delete/**
             artifacts/package-capabilities/*/manifest.json
             artifacts/package-capabilities/*/sbom.spdx.json
             artifacts/package-capabilities/*/release-notes.md
@@ -204,10 +215,12 @@ jobs:
             artifacts/package-capabilities/*/packages/*.snupkg
           if-no-files-found: error
 
-  test-recreation:
+  test-integration:
     strategy:
       fail-fast: false
       matrix:
+        architecture: [x64, arm64]
+        partition: [Recovery, Namespace, Content]
         include:
           - architecture: x64
             runner: windows-2022
@@ -233,80 +246,43 @@ jobs:
           $expected = '${{ matrix.architecture }}'
           if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ine $expected -or
               [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -ine $expected) {
-            throw 'The recreation job requires the selected native architecture.'
+            throw 'The integration partition requires the selected native architecture.'
           }
           dotnet --info
 
-      - name: Restore recreation tests
-        run: dotnet restore tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj
+      - name: Restore integration tests
+        run: dotnet restore tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --locked-mode
 
-      - name: Build recreation tests
+      - name: Build integration tests
         run: dotnet build tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-restore --disable-build-servers -m:1
 
-      - name: Test retired-path recreation and recovery
-        run: dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-build --no-restore --disable-build-servers -m:1 --filter "Category=RemoteRecreation" --logger "trx;LogFileName=recreation-test-results.trx" --blame-hang-timeout 2m --collect "XPlat Code Coverage"
-
-      - name: Verify complete recreation coverage
+      - name: Test complete native partition
         shell: pwsh
+        run: ./eng/test-integration-partition.ps1 -Partition '${{ matrix.partition }}' -CollectCoverage:('${{ matrix.architecture }}' -eq 'x64')
+
+      - name: Verify recovery as a fresh ordinary user
+        shell: pwsh
+        env:
+          PARTITION: ${{ matrix.partition }}
         run: |
-          [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/recreation-test-results.trx -Raw
-          $counts = $report.TestRun.ResultSummary.Counters
-          $cases = @($report.TestRun.Results.UnitTestResult)
-          if ([int]$counts.total -ne 81 -or [int]$counts.executed -ne 81 -or [int]$counts.passed -ne 81 -or
-              @($cases.testName | Sort-Object -Unique).Count -ne 81) {
-            throw 'All 81 distinct native recreation cases must execute and pass; skipped/missing/duplicated cases are failures.'
+          $suite = switch ($env:PARTITION) {
+            'Recovery' { 'Delete' }
+            'Namespace' { 'Recreation' }
+            'Content' { 'AccessJournal' }
+            default { throw 'Unexpected integration partition.' }
           }
+          ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite $suite
 
-      - name: Verify recreation as a fresh ordinary user
-        shell: pwsh
-        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite Recreation
-
-      - name: Test Access-only journal classification
-        run: dotnet test tests/CfSharp.IntegrationTests/CfSharp.IntegrationTests.csproj --configuration Release --no-build --no-restore --filter "Category=AccessJournal" --logger "trx;LogFileName=access-journal.trx" --blame-hang-timeout 2m
-
-      - name: Verify complete Access journal coverage
-        shell: pwsh
-        run: |
-          [xml] $report = Get-Content tests/CfSharp.IntegrationTests/TestResults/access-journal.trx -Raw
-          $counts = $report.TestRun.ResultSummary.Counters
-          $cases = @($report.TestRun.Results.UnitTestResult)
-          if ([int]$counts.total -ne 66 -or [int]$counts.executed -ne 66 -or [int]$counts.passed -ne 66 -or
-              @($cases.testName | Sort-Object -Unique).Count -ne 66 -or @($cases | Where-Object outcome -ne 'Passed').Count -ne 0) {
-            throw 'All 66 distinct Access journal cases must execute and pass.'
-          }
-
-      - name: Build SQLite physical ownership tests
-        run: dotnet build tests/CfSharp.Storage.Sqlite.Tests/CfSharp.Storage.Sqlite.Tests.csproj --configuration Release --disable-build-servers -m:1
-
-      - name: Verify Access journal as a fresh ordinary user
-        shell: pwsh
-        run: ./eng/test-ordinary-user-delete.ps1 -Configuration Release -Suite AccessJournal
-
-      - name: Test SQLite physical ownership
-        run: dotnet test tests/CfSharp.Storage.Sqlite.Tests/CfSharp.Storage.Sqlite.Tests.csproj --configuration Release --no-build --no-restore --filter "Category=PhysicalOwnership" --logger "trx;LogFileName=physical-ownership.trx" --blame-hang-timeout 2m
-
-      - name: Verify complete physical ownership coverage
-        shell: pwsh
-        run: |
-          [xml] $report = Get-Content tests/CfSharp.Storage.Sqlite.Tests/TestResults/physical-ownership.trx -Raw
-          $counts = $report.TestRun.ResultSummary.Counters
-          $cases = @($report.TestRun.Results.UnitTestResult)
-          if ([int]$counts.total -ne 29 -or [int]$counts.executed -ne 29 -or [int]$counts.passed -ne 29 -or
-              @($cases.testName | Sort-Object -Unique).Count -ne 29 -or @($cases | Where-Object outcome -ne 'Passed').Count -ne 0) {
-            throw 'All 29 distinct physical ownership cases must execute and pass.'
-          }
-
-      - name: Upload recreation evidence
+      - name: Upload native partition evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: recreation-results-${{ matrix.architecture }}
+          name: integration-${{ matrix.partition }}-${{ matrix.architecture }}
           path: |
             tests/CfSharp.IntegrationTests/TestResults/**/*.trx
             tests/CfSharp.IntegrationTests/TestResults/**/*.xml
-            tests/CfSharp.Storage.Sqlite.Tests/TestResults/**/*.trx
-            artifacts/ordinary-user-recreation/**
-            artifacts/ordinary-user-accessjournal/**
+            artifacts/integration-plan.json
+            artifacts/ordinary-user-*/**
           if-no-files-found: error
 
   native-abi-x64:
@@ -351,7 +327,7 @@ jobs:
           }
 
       - name: Compare managed and native ABI
-        run: dotnet test tests/CfSharp.Native.Tests/CfSharp.Native.Tests.csproj --configuration Release --no-restore --logger "trx;LogFileName=abi-test-results.trx"
+        run: dotnet test tests/CfSharp.Native.Tests/CfSharp.Native.Tests.csproj --configuration Release --no-restore --filter "Category=AbiProbe" --logger "trx;LogFileName=abi-test-results.trx"
         env:
           CFSHARP_ABI_PROBE_JSON: ${{ github.workspace }}\artifacts\abi-probe\x64.json
 

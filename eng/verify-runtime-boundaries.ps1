@@ -1,13 +1,14 @@
 [CmdletBinding()]
 param(
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [ValidateSet('win-x64', 'win-arm64')]
+    [string[]]$RuntimeIdentifiers = @('win-x64', 'win-arm64')
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repoRoot "samples/CfSharp.SampleProvider/CfSharp.SampleProvider.csproj"
 $publishRoot = Join-Path $repoRoot "artifacts/runtime-boundaries"
-$runtimeIdentifiers = @("win-x64", "win-arm64")
 
 if (-not (Test-Path -LiteralPath $project -PathType Leaf))
 {
