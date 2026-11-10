@@ -365,8 +365,11 @@ if (outcome.Status is CloudRemoteDeleteReconciliationStatus.RecordedConflict or
 // Handle typed refusals explicitly; never replace the batch or edit SDK repositories.
 ```
 
-The full unchanged request fingerprint, current ordinal, identity, kind, exact durable path
-and any previous revision must match an official tombstone. A new batch starts only at zero;
+The full unchanged request fingerprint, current ordinal, identity, kind, Windows-equivalent path
+and any previous revision must match an official tombstone. Paths compare case-insensitively
+with normalized separators; the exact request and durable-row spellings remain independently
+retained. Equivalent root-path casing on reopen does not change the durable scope.
+A new batch starts only at zero;
 an existing preview.11 batch can resume at its original partial prefix, including `3/5`.
 The SDK never accepts caller-authored success evidence. Existing original native Delete, Move
 or creation preparations take precedence and remain intact for their own recovery protocol.

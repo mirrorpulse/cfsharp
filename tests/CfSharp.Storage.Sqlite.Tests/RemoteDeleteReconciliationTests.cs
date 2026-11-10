@@ -6,6 +6,30 @@ namespace CfSharp.Storage.Sqlite.Tests;
 public sealed class RemoteDeleteReconciliationTests
 {
     [Theory]
+    [InlineData("retired", "retired", true)]
+    [InlineData("retired", "RETIRED", false)]
+    [InlineData("docs/retired", "DOCS\\RETIRED", false)]
+    public async Task EquivalentWindowsPathsRetainOriginalRequestAndDurableSpellings(string durablePath, string requestedPath, bool uppercaseRoot)
+    {
+        await using Fixture fixture = await Fixture.OpenAsync(false, durablePath);
+        CloudRemoteChange change = new("delete", CloudRemoteChangeKind.Delete, "remote", "v2", CloudItemKind.File,
+            requestedPath, fixture.Item.ItemId, previousRemoteRevision: "v1");
+        CloudRemoteChangeBatch batch = new("original", new byte[] { 1 }, [change], new byte[] { 9 });
+        CloudRemoteDeleteReconciliationResult result = await fixture.System.ReconcileRemoteDeleteAsync(batch, 0);
+        AssertRecorded(result, 1, new byte[] { 9 });
+        Assert.Equal(change.RelativePath, result.Entry!.Conflict!.Change.RelativePath);
+        Assert.Equal(durablePath, result.Entry.Conflict.LocalState!.RelativePath);
+        await fixture.RestartAsync(uppercaseRoot ? fixture.System.SyncRootPath.ToUpperInvariant() : null);
+        CloudRemoteDeleteReconciliationResult lookup = await fixture.System.GetRemoteDeleteReconciliationAsync(batch, 0);
+        Assert.Equal(CloudRemoteDeleteReconciliationStatus.AlreadyRecorded, lookup.Status);
+        Assert.Equal(result.ConflictId, lookup.ConflictId);
+        Assert.Equal(durablePath, lookup.Entry!.Conflict!.LocalState!.RelativePath);
+        Assert.Equal(change.RelativePath, lookup.Entry.Conflict.Change.RelativePath);
+        Assert.Equal(result.ConflictId, (await fixture.System.ReconcileRemoteDeleteAsync(batch, 0)).ConflictId);
+        await fixture.AssertOriginalsAsync();
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task Preview11PartialBatchRetainsItsOriginalConflictAcrossOwnersAndDismissal(bool directory)
@@ -318,7 +342,7 @@ public sealed class RemoteDeleteReconciliationTests
             return new("original", new byte[] { 1 }, mixed ? [Missing(0), Missing(1), Missing(2), target,
                 new("last", CloudRemoteChangeKind.Delete, "last", "v1", CloudItemKind.File, "last")] : [target], new byte[] { 9 });
         }
-        internal static async Task<Fixture> OpenAsync(bool directory)
+        internal static async Task<Fixture> OpenAsync(bool directory, string relativePath = "retired")
         {
             string area = Path.Combine(Path.GetTempPath(), "CfSharp-delete-reconciliation", Guid.NewGuid().ToString("N"));
             string root = Path.Combine(area, "root");
@@ -326,7 +350,7 @@ public sealed class RemoteDeleteReconciliationTests
             Factory factory = new(new SqliteCloudStateStoreFactory(Path.Combine(area, "state.db")));
             CloudFileSystem system = Create(root, factory);
             await system.StartAsync();
-            CloudItemState item = new(Guid.NewGuid(), "remote", "retired", directory ? CloudItemKind.Directory : CloudItemKind.File,
+            CloudItemState item = new(Guid.NewGuid(), "remote", relativePath, directory ? CloudItemKind.Directory : CloudItemKind.File,
                 "v1", 123, true, DateTimeOffset.UtcNow);
             await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync();
             await transaction.Items.UpsertAsync(item);
@@ -338,9 +362,9 @@ public sealed class RemoteDeleteReconciliationTests
             await transaction.CommitAsync();
             return new(area, system, factory, item, originals);
         }
-        internal async Task RestartAsync()
+        internal async Task RestartAsync(string? rootPath = null)
         {
-            string root = System.SyncRootPath;
+            string root = rootPath ?? System.SyncRootPath;
             await System.DisposeAsync();
             System = Create(root, factory);
             await System.StartAsync();

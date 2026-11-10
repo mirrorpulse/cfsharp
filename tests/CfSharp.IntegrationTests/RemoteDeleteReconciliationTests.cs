@@ -22,7 +22,7 @@ public sealed partial class RemoteDeleteRecoveryTests
             Assert.Equal(Environment.GetEnvironmentVariable("CFSHARP_EXPECTED_TEST_ARCHITECTURE"), architecture, ignoreCase: true);
         }
 
-        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, deferCreation: true);
+        await using DeleteRoot root = await DeleteRoot.OpenAsync(directory, alternateCasing: acknowledged, deferCreation: true);
         IReadOnlyList<CloudOperationJournalEntry> operations;
         CloudItemState tombstone;
         Guid originalDelete;
@@ -43,7 +43,7 @@ public sealed partial class RemoteDeleteRecoveryTests
             else { await root.FileSystem.GetFile(root.Target).DeleteAsync(); }
             Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)) || Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
             CloudLocalChange observed = await WaitForReconciliationChangeAsync(feed,
-                change => change.Kind == CloudLocalChangeKind.Delete && change.RelativePath == root.Target);
+                change => change.Kind == CloudLocalChangeKind.Delete && string.Equals(change.RelativePath, root.Target, StringComparison.OrdinalIgnoreCase));
             originalDelete = observed.OperationId;
             Assert.Equal(directory, observed.IsDirectory);
             if (acknowledged)
@@ -67,6 +67,12 @@ public sealed partial class RemoteDeleteRecoveryTests
             tombstone = (await capture.Items.GetByItemIdAsync(root.ItemId))!;
             Assert.True(tombstone.IsTombstone);
             Assert.Equal("v1", tombstone.RemoteRevision);
+            if (acknowledged)
+            {
+                Assert.StartsWith("Docs\\", tombstone.RelativePath, StringComparison.Ordinal);
+                Assert.NotEqual(root.Target, tombstone.RelativePath);
+            }
+            _output.WriteLine($"Original path spellings: request={root.Target}; tombstone={tombstone.RelativePath}.");
             Assert.Empty(await capture.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix));
         }
         await root.RestartAsync();

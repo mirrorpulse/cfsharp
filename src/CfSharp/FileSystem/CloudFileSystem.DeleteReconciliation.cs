@@ -22,6 +22,8 @@ public sealed partial class CloudFileSystem
     /// resolver/provider, and performs no enumeration, hydration, native mutation, or local ACK.
     /// It requires an exact matching official tombstone and refuses original pending native
     /// recovery. A tombstone authorizes only rejection, never a successful native completion.
+    /// Path comparison follows Windows case-insensitive, separator-normalized semantics;
+    /// the request and tombstone retain their independent original spellings in the outcome.
     /// The conflict, versioned receipt, and exactly one entry of progress commit atomically.
     /// Existing preview.11 progress, including a partially applied batch, needs no new native
     /// receipt or SQL migration. Resubmit the original preserving options; preview.11 did not
@@ -155,7 +157,8 @@ public sealed partial class CloudFileSystem
 
     private static bool MatchesReconciliationTombstone(CloudRemoteChange change, CloudItemState? item) =>
         item is { IsTombstone: true } && item.RemoteId == change.RemoteId && item.Kind == change.ItemKind &&
-        (!change.ItemId.HasValue || item.ItemId == change.ItemId) && item.RelativePath == change.RelativePath &&
+        (!change.ItemId.HasValue || item.ItemId == change.ItemId) &&
+        CloudDirectoryStateProjection.SamePath(item.RelativePath, change.RelativePath) &&
         (change.PreviousRemoteRevision is null || item.RemoteRevision == change.PreviousRemoteRevision);
 
     private static ReadOnlyMemory<byte> ReconciliationCursor(CloudRemoteChangeBatch batch, int prefix)
@@ -192,7 +195,7 @@ public sealed partial class CloudFileSystem
         {
             return new(CloudRemoteDeleteReconciliationStatus.BatchMismatch, index);
         }
-        if (receipt.RootPath != SyncRootPath || receipt.StoreScope !=
+        if (!CloudDirectoryStateProjection.SamePath(receipt.RootPath, SyncRootPath) || receipt.StoreScope !=
             await CloudDirectoryMoveEvidence.GetScopeAsync(transaction, false, cancellationToken).ConfigureAwait(false))
         {
             return new(CloudRemoteDeleteReconciliationStatus.ScopeMismatch, index);

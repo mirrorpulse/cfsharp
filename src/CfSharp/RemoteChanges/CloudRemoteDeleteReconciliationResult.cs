@@ -16,9 +16,9 @@ public enum CloudRemoteDeleteReconciliationStatus
     BatchMismatch = 4,
     /// <summary>The policy is destructive, supplies a resolver, or differs from this entry's retained policy.</summary>
     PolicyMismatch = 5,
-    /// <summary>The receipt belongs to a different durable store scope or normalized root path.</summary>
+    /// <summary>The receipt belongs to a different durable store scope or Windows root path.</summary>
     ScopeMismatch = 6,
-    /// <summary>No exact matching official tombstone exists, including identity, kind, path, and previous revision.</summary>
+    /// <summary>No matching official tombstone exists, including exact identity/kind/revision and Windows-equivalent path.</summary>
     NotApplicable = 7,
     /// <summary>Original native recovery evidence exists; ordinary remote replay must handle it.</summary>
     PendingNativeRecovery = 8,
