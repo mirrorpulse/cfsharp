@@ -46,6 +46,9 @@ public enum CloudRemoteConflictReason
 
     /// <summary>The remote identity cannot be resolved to a required local item.</summary>
     MissingItem = 6,
+
+    /// <summary>An original remote Delete was explicitly rejected against a matching local tombstone; native completion is unproven.</summary>
+    LocalDeleteReconciliationRequired = 7,
 }
 
 /// <summary>Chooses how an application resolves a durable remote/local conflict.</summary>

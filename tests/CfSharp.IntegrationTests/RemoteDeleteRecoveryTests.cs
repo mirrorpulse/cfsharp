@@ -1205,6 +1205,7 @@ public sealed partial class RemoteDeleteRecoveryTests
     private sealed class DeleteRoot(string area, CloudFileSystem fileSystem, DeleteFactory factory,
         RejectingProvider provider, CloudPlaceholderIdentity identity, CloudRemoteChangeBatch batch, string target) : IAsyncDisposable
     {
+        private bool _registered = true;
         internal CloudFileSystem FileSystem => fileSystem;
         internal string Path => fileSystem.SyncRootPath;
         internal string Database => System.IO.Path.Combine(area, "state.db");
@@ -1218,16 +1219,25 @@ public sealed partial class RemoteDeleteRecoveryTests
         internal Task<CloudRemoteApplyResult> ApplyAuthorizedAsync() => fileSystem.ApplyRemoteChangesAsync(batch, DestructiveOptions).AsTask();
         internal Task<CloudRemoteApplyResult> ApplyProtectedAsync() => fileSystem.ApplyRemoteChangesAsync(batch).AsTask();
 
-        internal async Task RestartAsync()
+        internal async Task RestartAsync(bool connectProvider = true)
         {
             string root = Path;
             await fileSystem.DisposeAsync();
-            fileSystem = CloudFileSystem.CreateBuilder(root).WithStateStore(factory).WithContentProvider(provider).Build();
+            CloudFileSystem.Builder builder = CloudFileSystem.CreateBuilder(root).WithStateStore(factory);
+            if (connectProvider) { builder.WithContentProvider(provider); }
+            fileSystem = builder.Build();
             await fileSystem.StartAsync();
         }
 
+        internal void Unregister()
+        {
+            CloudSyncRoot.Open(Path).Unregister();
+            _registered = false;
+        }
+
         internal static async Task<DeleteRoot> OpenAsync(bool directory, bool equalRevisions = false, bool omitPrevious = false,
-            bool children = false, bool preserveInSync = true, bool hydrated = false, bool alternateCasing = false)
+            bool children = false, bool preserveInSync = true, bool hydrated = false, bool alternateCasing = false,
+            bool deferCreation = false)
         {
             string area = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "CfSharp-remote-delete", Guid.NewGuid().ToString("N"));
             string root = System.IO.Path.Combine(area, "root");
@@ -1248,7 +1258,11 @@ public sealed partial class RemoteDeleteRecoveryTests
                 CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "remote-file", "v1");
                 string parent = alternateCasing ? "docs" : "Docs";
                 string target = parent + (directory ? "\\remote" : "\\remote.bin");
-                if (directory)
+                if (deferCreation)
+                {
+                    // The reconciliation controls start their real feed before the remote birth.
+                }
+                else if (directory)
                 {
                     await fileSystem.GetDirectory(parent).CreatePlaceholderAsync(
                         CloudDirectoryPlaceholderSpec.CreateBuilder("remote", identity).WithInSyncState(true)
@@ -1298,7 +1312,7 @@ public sealed partial class RemoteDeleteRecoveryTests
         public async ValueTask DisposeAsync()
         {
             await fileSystem.DisposeAsync();
-            CloudSyncRoot.Open(Path).Unregister();
+            if (_registered) { CloudSyncRoot.Open(Path).Unregister(); }
             Directory.Delete(area, recursive: true);
         }
     }

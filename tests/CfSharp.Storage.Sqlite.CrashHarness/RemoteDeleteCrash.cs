@@ -16,8 +16,15 @@ internal static class RemoteDeleteCrash
         await system.StartAsync();
         CloudRemoteChange change = new("delete", CloudRemoteChangeKind.Delete, "remote-file", "v2",
             directory ? CloudItemKind.Directory : CloudItemKind.File, target, Guid.Parse(itemId), previousRemoteRevision: "v1");
-        await system.ApplyRemoteChangesAsync(new("stable-original-batch", new byte[] { 1 }, [change], new byte[] { 9 }),
-            new() { PreserveUnsynchronizedLocalContent = false });
+        CloudRemoteChangeBatch batch = new("stable-original-batch", new byte[] { 1 }, [change], new byte[] { 9 });
+        if (mode.StartsWith("delete-reconciliation-", StringComparison.Ordinal))
+        {
+            await system.ReconcileRemoteDeleteAsync(batch, 0);
+        }
+        else
+        {
+            await system.ApplyRemoteChangesAsync(batch, new() { PreserveUnsynchronizedLocalContent = false });
+        }
         return 3; // Reaching this point means the selected kill boundary was not observed.
     }
 
@@ -59,6 +66,13 @@ internal static class RemoteDeleteCrash
             public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
             {
                 CloudRemoteBatchState? batch = await RemoteBatches.GetAsync("stable-original-batch", cancellationToken);
+                if (owner.Mode.StartsWith("delete-reconciliation-", StringComparison.Ordinal))
+                {
+                    if (batch?.AppliedEntryCount == 1 && owner.Mode.EndsWith("-before", StringComparison.Ordinal)) { owner.WaitForKill(); }
+                    await inner.CommitAsync(cancellationToken);
+                    if (batch?.AppliedEntryCount == 1 && owner.Mode.EndsWith("-after", StringComparison.Ordinal)) { owner.WaitForKill(); }
+                    return;
+                }
                 CloudItemState? item = await Items.GetByRelativePathAsync(owner.Target, cancellationToken);
                 bool prepared = (await Checkpoints.ListAsync("cfsharp/remote-delete/v1/", cancellationToken)).Count != 0;
                 bool absent = !File.Exists(Path.Combine(owner.Root, owner.Target)) && !Directory.Exists(Path.Combine(owner.Root, owner.Target));
