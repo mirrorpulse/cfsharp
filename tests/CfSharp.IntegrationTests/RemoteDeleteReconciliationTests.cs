@@ -26,6 +26,7 @@ public sealed partial class RemoteDeleteRecoveryTests
         IReadOnlyList<CloudOperationJournalEntry> operations;
         CloudItemState tombstone;
         Guid originalDelete;
+        string backendObject = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(root.Path)!, "backend-object");
         await using (CloudLocalChangeFeed feed = root.FileSystem.CreateLocalChangeFeed())
         {
             await feed.StartAsync();
@@ -35,7 +36,9 @@ public sealed partial class RemoteDeleteRecoveryTests
                 metadata: directory ? CloudPlaceholderMetadata.CreateDirectoryBuilder().Build() : CloudPlaceholderMetadata.CreateFileBuilder().Build());
             CloudRemoteApplyResult birth = await root.FileSystem.ApplyRemoteChangesAsync(new("birth", Array.Empty<byte>(), [create], new byte[] { 1 }));
             Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(birth.Entries).Status);
-            HashSet<string> disposableBackend = [root.Identity.RemoteId];
+            if (directory) { Directory.CreateDirectory(backendObject); }
+            else { await File.WriteAllBytesAsync(backendObject, new byte[512]); }
+            Assert.True(directory ? Directory.Exists(backendObject) : File.Exists(backendObject));
             if (directory) { await root.FileSystem.GetDirectory(root.Target).DeleteAsync(); }
             else { await root.FileSystem.GetFile(root.Target).DeleteAsync(); }
             Assert.False(File.Exists(System.IO.Path.Combine(root.Path, root.Target)) || Directory.Exists(System.IO.Path.Combine(root.Path, root.Target)));
@@ -45,10 +48,13 @@ public sealed partial class RemoteDeleteRecoveryTests
             Assert.Equal(directory, observed.IsDirectory);
             if (acknowledged)
             {
-                Assert.True(disposableBackend.Remove(root.Identity.RemoteId));
+                if (directory) { Directory.Delete(backendObject); }
+                else { File.Delete(backendObject); }
+                Assert.False(File.Exists(backendObject) || Directory.Exists(backendObject));
                 await feed.AcknowledgeAsync([originalDelete]);
             }
-            Assert.Equal(!acknowledged, disposableBackend.Contains(root.Identity.RemoteId));
+            Assert.Equal(!acknowledged, directory ? Directory.Exists(backendObject) : File.Exists(backendObject));
+            _output.WriteLine($"Disposable filesystem backend: directory={directory}; deletionObservedBeforeAck={acknowledged}.");
             await File.WriteAllTextAsync(System.IO.Path.Combine(root.Path, "unrelated.txt"), "unrelated later local work");
             await WaitForReconciliationChangeAsync(feed,
                 change => change.Kind == CloudLocalChangeKind.Create && change.RelativePath == "unrelated.txt");
@@ -115,6 +121,7 @@ public sealed partial class RemoteDeleteRecoveryTests
         Assert.Equal(1, progress.AppliedEntryCount);
         Assert.Equal(new byte[] { 2 }, progress.Cursor.ToArray());
         Assert.Single(await verify.Conflicts.ListAsync());
+        Assert.Equal(!acknowledged, directory ? Directory.Exists(backendObject) : File.Exists(backendObject));
         Assert.Equal(0, root.Provider.Reads);
         _output.WriteLine($"Original batch={batch.BatchId}; fingerprint={Convert.ToHexString(batch.Fingerprint.Span)}; localDelete={originalDelete}; retainedOperations={operations.Count}; conflict={result.ConflictId}; prefix={progress.AppliedEntryCount}/{progress.TotalEntryCount}; cursor={Convert.ToHexString(progress.Cursor.Span)}; hydrationReads={root.Provider.Reads}.");
     }
