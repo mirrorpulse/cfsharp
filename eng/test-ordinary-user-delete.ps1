@@ -2,7 +2,7 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
-    [ValidateSet('Delete', 'Recreation', 'AccessJournal', 'OfflineReference')]
+    [ValidateSet('Delete', 'Recreation', 'AccessJournal', 'OfflineReference', 'DeleteReconciliation')]
     [string] $Suite = 'Delete'
 )
 
@@ -27,8 +27,9 @@ $suiteName = $Suite.ToLowerInvariant()
 $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen' }
     elseif ($Suite -eq 'AccessJournal') { 'FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit' }
     elseif ($Suite -eq 'OfflineReference') { 'FullyQualifiedName~OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess' }
+    elseif ($Suite -eq 'DeleteReconciliation') { 'FullyQualifiedName~LocalDeleteReconciliationRetainsAnOriginalConflictWithoutNativeWork' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
-$expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'AccessJournal') { 4 } else { 2 }
+$expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -in @('AccessJournal', 'DeleteReconciliation')) { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null
@@ -133,6 +134,17 @@ exit $LASTEXITCODE
         foreach ($mode in @('False', 'True')) {
             if (@($cases | Where-Object { $_.testName -match "OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess\(exposeBeforeReference: $mode\)" -and $_.outcome -eq 'Passed' }).Count -ne 1) {
                 throw 'Both default and exposed-mode offline reference cases must pass exactly once.'
+            }
+        }
+    }
+    if ($Suite -eq 'DeleteReconciliation') {
+        $cases = @($report.TestRun.Results.UnitTestResult)
+        foreach ($directory in @('False', 'True')) {
+            foreach ($acknowledged in @('False', 'True')) {
+                $case = "LocalDeleteReconciliationRetainsAnOriginalConflictWithoutNativeWork\(directory: $directory, acknowledged: $acknowledged\)"
+                if (@($cases | Where-Object { $_.testName -match $case -and $_.outcome -eq 'Passed' }).Count -ne 1) {
+                    throw 'Each file/directory and pending/acknowledged Delete reconciliation case must pass exactly once.'
+                }
             }
         }
     }

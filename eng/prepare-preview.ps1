@@ -560,6 +560,13 @@ $publicationNote
 
 $packageLines
 
+## Remote Delete reconciliation
+
+- ReconcileRemoteDeleteAsync can explicitly retain an original tombstone Delete as a durable conflict without native work.
+- GetRemoteDeleteReconciliationAsync restores the stable original result after restart, lost returns, or conflict dismissal.
+- Existing preview.11 partial batches retain their original fingerprint, ordinal, local operations and safe-cursor semantics; the strict default is unchanged.
+- This result certifies rejection, not native deletion or backend acceptance. See docs/remote-change-application.md.
+
 ## Verification
 
 - Package metadata requires MirrorPulse Team attribution and Apache-2.0 licensing.
@@ -581,6 +588,7 @@ $publicationChecks
 | x86 | Not supported |
 | Native component | CfSharp.Native exposes the complete Cloud Files ABI surface |
 | Durable state | CfSharp.Storage.Sqlite requires a caller-supplied database path outside the managed sync root |
+| Local tombstone Delete | Explicit metadata-only conflict reconciliation; strict default recovery and original local journals retained |
 | Protected local operations | Short same-object callbacks, local conversion and Access-only descriptors; files require native access and alias protection; directories provide metadata only |
 
 $(if ($isPreview) {

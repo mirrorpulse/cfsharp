@@ -23,8 +23,7 @@ public sealed partial class CloudFileSystem
             throw new ArgumentException("The conflict identifier cannot be empty.", nameof(conflictId));
         }
 
-        using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
-            [CloudItemOperationScope.Subtree(SyncRootPath)], cancellationToken).ConfigureAwait(false);
+        using CloudFileSystemOperationLease operation = await AcquireStateOperationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await operation.StateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         CloudConflictState? state = await transaction.Conflicts.GetAsync(conflictId, cancellationToken)
@@ -50,8 +49,7 @@ public sealed partial class CloudFileSystem
     public async ValueTask<IReadOnlyList<CloudRemoteConflictRecord>> ListRemoteConflictsAsync(
         CancellationToken cancellationToken = default)
     {
-        using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
-            [CloudItemOperationScope.Subtree(SyncRootPath)], cancellationToken).ConfigureAwait(false);
+        using CloudFileSystemOperationLease operation = await AcquireStateOperationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await operation.StateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudConflictState> states = await transaction.Conflicts.ListAsync(cancellationToken)

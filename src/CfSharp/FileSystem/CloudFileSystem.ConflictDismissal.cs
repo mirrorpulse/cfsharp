@@ -33,8 +33,7 @@ public sealed partial class CloudFileSystem
         await _remoteApplyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
-                [CloudItemOperationScope.Subtree(SyncRootPath)], cancellationToken).ConfigureAwait(false);
+            using CloudFileSystemOperationLease operation = await AcquireStateOperationAsync(cancellationToken).ConfigureAwait(false);
             await using ICloudStateTransaction transaction = await operation.StateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             string receiptName = ConflictDismissalPrefix + "/" + conflictId.ToString("N");

@@ -124,3 +124,16 @@ lookup contracts through the existing public repositories. They must also fence 
 from the new creation receipts and preserve processed-conflict receipts. No private SDK table
 editing or provider generation codec is required. See the remote-change guide for already affected
 preview.7 states and legacy preparations, which require explicit reconciliation.
+
+### Original tombstone Delete rejection
+
+The explicit `ReconcileRemoteDeleteAsync` protocol uses existing schema-9 checkpoint, conflict
+and remote-batch repositories in one official transaction. It needs no SQL migration and does
+not rewrite preview.11 tombstones, local journals or existing partial batch fingerprints.
+Its versioned receipt is a durable rejection, not native completion evidence. A before-commit
+failure/termination retains the original prefix; an after-commit lost return can recover the
+same conflict ID through `GetRemoteDeleteReconciliationAsync`. Corrupt or foreign evidence
+is refused, never reconstructed from an absent path. Custom transactional stores must provide
+the same atomicity and root isolation. Use matching core/SQLite versions for all owners; old
+binaries cannot interpret this new conflict reason. See the remote-change guide for the public
+integration flow, typed results, budgets and non-destructive dismissal.

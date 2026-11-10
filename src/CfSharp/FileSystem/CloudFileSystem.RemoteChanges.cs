@@ -247,6 +247,8 @@ public sealed partial class CloudFileSystem
     /// transaction checks still apply, but user-mode deletion does not exclude concurrent
     /// external attribute writes. The conflict is removed only after validated completion.
     /// Calls serialize on this file-system instance; no ownership of caller resources changes.
+    /// LocalDeleteReconciliationRequired conflicts always remain Conflict for every decision:
+    /// they authorize metadata rejection only. Explicit dismissal is the non-destructive close.
     /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
@@ -287,6 +289,12 @@ public sealed partial class CloudFileSystem
         ArgumentNullException.ThrowIfNull(resolution);
         (CloudRemoteConflict conflict, CloudConflictState durableState) =
             await ReadRemoteConflictAsync(conflictId, cancellationToken).ConfigureAwait(false);
+        if (conflict.Reason == CloudRemoteConflictReason.LocalDeleteReconciliationRequired)
+        {
+            // This receipt authorizes rejection only. A later occupant must never inherit
+            // destructive authority through a delayed KeepRemote or KeepBoth decision.
+            return new(conflict.Change.ChangeId, CloudRemoteApplyEntryStatus.Conflict, conflict);
+        }
         if (resolution.Decision is CloudRemoteConflictDecision.Defer or
             CloudRemoteConflictDecision.KeepLocal)
         {
@@ -390,28 +398,7 @@ public sealed partial class CloudFileSystem
                     $"Remote batch '{batch.BatchId}' has invalid durable progress.");
             }
 
-            // preview.7 could acknowledge an explicit successor while projecting its remote
-            // metadata onto a predecessor ID. An accepted fingerprint cannot repair that
-            // ambiguity. Fence incompatible historical success without rewriting any evidence.
-            for (int completedIndex = 0; completedIndex < existing.AppliedEntryCount; completedIndex++)
-            {
-                CloudRemoteChange completed = batch.Changes[completedIndex];
-                if (completed.ItemId is Guid requestedId &&
-                    completed.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
-                {
-                    CloudStateCheckpoint? conflictReceipt = await transaction.Checkpoints.GetAsync(
-                        RemoteCreationIntent.IdentityConflictName(batch.BatchId, completedIndex), cancellationToken).ConfigureAwait(false);
-                    if (conflictReceipt is not null && conflictReceipt.Value.Span.SequenceEqual(batch.Fingerprint.Span))
-                    {
-                        continue;
-                    }
-                    CloudItemState? projected = await transaction.Items.GetByRemoteIdAsync(completed.RemoteId, cancellationToken).ConfigureAwait(false);
-                    if (projected is not null && projected.ItemId != requestedId)
-                    {
-                        throw new InvalidDataException("The accepted remote prefix has an incompatible explicit item identity; retain the original batch and reconcile native and durable ownership before resuming.");
-                    }
-                }
-            }
+            await ValidateAcceptedRemoteIdentitiesAsync(transaction, batch, existing.AppliedEntryCount, cancellationToken).ConfigureAwait(false);
 
             if (existing.AppliedEntryCount < batch.Changes.Count &&
                 batch.Changes[existing.AppliedEntryCount] is { Kind: CloudRemoteChangeKind.Move, ItemKind: CloudItemKind.File })
@@ -491,6 +478,34 @@ public sealed partial class CloudFileSystem
         await transaction.RemoteBatches.UpsertAsync(initial, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return initial;
+    }
+
+    private static async ValueTask ValidateAcceptedRemoteIdentitiesAsync(ICloudStateTransaction transaction,
+        CloudRemoteChangeBatch batch, int appliedEntryCount, CancellationToken cancellationToken)
+    {
+        // preview.7 could acknowledge an explicit successor while projecting its remote
+        // metadata onto a predecessor ID. An accepted fingerprint cannot repair that
+        // ambiguity. Fence incompatible historical success without rewriting any evidence.
+        for (int completedIndex = 0; completedIndex < appliedEntryCount; completedIndex++)
+        {
+            CloudRemoteChange completed = batch.Changes[completedIndex];
+            if (completed.ItemId is Guid requestedId &&
+                completed.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert)
+            {
+                CloudStateCheckpoint? conflictReceipt = await transaction.Checkpoints.GetAsync(
+                    RemoteCreationIntent.IdentityConflictName(batch.BatchId, completedIndex), cancellationToken).ConfigureAwait(false);
+                if (conflictReceipt is not null && conflictReceipt.Value.Span.SequenceEqual(batch.Fingerprint.Span))
+                {
+                    continue;
+                }
+                CloudItemState? projected = await transaction.Items.GetByRemoteIdAsync(completed.RemoteId, cancellationToken).ConfigureAwait(false);
+                if (projected is not null && projected.ItemId != requestedId)
+                {
+                    throw new InvalidDataException("The accepted remote prefix has an incompatible explicit item identity; retain the original batch and reconcile native and durable ownership before resuming.");
+                }
+            }
+        }
+
     }
 
     private async ValueTask<RemoteEntryOutcome> ApplyRemoteEntryAsync(
@@ -1404,7 +1419,7 @@ public sealed partial class CloudFileSystem
         {
             CloudRemoteConflictReason.Content => CloudStateConflictKind.Content,
             CloudRemoteConflictReason.Move => CloudStateConflictKind.Move,
-            CloudRemoteConflictReason.Delete => CloudStateConflictKind.Delete,
+            CloudRemoteConflictReason.Delete or CloudRemoteConflictReason.LocalDeleteReconciliationRequired => CloudStateConflictKind.Delete,
             _ => CloudStateConflictKind.Metadata,
         };
 

@@ -329,6 +329,97 @@ evidence. The account-creation harness runs only on disposable GitHub Actions ru
 
 
 
+## Reconciling an original Delete after a local deletion
+
+An official tombstone is not proof that an original **remote** Delete performed a native
+deletion. A prior local `DeleteAsync`, including one whose exact journal operation was already
+acknowledged, can therefore leave ordinary remote replay retryable with
+`CloudRemoteDeleteRecoveryException`. This is an SDK provenance failure, not a claimed Win32
+failure. The strict default remains unchanged.
+
+An application can explicitly reject that exact original entry as a retained conflict using
+`ReconcileRemoteDeleteAsync`. This is the minimum non-destructive recovery path: it records
+`LocalDeleteReconciliationRequired`, never successful native deletion. It does not verify
+application/backend acceptance or offer a stronger local-deletion witness. Pending and already
+acknowledged local Deletes are both eligible for **rejection only**.
+
+```csharp
+// Keep the received batch, actual zero-based ordinal and original preserving options.
+CloudRemoteDeleteReconciliationResult outcome =
+    await fileSystem.GetRemoteDeleteReconciliationAsync(originalBatch, ordinal, cancellationToken);
+if (outcome.Status == CloudRemoteDeleteReconciliationStatus.NotFound)
+{
+    outcome = await fileSystem.ReconcileRemoteDeleteAsync(
+        originalBatch, ordinal, originalPreservingOptions, cancellationToken);
+}
+
+if (outcome.Status is CloudRemoteDeleteReconciliationStatus.RecordedConflict or
+    CloudRemoteDeleteReconciliationStatus.AlreadyRecorded)
+{
+    // Entry.Status is Conflict; NativeMutationAttempted is false. Persist this SDK outcome
+    // in the application's own recovery state before deciding its separate product cursor.
+    // The stable ConflictId and detailed original result survive a lost return and restart.
+    // Only after the application's independent source-effect/ownership proof, it may call:
+    // await fileSystem.DismissRemoteConflictAsync(outcome.ConflictId.Value, cancellationToken);
+}
+// Handle typed refusals explicitly; never replace the batch or edit SDK repositories.
+```
+
+The full unchanged request fingerprint, current ordinal, identity, kind, exact durable path
+and any previous revision must match an official tombstone. A new batch starts only at zero;
+an existing preview.11 batch can resume at its original partial prefix, including `3/5`.
+The SDK never accepts caller-authored success evidence. Existing original native Delete, Move
+or creation preparations take precedence and remain intact for their own recovery protocol.
+Only preserving options without an application resolver are accepted. Preview.11 did not store
+all policy fields for unprepared entries; resubmit the original options. The new receipt binds
+subsequent reconciliation calls to those options and never authorizes destructive work.
+
+The conflict, versioned result receipt and **one** ordinal of progress commit together through
+the selected transactional store. No later entry runs in this call. Per-entry cursors and the
+terminal fallback cursor follow ordinary processed-conflict semantics. An Applied batch containing
+this Conflict does not claim an Applied native Delete. Ordinary replay may subsequently return
+AlreadyApplied; `GetRemoteDeleteReconciliationAsync` recovers the original conflict and its
+commit-time prefix/cursor, even after later entries commit or the conflict is dismissed.
+
+Recording, lookup, conflict queries and explicit dismissal use state-only lifecycle admission.
+They acquire no native namespace handles, enumerate no backend, invoke no provider/resolver,
+hydrate no content, and acknowledge no local operation. They preserve tombstones, journal IDs,
+sequences, payloads, attempts and later objects, including foreign occupants at the retired path.
+KeepRemote and KeepBoth cannot execute this rejection; every resolution decision retains Conflict.
+Explicit dismissal closes it without asserting physical retirement or accepted source effects.
+The owner must be started with the same valid root/store context, but these metadata operations
+need no prior application namespace role token or namespace re-audit. A disconnected owner without
+a content provider can perform them while application work is disabled, even if registration is
+subsequently removed after startup.
+They do not bypass normal owner startup/root/store validation or enable ordinary namespace work.
+
+| Result or exception | Meaning |
+| --- | --- |
+| RecordedConflict / AlreadyRecorded | Newly committed or stable previous rejection; inspect Entry, ConflictId and commit-time progress |
+| NotFound | Lookup found no receipt; no claim about native work or other batches |
+| EntryNotCurrent / BatchMismatch | Wrong next ordinal or incompatible original immutable request |
+| PolicyMismatch / ScopeMismatch | Incompatible preserving policy or foreign receipt root/store scope |
+| NotApplicable | No exact matching tombstone; a missing path, moved/live item or new generation is insufficient |
+| PendingNativeRecovery | Original preparation exists; retain it and use its normal replay/recovery |
+| Busy | Another remote operation owns this instance's gate; retry the same request |
+| OperationCanceledException | Cancellation before commit; lookup after an ambiguous commit/result gap |
+| InvalidDataException | Corrupt or inconsistent durable receipt, conflict or prefix; do not fabricate repair |
+| NotSupportedException | Custom store lacks a required operation, or metadata exceeds the supported encoding budget |
+
+Receipt metadata is bounded to one MiB, including its cursor and all fields; each text field is
+limited to 32768 UTF-8 bytes. Budget failure rolls back the whole transaction. Storage errors
+propagate and may leave an ambiguous commit: recover using the original request, never a new
+identity. Receipts have no automatic expiry. Use one active owner per root/store and matching
+core/SQLite package versions. Existing preview.11 schema-9 data needs no SQL rewrite or new
+historical native witness; older binaries cannot interpret the new conflict reason.
+
+Native controls cover files and empty directories, pending Deletes and real disposable backend
+deletion followed by exact public ACK, later occupants, owner reopen and zero hydration. Real
+subprocess termination covers both sides of the official SQLite commit. CI repeats the four
+Delete/ACK controls as fresh ordinary users on x64 and ARM64, retaining original TRX, identities
+and batch inputs/results. Package publication and downstream signed Host/S06 acceptance remain
+separate release gates; this SDK result does not clear an application's received header.
+
 ## Distinct births at retired paths (CF-009)
 
 A completed retirement does not give its path authority over a new remote identity. For a file or
