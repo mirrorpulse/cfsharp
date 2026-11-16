@@ -2,7 +2,7 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
-    [ValidateSet('Delete', 'Recreation', 'AccessJournal', 'OfflineReference', 'DeleteReconciliation')]
+    [ValidateSet('Delete', 'Recreation', 'AccessJournal', 'OfflineReference', 'DeleteReconciliation', 'CreationBinding')]
     [string] $Suite = 'Delete'
 )
 
@@ -28,8 +28,10 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
     elseif ($Suite -eq 'AccessJournal') { 'FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit' }
     elseif ($Suite -eq 'OfflineReference') { 'FullyQualifiedName~OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess' }
     elseif ($Suite -eq 'DeleteReconciliation') { 'FullyQualifiedName~LocalDeleteReconciliationRetainsAnOriginalConflictWithoutNativeWork' }
+    elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
-$expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -in @('AccessJournal', 'DeleteReconciliation')) { 4 } else { 2 }
+$expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
+    elseif ($Suite -in @('AccessJournal', 'DeleteReconciliation')) { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null

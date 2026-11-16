@@ -567,6 +567,10 @@ $packageLines
 - Existing preview.11 partial batches retain their original fingerprint, ordinal, local operations and safe-cursor semantics; the strict default is unchanged.
 - This result certifies rejection, not native deletion or backend acceptance. See docs/remote-change-application.md.
 
+## Placeholder creation recovery
+
+- CreateRecoverablePlaceholdersAsync retains the original guarded native binding with its official projection. RecoverPlaceholderCreationAsync authenticates that binding after restart. See docs/placeholders.md.
+
 ## Verification
 
 - Package metadata requires MirrorPulse Team attribution and Apache-2.0 licensing.
