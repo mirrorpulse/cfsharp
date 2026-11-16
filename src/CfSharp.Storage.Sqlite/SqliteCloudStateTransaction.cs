@@ -215,23 +215,11 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         List<Exception>? failures = null;
         try
         {
-            try
-            {
-                await _transaction.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
-            }
-
-            try
-            {
-                await _connection.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
-            }
+            await _transaction.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            (failures ??= []).Add(exception);
         }
         finally
         {

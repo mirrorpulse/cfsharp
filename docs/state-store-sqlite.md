@@ -29,8 +29,9 @@ SQLite's data and normal lock ranges and does not allocate or alter file content
 returns `AlreadyInUse` with the underlying Win32 error. Existing no-delete parent/main/sidecar
 handles, reparse checks, root containment and permanent root binding remain in force. Shared or
 retargeted sidecars and lock aliases are likewise rejected; genuinely independent databases remain
-independent. The physical locks outlive pooled SQLite connections and are released on failed open
-or store disposal; an unsuccessful contender cannot release another owner's locks.
+independent. Each store owns one unpooled SQLite connection and uses it for serialized transactions.
+The physical locks stay held until that connection closes, including during failed initialization.
+An unsuccessful contender cannot release another owner's locks.
 
 This is a cooperative official-provider ownership protocol. It does not attest arbitrary database
 integrity or exclude unrelated SQLite clients, direct file writes or mapped I/O. In particular,
@@ -43,6 +44,13 @@ The provider uses transactions, foreign keys, WAL mode, bounded lock waits, and 
 Dispose an uncommitted transaction to roll back. Windows namespace operations and SQLite transactions
 cannot be one physical transaction; if the namespace succeeds and the store fails, the managed
 exception identifies the coordination boundary so the application can reconcile.
+
+Dispose the store after its last transaction ends. Before closing the connection and releasing
+file ownership, disposal asks SQLite to checkpoint and truncate the WAL without waiting for
+other clients. If a direct SQLite client prevents checkpointing all frames, the remaining
+committed frames stay in the WAL for SQLite to replay. The verified WAL and shared-memory files
+remain available for reuse across opens. Include them in offline recovery and use SQLite's
+backup mechanisms for a consistent live backup.
 
 ## Backup and recovery
 

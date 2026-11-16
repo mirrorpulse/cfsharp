@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
+using SQLitePCL;
 
 namespace CfSharp.Storage.Sqlite;
 
@@ -26,6 +27,10 @@ namespace CfSharp.Storage.Sqlite;
 /// so an alias added during an open lifetime cannot admit a second provider owner. Contention
 /// fails with <see cref="SqliteCloudStateStoreError.AlreadyInUse"/> independently of root context.
 /// This cooperative provider protocol does not exclude arbitrary direct SQLite clients.
+/// </para>
+/// <para>
+/// The store checkpoints WAL and closes its SQLite connection before releasing its ownership.
+/// The verified WAL and shared-memory files may remain for SQLite to reuse on the next open.
 /// </para>
 /// <para>
 /// The factory is immutable and safe for concurrent calls, although concurrent opens for the same
@@ -138,7 +143,6 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
 
         FileStream ownerLock = AcquireOwnerLock();
         SqlitePathHandleLease? databaseLease = null;
-        string connectionString = CreateConnectionString();
         try
         {
             // Hold the verified parent chain and database object while SQLite opens its own
@@ -161,19 +165,20 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
             throw;
         }
 
+        SqliteConnection? connection = null;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
             ValidateSafeLocation(context.SyncRootPath);
+            connection = new SqliteConnection(CreateConnectionString());
             await SqliteSchema.InitializeAsync(
-                connectionString,
+                connection,
                 _busyTimeoutMilliseconds,
                 DatabasePath,
                 context.SyncRootPath,
                 cancellationToken).ConfigureAwait(false);
             return new SqliteCloudStateStore(
-                connectionString,
-                _busyTimeoutMilliseconds,
+                connection,
                 DatabasePath,
                 ownerLock,
                 databaseLease);
@@ -182,7 +187,10 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         {
             try
             {
-                SqliteConnectionPool.Clear(connectionString);
+                if (connection is not null)
+                {
+                    await connection.DisposeAsync().ConfigureAwait(false);
+                }
             }
             finally
             {
@@ -351,7 +359,7 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
             DataSource = DatabasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
             Cache = SqliteCacheMode.Private,
-            Pooling = true,
+            Pooling = false,
             ForeignKeys = true,
             // SQLite's busy_timeout controls lock waits. Do not reuse it as Microsoft.Data.Sqlite's
             // command timeout: schema checks and large subtree reads must not be interrupted merely
@@ -390,8 +398,7 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
 internal sealed class SqliteCloudStateStore : ICloudStateStore
 {
     private readonly object _lifecycleGate = new();
-    private readonly string _connectionString;
-    private readonly int _busyTimeoutMilliseconds;
+    private readonly SqliteConnection _connection;
     private readonly string _databasePath;
     private readonly FileStream _ownerLock;
     private readonly SqlitePathHandleLease _databaseLease;
@@ -400,14 +407,12 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
     private bool _disposed;
 
     internal SqliteCloudStateStore(
-        string connectionString,
-        int busyTimeoutMilliseconds,
+        SqliteConnection connection,
         string databasePath,
         FileStream ownerLock,
         SqlitePathHandleLease databaseLease)
     {
-        _connectionString = connectionString;
-        _busyTimeoutMilliseconds = busyTimeoutMilliseconds;
+        _connection = connection;
         _databasePath = databasePath;
         _ownerLock = ownerLock;
         _databaseLease = databaseLease;
@@ -418,48 +423,31 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         await _transactionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        bool transactionGateOwned = true;
         lock (_lifecycleGate)
         {
             if (_disposed)
             {
                 _transactionGate.Release();
-                transactionGateOwned = false;
                 ObjectDisposedException.ThrowIf(true, this);
             }
 
             _activeTransactions++;
         }
 
-        SqliteConnection? connection = null;
         try
         {
-            connection = new SqliteConnection(_connectionString);
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await SqliteSchema.ConfigureConnectionAsync(
-                connection,
-                _busyTimeoutMilliseconds,
-                cancellationToken).ConfigureAwait(false);
-            SqliteTransaction transaction = (SqliteTransaction)await connection
+            SqliteTransaction transaction = (SqliteTransaction)await _connection
                 .BeginTransactionAsync(cancellationToken)
                 .ConfigureAwait(false);
             return new SqliteCloudStateTransaction(
-                connection,
+                _connection,
                 transaction,
                 _databasePath,
                 OnTransactionCompleted);
         }
         catch (Exception exception)
         {
-            if (connection is not null)
-            {
-                await connection.DisposeAsync().ConfigureAwait(false);
-            }
-
-            if (transactionGateOwned)
-            {
-                OnTransactionCompleted();
-            }
+            OnTransactionCompleted();
             if (exception is OperationCanceledException or SqliteCloudStateStoreException)
             {
                 throw;
@@ -469,32 +457,53 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_lifecycleGate)
         {
-            if (_disposed)
+            if (_disposed && _connection.Handle is null)
             {
-                return;
+                return ValueTask.CompletedTask;
             }
 
             if (_activeTransactions != 0)
             {
-                throw new InvalidOperationException(
-                    "The SQLite state store cannot be disposed while transactions are active.");
+                return ValueTask.FromException(new InvalidOperationException(
+                    "The SQLite state store cannot be disposed while transactions are active."));
             }
 
             _disposed = true;
-        }
 
-        try
-        {
-            SqliteConnectionPool.Clear(_connectionString);
-        }
-        finally
-        {
-            _databaseLease.Dispose();
-            await _ownerLock.DisposeAsync().ConfigureAwait(false);
+            // Microsoft.Data.Sqlite closes the native connection synchronously. Keep admission
+            // and concurrent disposers behind this gate until the physical lease is released.
+            try
+            {
+                try
+                {
+                    SqliteWalLifetime.Checkpoint(_connection);
+                }
+                finally
+                {
+                    _connection.Dispose();
+                }
+            }
+            catch (SqliteException exception)
+            {
+                return ValueTask.FromException(SqliteSchema.TranslateFailure(_databasePath,
+                    "The SQLite state database could not checkpoint or close.", exception));
+            }
+            finally
+            {
+                // If close itself failed before releasing its handle, keep ownership and allow
+                // a later disposal to finish closing. No more transactions can enter this store.
+                if (_connection.Handle is null)
+                {
+                    _databaseLease.Dispose();
+                    _ownerLock.Dispose();
+                }
+            }
+
+            return ValueTask.CompletedTask;
         }
     }
 
@@ -798,7 +807,7 @@ internal static class SqliteSchema
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
     internal static async Task InitializeAsync(
-        string connectionString,
+        SqliteConnection connection,
         int busyTimeoutMilliseconds,
         string databasePath,
         string syncRootPath,
@@ -806,8 +815,8 @@ internal static class SqliteSchema
     {
         try
         {
-            await using SqliteConnection connection = new(connectionString);
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            SqliteWalLifetime.RetainSidecars(connection);
             await ConfigureConnectionAsync(
                 connection,
                 busyTimeoutMilliseconds,
@@ -1537,12 +1546,32 @@ internal static class SqliteSchema
     }
 }
 
-internal static class SqliteConnectionPool
+internal static class SqliteWalLifetime
 {
-    internal static void Clear(string connectionString)
+    internal static void RetainSidecars(SqliteConnection connection)
     {
-        using SqliteConnection connection = new(connectionString);
-        SqliteConnection.ClearPool(connection);
+        // The default last close bundles checkpointing with path-based WAL/SHM deletion.
+        // Our no-delete guards cover both files until the connection closes. Separate the
+        // checkpoint from that cleanup so SQLite can reuse the verified sidecars on reopen.
+        int result = raw.sqlite3_db_config(connection.Handle, raw.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, out _);
+        SqliteException.ThrowExceptionForRC(result, connection.Handle);
+    }
+
+    internal static void Checkpoint(SqliteConnection connection)
+    {
+        // A freshly reopened WAL index can lose the previous checkpoint's backfill position.
+        // Let SQLite truncate a fully checkpointed WAL so short-lived stores do not accumulate
+        // frames on every reopen. This connection is closing. Checkpoint without waiting for
+        // unrelated SQLite clients, just as the default close path does. Transaction busy
+        // timeout is kept for all store operations.
+        SqliteException.ThrowExceptionForRC(raw.sqlite3_busy_timeout(connection.Handle, 0), connection.Handle);
+        int result = raw.sqlite3_wal_checkpoint_v2(connection.Handle, "main", raw.SQLITE_CHECKPOINT_TRUNCATE, out _, out _);
+        // SQLite can replay any frames left by a busy checkpoint. Real I/O failures retain
+        // their SQLite error codes.
+        if (result != raw.SQLITE_BUSY)
+        {
+            SqliteException.ThrowExceptionForRC(result, connection.Handle);
+        }
     }
 }
 

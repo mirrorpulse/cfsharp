@@ -112,7 +112,7 @@ jobs:
 
       - name: Verify isolated package capabilities on x64
         shell: pwsh
-        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities
+        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities -MeasureSqliteLifetime
 
       - name: Upload x64 package capability evidence
         if: always()
@@ -124,8 +124,10 @@ jobs:
             artifacts/package-capabilities/*/sbom.spdx.json
             artifacts/package-capabilities/*/release-notes.md
             artifacts/package-capabilities/*/support-matrix.md
+            artifacts/package-capabilities/*/sqlite-lifetime.tsv
             artifacts/package-capabilities/*/consumer-smoke/PreviewConsumer.csproj
             artifacts/package-capabilities/*/consumer-smoke/Program.cs
+            artifacts/package-capabilities/*/consumer-smoke/SqliteLifetimeProbe.cs
             artifacts/package-capabilities/*/consumer-smoke/packages.lock.json
             artifacts/package-capabilities/*/packages/*.nupkg
             artifacts/package-capabilities/*/packages/*.snupkg
@@ -194,7 +196,7 @@ jobs:
 
       - name: Verify isolated package capabilities on ARM64
         shell: pwsh
-        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities
+        run: ./eng/prepare-preview.ps1 -Version '0.0.0-preview.${{ github.run_number }}' -Channel Preview -OutputDirectory artifacts/package-capabilities -MeasureSqliteLifetime
 
       - name: Upload ARM64 test results
         if: always()
@@ -208,8 +210,10 @@ jobs:
             artifacts/package-capabilities/*/sbom.spdx.json
             artifacts/package-capabilities/*/release-notes.md
             artifacts/package-capabilities/*/support-matrix.md
+            artifacts/package-capabilities/*/sqlite-lifetime.tsv
             artifacts/package-capabilities/*/consumer-smoke/PreviewConsumer.csproj
             artifacts/package-capabilities/*/consumer-smoke/Program.cs
+            artifacts/package-capabilities/*/consumer-smoke/SqliteLifetimeProbe.cs
             artifacts/package-capabilities/*/consumer-smoke/packages.lock.json
             artifacts/package-capabilities/*/packages/*.nupkg
             artifacts/package-capabilities/*/packages/*.snupkg
