@@ -18,7 +18,7 @@ internal static partial class WindowsFileUsn
     internal const int Version3HeaderLength = 76;
 
     [SupportedOSPlatform("windows10.0.16299")]
-    internal static unsafe long Read(string path, bool expectedDirectory)
+    internal static long Read(string path, bool expectedDirectory)
     {
         // Attribute-only access and OPEN_REPARSE_POINT avoid hydrating file content or following
         // a final symlink. BACKUP_SEMANTICS permits the same query for files and directories.
@@ -35,6 +35,12 @@ internal static partial class WindowsFileUsn
             throw new Win32Exception(Marshal.GetLastPInvokeError());
         }
 
+        return Read(handle, expectedDirectory);
+    }
+
+    [SupportedOSPlatform("windows10.0.16299")]
+    internal static unsafe long Read(SafeFileHandle handle, bool expectedDirectory)
+    {
         FileAttributeTagInfo attributes = default;
         if (!GetFileInformationByHandleEx(handle, 9, &attributes, (uint)sizeof(FileAttributeTagInfo)))
         {

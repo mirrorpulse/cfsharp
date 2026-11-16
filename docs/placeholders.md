@@ -178,6 +178,67 @@ result.ThrowIfAnyFailed();
 The identity envelope is versioned, deterministic, and bounded by the native identity limit. Do not
 put credentials or secrets in remote identifiers, revisions, or placeholder metadata.
 
+### Recover the first native binding
+
+Use `CreateRecoverablePlaceholdersAsync` when another durable workflow needs to authenticate the
+very first native object after restart or a lost response. Persist a unique operation ID and the
+original parent and specification in that workflow before asking CfSharp to create the child.
+
+```csharp
+var request = new CloudPlaceholderCreationRequest(originalOperationId, report);
+
+// First attempt. The same ID may also be resubmitted to this API.
+var created = (await parent.CreateRecoverablePlaceholdersAsync([request],
+    cancellationToken: cancellationToken)).Single();
+
+// After reopening the same root and store, reconstruct the original request and parent.
+var recovered = await parent.RecoverPlaceholderCreationAsync(request, cancellationToken);
+if (recovered.Status == CloudPlaceholderCreationRecoveryStatus.Recovered)
+{
+    CloudLocalFileBinding original = recovered.Receipt!.Binding;
+    // Compare this binding while holding the application's own protection for its next action.
+}
+```
+
+The operation ID is scoped to the durable store. CfSharp binds it to the original physical sync
+root, parent, target name, kind, exact opaque placeholder identity and native creation settings.
+It uses Windows path comparison and retains the original normalized spelling. Windows returns a
+creation USN. CfSharp opens the created object with metadata access and checks that USN through
+the same handle that supplies its native IDs and placeholder identity. It commits the receipt and
+official SQLite projection in a single transaction while the guarded object is open. The receipt
+holds the original 64-bit volume serial, opaque 128-bit sync-root and object IDs, identity bytes and
+creation USN. The full binding is independent of the legacy `CloudItemState.LocalFileId` column.
+
+| Outcome | Meaning |
+| --- | --- |
+| `Created` or `Recovered` | The original binding and identity are authenticated. The returned receipt survives owner disposal. |
+| `Pending` | A preparation survived without the projection/receipt commit. The first binding cannot be authenticated. Retain the original pending operation. |
+| `Missing` or `Replaced` | The original target or parent is absent or the current object fails the native binding or identity check. |
+| `WrongRoot` | The retained store scope or physical root differs. |
+| `Conflict` | The original ID was resubmitted with an incompatible request, or a native or official occupant blocks a new birth. |
+| `NotFound` | This store has no record for the ID, including old or untracked entries. |
+| `Unavailable` or `Failed` | The native evidence cannot be checked or Windows failed to create the entry. Inspect `Error` when present. |
+| `NotProcessed` | The batch stopped before this entry. |
+
+The preparation and native create are separate. Even if a matching identity exists at the requested
+name after an interruption before commit, the durable preparation cannot identify that object.
+Replay leaves the preparation pending and performs no second create. The same applies if the
+operation stopped immediately after preparation and the target is absent. After a commit or an
+ambiguous store error, query the original request. Committed recovery checks the current object on
+a metadata handle against the original receipt and performs no projection repair, file content
+read, hydration, pin change or journal acknowledgement. The caller owns the application policy
+for retiring sources, registering members or acknowledging work after obtaining the receipt.
+
+This opt-in path supports directory and online-only file creation with `Fail` collision behavior.
+The native storage must support a Cloud Files registration, full native file IDs and a positive
+creation USN that can be verified on the original handle. It also requires safe no-delete path
+guards. Each successful batch entry commits independently, so earlier successes survive a later
+entry's failure, cancellation or process exit. Recovery is per request. Existing SQLite schemas
+can store the versioned receipt without migration. Older library versions do not implement this
+protocol. Keep all owners of in-flight tracked operations on a supporting version. Older item
+rows give no historical proof. Existing `CreatePlaceholdersAsync` callers can still use their
+normal identity-match and availability options.
+
 ## Availability is explicit
 
 `OnlineOnly`, `LocallyAvailable`, and `AlwaysAvailable` describe different pin and content states.

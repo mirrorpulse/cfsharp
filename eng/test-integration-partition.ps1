@@ -14,12 +14,12 @@ $project = Join-Path $repository 'tests/CfSharp.IntegrationTests/CfSharp.Integra
 $results = Join-Path $repository 'tests/CfSharp.IntegrationTests/TestResults'
 $planPath = Join-Path $repository 'artifacts/integration-plan.json'
 $prefix = 'CfSharp.IntegrationTests.'
-$recovery = "FullyQualifiedName~${prefix}RemoteDeleteRecoveryTests|FullyQualifiedName~${prefix}RemoteMoveRecoveryTests"
+$recovery = "FullyQualifiedName~${prefix}RemoteDeleteRecoveryTests|FullyQualifiedName~${prefix}RemoteMoveRecoveryTests|FullyQualifiedName~${prefix}PlaceholderCreationBindingTests"
 $namespace = "FullyQualifiedName~${prefix}CloudDirectoryMoveTests|FullyQualifiedName~${prefix}RemoteRecreationTests"
 $filters = [ordered]@{
     Recovery = "Category!=LongSoak&($recovery)"
     Namespace = "Category!=LongSoak&($namespace)"
-    Content = "Category!=LongSoak&FullyQualifiedName!~${prefix}RemoteDeleteRecoveryTests&FullyQualifiedName!~${prefix}RemoteMoveRecoveryTests&FullyQualifiedName!~${prefix}CloudDirectoryMoveTests&FullyQualifiedName!~${prefix}RemoteRecreationTests"
+    Content = "Category!=LongSoak&FullyQualifiedName!~${prefix}RemoteDeleteRecoveryTests&FullyQualifiedName!~${prefix}RemoteMoveRecoveryTests&FullyQualifiedName!~${prefix}PlaceholderCreationBindingTests&FullyQualifiedName!~${prefix}CloudDirectoryMoveTests&FullyQualifiedName!~${prefix}RemoteRecreationTests"
 }
 $common = @($project, '--configuration', $Configuration, '--no-build', '--no-restore', '--disable-build-servers', '-m:1')
 

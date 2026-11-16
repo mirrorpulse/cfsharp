@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 
+using CfSharp.Native;
 using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp;
@@ -39,7 +40,8 @@ internal sealed class CloudPathHandleLease : IDisposable
     /// <summary>Opens every existing directory from the volume root through the target parent.</summary>
     internal static CloudPathHandleLease OpenDirectoryChain(
         string syncRootPath,
-        string targetDirectory)
+        string targetDirectory,
+        bool protectRename = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(syncRootPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(targetDirectory);
@@ -56,7 +58,7 @@ internal sealed class CloudPathHandleLease : IDisposable
         List<SafeFileHandle> handles = [];
         try
         {
-            OpenDirectoryChainInto(root, target, handles);
+            OpenDirectoryChainInto(root, target, handles, protectRename);
 
             return new CloudPathHandleLease(handles);
         }
@@ -153,9 +155,10 @@ internal sealed class CloudPathHandleLease : IDisposable
         string path,
         List<SafeFileHandle> handles,
         bool isDirectory,
-        bool allowReparsePoint)
+        bool allowReparsePoint,
+        bool protectRename = false)
     {
-        SafeFileHandle handle = Open(path, isDirectory);
+        SafeFileHandle handle = protectRename ? WindowsFileMetadata.OpenDirectoryGuard(path) : Open(path, isDirectory);
         try
         {
             EnsureNotReparsePoint(handle, path, allowReparsePoint);
@@ -171,7 +174,8 @@ internal sealed class CloudPathHandleLease : IDisposable
     private static void OpenDirectoryChainInto(
         string root,
         string target,
-        List<SafeFileHandle> handles)
+        List<SafeFileHandle> handles,
+        bool protectRename = false)
     {
         if (!IsSameOrChild(root, target))
         {
@@ -187,7 +191,8 @@ internal sealed class CloudPathHandleLease : IDisposable
             handles,
             isDirectory: true,
             allowReparsePoint: string.Equals(current, root, StringComparison.OrdinalIgnoreCase) ||
-                CloudItemInspector.IsCloudPlaceholder(current));
+                CloudItemInspector.IsCloudPlaceholder(current),
+            protectRename);
         string remainder = target[volumeRoot.Length..];
         foreach (string segment in remainder.Split(
                      [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
@@ -199,7 +204,8 @@ internal sealed class CloudPathHandleLease : IDisposable
                 handles,
                 isDirectory: true,
                 allowReparsePoint: string.Equals(current, root, StringComparison.OrdinalIgnoreCase) ||
-                    CloudItemInspector.IsCloudPlaceholder(current));
+                    CloudItemInspector.IsCloudPlaceholder(current),
+                protectRename);
         }
     }
 
