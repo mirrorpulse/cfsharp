@@ -1,8 +1,11 @@
 using System.ComponentModel;
+using System.Data;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
+using SQLitePCL;
 
 namespace CfSharp.Storage.Sqlite.Tests;
 
@@ -278,6 +281,282 @@ public sealed partial class SqliteCloudStateStoreTests
         }
         if (ready is not null) { start.ArgumentList.Add(ready); start.ArgumentList.Add(ready + ".release"); }
         return new(Process.Start(start) ?? throw new InvalidOperationException("The ownership child did not start."));
+    }
+
+    [Trait("Category", "PhysicalOwnership")]
+    [Fact]
+    public async Task NativeCloseKeepsOriginalFilesAndOwnerProtectedUntilConnectionCloses()
+    {
+        await SeedOwnershipAsync();
+        using ManualResetEventSlim closing = new();
+        using ManualResetEventSlim resume = new();
+        using CloseBarrierConnection connection = new(CreateConnectionString(_databasePath), closing, resume);
+        using FileStream owner = File.Open(_databasePath + ".cfsharp.lock", FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using SqlitePathHandleLease lease = SqlitePathHandleLease.Open(_databasePath);
+        await SqliteSchema.InitializeAsync(connection, 5000, _databasePath, _syncRootPath, CancellationToken.None);
+        SqliteCloudStateStore store = new(connection, _databasePath, owner, lease);
+        Task disposal = Task.Run(async () => await store.DisposeAsync());
+        Task? concurrent = null;
+        string walAlias = Path.Combine(Path.GetDirectoryName(_databasePath)!, "late-alias.db");
+        try
+        {
+            Assert.True(await Task.Run(() => closing.Wait(TimeSpan.FromSeconds(15))));
+            concurrent = Task.Run(async () => await store.DisposeAsync());
+            using OwnershipChild contender = StartOwnershipChild(_databasePath, _syncRootPath);
+            await contender.RequireResultAsync(SqliteCloudStateStoreError.AlreadyInUse);
+            Assert.False(concurrent.IsCompleted);
+            foreach (string suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                string path = _databasePath + suffix;
+                Assert.Equal(32, Assert.Throws<IOException>(() => File.Move(path, path + ".moved")).HResult & 0xffff);
+            }
+
+            if (TryCreateLiveAlias(walAlias, _databasePath + "-wal"))
+            {
+                using OwnershipChild alias = StartOwnershipChild(walAlias, _syncRootPath);
+                await alias.RequireResultAsync(SqliteCloudStateStoreError.AlreadyInUse);
+            }
+        }
+        finally
+        {
+            resume.Set();
+            await disposal;
+            if (concurrent is not null)
+            {
+                await concurrent;
+            }
+            File.Delete(walAlias);
+        }
+
+        Assert.Equal(ConnectionState.Closed, connection.State);
+        await store.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await store.BeginTransactionAsync());
+        using (OwnershipChild successor = StartOwnershipChild(_databasePath, _syncRootPath))
+        {
+            await successor.RequireResultAsync(null);
+        }
+        await using ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext());
+        await AssertOwnershipStateAsync(reopened);
+    }
+
+    [Fact]
+    public async Task CleanDisposalCheckpointsCommittedDataAndReusesOriginalSidecars()
+    {
+        await SeedOwnershipAsync();
+        string wal = _databasePath + "-wal";
+        string shm = _databasePath + "-shm";
+        PhysicalFileIdentity originalWal = ReadPhysicalIdentity(wal);
+        PhysicalFileIdentity originalShm = ReadPhysicalIdentity(shm);
+        long largestShm = new FileInfo(shm).Length;
+        byte[] payload = [51, 68];
+
+        for (int index = 0; index < 12; index++)
+        {
+            payload[0] = (byte)index;
+            await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+            {
+                await using ICloudStateTransaction transaction = await store.BeginTransactionAsync();
+                await transaction.Checkpoints.UpsertAsync(new("updated", payload, DateTimeOffset.UtcNow));
+                await transaction.CommitAsync();
+            }
+
+            Assert.Equal(originalWal, ReadPhysicalIdentity(wal));
+            Assert.Equal(originalShm, ReadPhysicalIdentity(shm));
+            Assert.Equal(0, new FileInfo(wal).Length);
+            Assert.InRange(new FileInfo(shm).Length, 0, largestShm);
+        }
+
+        // A copy of the main file alone can only observe the last update if close checkpointed it.
+        string copy = Path.Combine(Path.GetDirectoryName(_databasePath)!, "checkpointed.db");
+        File.Copy(_databasePath, copy);
+        await using ICloudStateStore reopened = await new SqliteCloudStateStoreFactory(copy).OpenAsync(CreateContext());
+        await AssertOwnershipStateAsync(reopened);
+        await using ICloudStateTransaction read = await reopened.BeginTransactionAsync();
+        Assert.Equal(payload, (await read.Checkpoints.GetAsync("updated"))!.Value.ToArray());
+        output.WriteLine($"Twelve update/reopen cycles retained the original WAL (truncated) and SHM ({largestShm} bytes).");
+    }
+
+    [Fact]
+    public async Task DirectSqliteReaderCanDeferTruncationWithoutLosingAcknowledgedCommit()
+    {
+        await SeedOwnershipAsync();
+        await using (SqliteConnection external = new(new SqliteConnectionStringBuilder
+        {
+            DataSource = _databasePath,
+            Pooling = false,
+        }.ToString()))
+        {
+            await external.OpenAsync();
+            SqliteWalLifetime.RetainSidecars(external);
+            using SqliteTransaction snapshot = external.BeginTransaction(deferred: true);
+            using SqliteCommand read = external.CreateCommand();
+            read.CommandText = "SELECT COUNT(*) FROM cfsharp_schema;";
+            Assert.Equal(1L, await read.ExecuteScalarAsync());
+
+            await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+            {
+                await using ICloudStateTransaction write = await store.BeginTransactionAsync();
+                await write.Checkpoints.UpsertAsync(new("busy-checkpoint", new byte[] { 41, 42 }, DateTimeOffset.UtcNow));
+                await write.CommitAsync();
+            }
+
+            Assert.True(new FileInfo(_databasePath + "-wal").Length > 0);
+            Assert.Equal(1L, await read.ExecuteScalarAsync());
+        }
+
+        await using (ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext()))
+        {
+            await AssertOwnershipStateAsync(reopened);
+            await using ICloudStateTransaction read = await reopened.BeginTransactionAsync();
+            Assert.Equal(new byte[] { 41, 42 }, (await read.Checkpoints.GetAsync("busy-checkpoint"))!.Value.ToArray());
+        }
+        Assert.Equal(0, new FileInfo(_databasePath + "-wal").Length);
+    }
+
+    [Trait("Category", "PhysicalOwnership")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailedInitializationKeepsPhysicalOwnershipUntilNativeClose(bool migrating)
+    {
+        if (migrating)
+        {
+            await SeedOwnershipAsync();
+            await ExecuteSqlAsync(_databasePath, "UPDATE cfsharp_schema SET version = 8 WHERE singleton = 1;");
+        }
+
+        using ManualResetEventSlim closing = new();
+        using ManualResetEventSlim resume = new();
+        int commits = 0;
+        int rollbacks = 0;
+        bool closedWithPhysicalLocks = false;
+        strdelegate_authorizer rejectBoundaries = (_, operation, name, _, _, _) =>
+        {
+            if (operation == raw.SQLITE_TRANSACTION)
+            {
+                switch (name)
+                {
+                    case "COMMIT":
+                        commits++;
+                        return raw.SQLITE_DENY;
+                    case "ROLLBACK":
+                        rollbacks++;
+                        return raw.SQLITE_DENY;
+                }
+            }
+
+            return raw.SQLITE_OK;
+        };
+        CloseBarrierConnection? oldConnection = null;
+        SqliteCloudStateStoreFactory factory = new(_databasePath);
+        Task<ICloudStateStore> opening = Task.Run(async () => await factory.OpenAsync(CreateContext(), connectionString =>
+        {
+            oldConnection = new CloseBarrierConnection(connectionString, closing, resume);
+            oldConnection.StateChange += ObserveStateChange;
+            return oldConnection;
+        }, CancellationToken.None));
+
+        Exception? failure;
+        try
+        {
+            Assert.True(await Task.Run(() => closing.Wait(TimeSpan.FromSeconds(15))));
+            Assert.NotNull(oldConnection);
+            Assert.Equal(0, raw.sqlite3_get_autocommit(oldConnection.Handle));
+            Assert.Equal(1, commits);
+            Assert.True(rollbacks >= 1);
+            using OwnershipChild contender = StartOwnershipChild(_databasePath, _syncRootPath);
+            await contender.RequireResultAsync(SqliteCloudStateStoreError.AlreadyInUse);
+            RequirePhysicalLocks();
+        }
+        finally
+        {
+            resume.Set();
+            failure = await Record.ExceptionAsync(async () =>
+            {
+                await using ICloudStateStore unexpected = await opening;
+            });
+            if (oldConnection is not null)
+            {
+                oldConnection.StateChange -= ObserveStateChange;
+                if (oldConnection.Handle is { } handle)
+                {
+                    raw.sqlite3_set_authorizer(handle, (strdelegate_authorizer?)null, null);
+                }
+            }
+        }
+
+        using (oldConnection)
+        {
+            Assert.NotNull(oldConnection);
+            Assert.Null(oldConnection.Handle);
+            Assert.True(closedWithPhysicalLocks);
+            Assert.Equal(1, rollbacks);
+            SqliteCloudStateStoreException error = Assert.IsType<SqliteCloudStateStoreException>(failure);
+            Assert.Equal(raw.SQLITE_AUTH, error.SqliteErrorCode);
+            Assert.Equal(_databasePath, error.DatabasePath);
+
+            await using ICloudStateStore reopened = await factory.OpenAsync(CreateContext());
+            if (migrating)
+            {
+                await AssertOwnershipStateAsync(reopened);
+            }
+            await using ICloudStateTransaction transaction = await reopened.BeginTransactionAsync();
+            if (migrating)
+            {
+                CloudItemState item = Assert.IsType<CloudItemState>(await transaction.Items.GetByItemIdAsync(
+                    Guid.Parse("7811b0dc-bff0-42b0-b376-d256878c2a5e")));
+                Assert.Equal("ownership-item", item.RemoteId);
+                Assert.Equal("item.txt", item.RelativePath);
+                Assert.Equal("v1", item.RemoteRevision);
+            }
+            await transaction.Checkpoints.UpsertAsync(new("after-reopen", new byte[] { 27 }, DateTimeOffset.UtcNow));
+            await transaction.CommitAsync();
+        }
+
+        void ObserveStateChange(object? sender, StateChangeEventArgs change)
+        {
+            SqliteConnection connection = Assert.IsAssignableFrom<SqliteConnection>(sender);
+            if (change.CurrentState == ConnectionState.Open)
+            {
+                Assert.Equal(raw.SQLITE_OK, raw.sqlite3_set_authorizer(connection.Handle, rejectBoundaries, null));
+            }
+            else if (change.CurrentState == ConnectionState.Closed)
+            {
+                Assert.Null(connection.Handle);
+                RequirePhysicalLocks();
+                closedWithPhysicalLocks = true;
+            }
+        }
+
+        void RequirePhysicalLocks()
+        {
+            foreach (string suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                string path = _databasePath + suffix;
+                using SafeFileHandle contenderFile = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                SqliteCloudStateStoreException locked = Assert.Throws<SqliteCloudStateStoreException>(() =>
+                    SqliteFileOwnership.Acquire(contenderFile, _databasePath, path));
+                Assert.Equal(SqliteCloudStateStoreError.AlreadyInUse, locked.Error);
+            }
+        }
+    }
+
+    private sealed class CloseBarrierConnection(string connectionString, ManualResetEventSlim closing, ManualResetEventSlim resume)
+        : SqliteConnection(connectionString)
+    {
+        public override void Close()
+        {
+            if (State == ConnectionState.Open)
+            {
+                closing.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(45)))
+                {
+                    throw new TimeoutException("The native close test boundary was not released.");
+                }
+            }
+
+            base.Close();
+        }
     }
 
     private sealed class OwnershipChild(Process process) : IDisposable

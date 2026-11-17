@@ -7,7 +7,8 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string] $Configuration = 'Release',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
-    [string] $OutputDirectory = (Join-Path $PSScriptRoot '..\artifacts\preview')
+    [string] $OutputDirectory = (Join-Path $PSScriptRoot '..\artifacts\preview'),
+    [switch] $MeasureSqliteLifetime
 )
 
 $ErrorActionPreference = 'Stop'
@@ -158,6 +159,7 @@ New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
 $consumerProject = Join-Path $smokeRoot 'PreviewConsumer.csproj'
 $consumerProgram = Join-Path $smokeRoot 'Program.cs'
 $consumerNuGetConfig = Join-Path $smokeRoot 'NuGet.config'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SqliteLifetimeProbe.cs') -Destination $smokeRoot
 @"
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
@@ -186,6 +188,12 @@ using System.Security.AccessControl;
 
 using CfSharp;
 using CfSharp.Storage.Sqlite;
+
+if (args.Contains("--sqlite-lifetime", StringComparer.Ordinal))
+{
+    await SqliteLifetimeProbe.RunAsync();
+    return;
+}
 
 await Smoke.VerifyPagingAsync();
 if (args.Contains("--native", StringComparer.Ordinal))
@@ -488,6 +496,12 @@ try {
                 & $executable --native
                 if ($LASTEXITCODE -ne 0) {
                     throw "Preview $mode native consumer failed for $runtime with exit code $LASTEXITCODE."
+                }
+                if ($MeasureSqliteLifetime -and $mode -eq 'trim') {
+                    & $executable --sqlite-lifetime | Tee-Object -FilePath (Join-Path $versionOutput 'sqlite-lifetime.tsv')
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "SQLite package lifetime qualification failed for $runtime with exit code $LASTEXITCODE."
+                    }
                 }
             }
             $consumerEvidence.Add([pscustomobject]@{ runtime = $runtime; mode = $mode; compiled = $true; executed = $executed })

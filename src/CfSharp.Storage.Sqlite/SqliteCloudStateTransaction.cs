@@ -1,25 +1,23 @@
 using System.Diagnostics;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 
 namespace CfSharp.Storage.Sqlite;
 
 internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
 {
     private readonly SqliteConnection _connection;
-    private readonly SqliteTransaction _transaction;
     private readonly string _databasePath;
-    private readonly Action _completed;
+    private readonly Action<Exception?>? _completed;
     private int _terminal;
 
-    internal SqliteCloudStateTransaction(
+    private SqliteCloudStateTransaction(
         SqliteConnection connection,
-        SqliteTransaction transaction,
         string databasePath,
-        Action completed)
+        Action<Exception?>? completed)
     {
         _connection = connection;
-        _transaction = transaction;
         _databasePath = databasePath;
         _completed = completed;
         Items = new ItemRepository(this);
@@ -42,6 +40,22 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
 
     public ICloudEchoSuppressionRepository EchoSuppressions { get; }
 
+    internal static async ValueTask<SqliteCloudStateTransaction> BeginAsync(
+        SqliteConnection connection,
+        string databasePath,
+        Action<Exception?>? completed,
+        CancellationToken cancellationToken)
+    {
+        // This connection runs one immediate transaction at a time. Use SQLite's native
+        // transaction state so a failed COMMIT that SQLite already rolled back cannot leave a
+        // stale Microsoft.Data.Sqlite transaction object attached to the reusable connection.
+        await ExecuteBoundaryAsync(connection, "BEGIN IMMEDIATE;", cancellationToken).ConfigureAwait(false);
+        return new SqliteCloudStateTransaction(connection, databasePath, completed);
+    }
+
+    internal static bool IsNativeTransactionActive(SqliteConnection connection) =>
+        connection.Handle is { } handle && raw.sqlite3_get_autocommit(handle) == 0;
+
     public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
     {
         CheckActive(cancellationToken);
@@ -50,11 +64,11 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
             // Once the pre-commit cancellation check passed, COMMIT must run to an
             // unambiguous terminal point. A caller token racing this statement could otherwise
             // report cancellation after SQLite had already committed.
-            await _transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
+            await ExecuteBoundaryAsync(_connection, "COMMIT;", CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
-            await RollBackAfterFailureAsync().ConfigureAwait(false);
+            // Preserve the original COMMIT error. Any unfinished rollback also fences the store.
             _ = await CompleteAsync().ConfigureAwait(false);
             if (exception is OperationCanceledException)
             {
@@ -80,30 +94,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
     {
         CheckActive(cancellationToken);
 
-        Exception? rollbackFailure = null;
-        try
-        {
-            await _transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            rollbackFailure = exception;
-        }
-
-        Exception? cleanupFailure = await CompleteAsync().ConfigureAwait(false);
-        if (cleanupFailure is not null)
-        {
-            rollbackFailure = rollbackFailure is null
-                ? cleanupFailure
-                : new AggregateException(rollbackFailure, cleanupFailure);
-        }
-
-        if (rollbackFailure is OperationCanceledException)
-        {
-            throw rollbackFailure;
-        }
-
-        if (rollbackFailure is not null)
+        if (await CompleteAsync().ConfigureAwait(false) is { } rollbackFailure)
         {
             throw SqliteSchema.TranslateFailure(
                 _databasePath,
@@ -114,30 +105,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
 
     public async ValueTask DisposeAsync()
     {
-        if (Volatile.Read(ref _terminal) != 0)
-        {
-            return;
-        }
-
-        Exception? rollbackFailure = null;
-        try
-        {
-            await _transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            rollbackFailure = exception;
-        }
-
-        Exception? cleanupFailure = await CompleteAsync().ConfigureAwait(false);
-        if (cleanupFailure is not null)
-        {
-            rollbackFailure = rollbackFailure is null
-                ? cleanupFailure
-                : new AggregateException(rollbackFailure, cleanupFailure);
-        }
-
-        if (rollbackFailure is not null)
+        if (await CompleteAsync().ConfigureAwait(false) is { } rollbackFailure)
         {
             // DisposeAsync is commonly running while another exception is already unwinding
             // an await-using scope. Do not mask that business failure with best-effort rollback
@@ -153,8 +121,12 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
     internal SqliteCommand CreateCommand(string commandText, CancellationToken cancellationToken)
     {
         CheckActive(cancellationToken);
+        if (!IsNativeTransactionActive(_connection))
+        {
+            throw new InvalidOperationException("SQLite already rolled back this transaction.");
+        }
+
         SqliteCommand command = _connection.CreateCommand();
-        command.Transaction = _transaction;
         command.CommandText = commandText;
         return command;
     }
@@ -193,16 +165,11 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         }
     }
 
-    private async ValueTask RollBackAfterFailureAsync()
+    private static async Task ExecuteBoundaryAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken)
     {
-        try
-        {
-            await _transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception)
-        {
-            // The original commit failure is more actionable and retains the SQLite result code.
-        }
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask<Exception?> CompleteAsync()
@@ -212,40 +179,33 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
             return null;
         }
 
-        List<Exception>? failures = null;
+        Exception? cleanupFailure = null;
         try
         {
-            try
+            if (IsNativeTransactionActive(_connection))
             {
-                await _transaction.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
-            }
-
-            try
-            {
-                await _connection.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
+                await ExecuteBoundaryAsync(_connection, "ROLLBACK;", CancellationToken.None).ConfigureAwait(false);
             }
         }
-        finally
+        catch (Exception exception)
         {
-            try
-            {
-                _completed();
-            }
-            catch (Exception exception)
-            {
-                (failures ??= []).Add(exception);
-            }
+            cleanupFailure = exception;
         }
 
-        return failures is null ? null : new AggregateException(failures);
+        Exception? unfinished = IsNativeTransactionActive(_connection)
+            ? cleanupFailure ?? new InvalidOperationException("SQLite still has an active transaction after rollback.")
+            : null;
+        cleanupFailure ??= unfinished;
+        try
+        {
+            _completed?.Invoke(unfinished);
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure = cleanupFailure is null ? exception : new AggregateException(cleanupFailure, exception);
+        }
+
+        return cleanupFailure;
     }
 
     private sealed class ItemRepository : ICloudItemStateRepository
