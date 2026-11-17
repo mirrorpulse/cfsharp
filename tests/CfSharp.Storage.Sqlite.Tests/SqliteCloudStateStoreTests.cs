@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using CfSharp.Tests.Persistence;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 using Xunit.Abstractions;
 using Xunit.Sdk;
 
@@ -82,18 +83,15 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     {
         await using SqliteConnection connection = new("Data Source=:memory:");
         await connection.OpenAsync();
-        await using SqliteTransaction nativeTransaction =
-            (SqliteTransaction)await connection.BeginTransactionAsync();
         int completionCalls = 0;
-        await using SqliteCloudStateTransaction transaction = new(
+        await using SqliteCloudStateTransaction transaction = await SqliteCloudStateTransaction.BeginAsync(
             connection,
-            nativeTransaction,
             "in-memory",
-            () =>
+            _ =>
             {
                 completionCalls++;
                 throw new InvalidOperationException("test cleanup failure");
-            });
+            }, CancellationToken.None);
 
         await transaction.CommitAsync();
 
@@ -106,19 +104,16 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     {
         await using SqliteConnection connection = new("Data Source=:memory:");
         await connection.OpenAsync();
-        await using SqliteTransaction nativeTransaction =
-            (SqliteTransaction)await connection.BeginTransactionAsync();
         using StringWriter traceOutput = new();
         using TextWriterTraceListener traceListener = new(traceOutput);
         Trace.Listeners.Add(traceListener);
 
         try
         {
-            await using SqliteCloudStateTransaction transaction = new(
+            await using SqliteCloudStateTransaction transaction = await SqliteCloudStateTransaction.BeginAsync(
                 connection,
-                nativeTransaction,
                 "in-memory",
-                () => throw new InvalidOperationException("test cleanup failure"));
+                _ => throw new InvalidOperationException("test cleanup failure"), CancellationToken.None);
 
             await transaction.DisposeAsync();
             Trace.Flush();
@@ -133,6 +128,117 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
             Trace.Listeners.Remove(traceListener);
         }
     }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RejectedCommitDoesNotStrandWaitingTransactionOrStoreOwnership(bool sqliteRollsBack)
+    {
+        await SeedOwnershipAsync();
+        using SqliteConnection connection = new(CreateConnectionString(_databasePath));
+        using FileStream owner = File.Open(_databasePath + ".cfsharp.lock", FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using SqlitePathHandleLease lease = SqlitePathHandleLease.Open(_databasePath);
+        await SqliteSchema.InitializeAsync(connection, 5000, _databasePath, _syncRootPath, CancellationToken.None);
+        await using (SqliteCloudStateStore store = new(connection, _databasePath, owner, lease))
+        {
+            await using ICloudStateTransaction failed = await store.BeginTransactionAsync();
+            await failed.Checkpoints.UpsertAsync(new("rejected", new byte[] { 51 }, DateTimeOffset.UtcNow));
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(10));
+            ValueTask<ICloudStateTransaction> waiting = store.BeginTransactionAsync(deadline.Token);
+            Assert.False(waiting.IsCompleted);
+            if (sqliteRollsBack)
+            {
+                raw.sqlite3_commit_hook(connection.Handle, static _ => 1, null);
+            }
+            else
+            {
+                Assert.Equal(raw.SQLITE_OK, raw.sqlite3_set_authorizer(connection.Handle, DenyTransactionCommand("COMMIT"), null));
+            }
+
+            try
+            {
+                SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(async () => await failed.CommitAsync());
+                Assert.Equal(sqliteRollsBack ? raw.SQLITE_CONSTRAINT : raw.SQLITE_AUTH, exception.SqliteErrorCode);
+                Assert.Equal(sqliteRollsBack ? raw.SQLITE_CONSTRAINT_COMMITHOOK : raw.SQLITE_AUTH, exception.SqliteExtendedErrorCode);
+            }
+            finally
+            {
+                raw.sqlite3_commit_hook(connection.Handle, null, null);
+                Assert.Equal(raw.SQLITE_OK, raw.sqlite3_set_authorizer(connection.Handle, (strdelegate_authorizer?)null, null));
+            }
+
+            await using ICloudStateTransaction next = await waiting;
+            Assert.Null(await next.Checkpoints.GetAsync("rejected"));
+            await next.Checkpoints.UpsertAsync(new("successor", new byte[] { 52 }, DateTimeOffset.UtcNow));
+            await next.CommitAsync();
+        }
+
+        await using ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext());
+        await AssertOwnershipStateAsync(reopened);
+        await using ICloudStateTransaction read = await reopened.BeginTransactionAsync();
+        Assert.Null(await read.Checkpoints.GetAsync("rejected"));
+        Assert.Equal(new byte[] { 52 }, (await read.Checkpoints.GetAsync("successor"))!.Value.ToArray());
+    }
+
+    [Fact]
+    public async Task FailedRollbackFencesFurtherTransactionsAndDisposalReleasesOwnership()
+    {
+        await SeedOwnershipAsync();
+        using SqliteConnection connection = new(CreateConnectionString(_databasePath));
+        using FileStream owner = File.Open(_databasePath + ".cfsharp.lock", FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using SqlitePathHandleLease lease = SqlitePathHandleLease.Open(_databasePath);
+        await SqliteSchema.InitializeAsync(connection, 5000, _databasePath, _syncRootPath, CancellationToken.None);
+        await using (SqliteCloudStateStore store = new(connection, _databasePath, owner, lease))
+        {
+            await using ICloudStateTransaction failed = await store.BeginTransactionAsync();
+            await failed.Checkpoints.UpsertAsync(new("uncommitted", new byte[] { 51 }, DateTimeOffset.UtcNow));
+            Assert.Equal(raw.SQLITE_OK, raw.sqlite3_set_authorizer(connection.Handle, DenyTransactionCommand("ROLLBACK"), null));
+            SqliteCloudStateStoreException rollback = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(async () => await failed.RollbackAsync());
+            Assert.Equal(raw.SQLITE_AUTH, rollback.SqliteErrorCode);
+            Assert.Equal(0, raw.sqlite3_get_autocommit(connection.Handle));
+
+            SqliteCloudStateStoreException begin = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(async () => await store.BeginTransactionAsync());
+            Assert.Same(rollback.InnerException, begin.InnerException);
+            await RequireOpenFailureAsync(_databasePath, CreateContext(), SqliteCloudStateStoreError.AlreadyInUse);
+        }
+
+        Assert.Null(connection.Handle);
+        await using ICloudStateStore reopened = await CreateFactory().OpenAsync(CreateContext());
+        await AssertOwnershipStateAsync(reopened);
+        await using ICloudStateTransaction read = await reopened.BeginTransactionAsync();
+        Assert.Null(await read.Checkpoints.GetAsync("uncommitted"));
+    }
+
+    [Fact]
+    public async Task StatementRollbackCannotTurnLaterRepositoryWritesIntoAutocommit()
+    {
+        await SeedOwnershipAsync();
+        await ExecuteSqlAsync(_databasePath, """
+            CREATE TRIGGER reject_checkpoint BEFORE INSERT ON checkpoints
+            WHEN NEW.name = 'reject' BEGIN SELECT RAISE(ROLLBACK, 'checkpoint rejected'); END;
+            """);
+        await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
+        await using (ICloudStateTransaction transaction = await store.BeginTransactionAsync())
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            await transaction.Checkpoints.UpsertAsync(new("before", new byte[] { 31 }, now));
+            SqliteCloudStateStoreException failure = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(async () =>
+                await transaction.Checkpoints.UpsertAsync(new("reject", new byte[] { 32 }, now)));
+            Assert.Equal(raw.SQLITE_CONSTRAINT_TRIGGER, failure.SqliteExtendedErrorCode);
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await transaction.Checkpoints.UpsertAsync(new("after", new byte[] { 33 }, now)));
+        }
+
+        await AssertOwnershipStateAsync(store);
+        await using ICloudStateTransaction read = await store.BeginTransactionAsync();
+        foreach (string name in new[] { "before", "reject", "after" })
+        {
+            Assert.Null(await read.Checkpoints.GetAsync(name));
+        }
+    }
+
+    private static strdelegate_authorizer DenyTransactionCommand(string command) =>
+        (_, operation, argument, _, _, _) => operation == raw.SQLITE_TRANSACTION && argument == command ? raw.SQLITE_DENY : raw.SQLITE_OK;
 
     [Fact]
     public async Task AbruptProcessExitPreservesOnlyDurableWritesAcrossWalRecovery()

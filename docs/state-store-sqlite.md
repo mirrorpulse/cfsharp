@@ -45,6 +45,10 @@ Dispose an uncommitted transaction to roll back. Windows namespace operations an
 cannot be one physical transaction; if the namespace succeeds and the store fails, the managed
 exception identifies the coordination boundary so the application can reconcile.
 
+After a transaction fails, the provider checks whether SQLite already rolled it back. If SQLite
+still has an active transaction and rollback fails, the store rejects further transactions.
+Dispose and reopen it to continue. Closing the connection discards the remaining uncommitted work.
+
 Dispose the store after its last transaction ends. Before closing the connection and releasing
 file ownership, disposal asks SQLite to checkpoint and truncate the WAL without waiting for
 other clients. If a direct SQLite client prevents checkpointing all frames, the remaining

@@ -404,6 +404,7 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
     private readonly SqlitePathHandleLease _databaseLease;
     private readonly SemaphoreSlim _transactionGate = new(1, 1);
     private int _activeTransactions;
+    private Exception? _unfinishedTransaction;
     private bool _disposed;
 
     internal SqliteCloudStateStore(
@@ -431,23 +432,24 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
                 ObjectDisposedException.ThrowIf(true, this);
             }
 
+            if (_unfinishedTransaction is { } failure)
+            {
+                _transactionGate.Release();
+                throw SqliteSchema.TranslateFailure(_databasePath,
+                    "A previous SQLite transaction could not be rolled back. Dispose and reopen the store.", failure);
+            }
+
             _activeTransactions++;
         }
 
         try
         {
-            SqliteTransaction transaction = (SqliteTransaction)await _connection
-                .BeginTransactionAsync(cancellationToken)
-                .ConfigureAwait(false);
-            return new SqliteCloudStateTransaction(
-                _connection,
-                transaction,
-                _databasePath,
-                OnTransactionCompleted);
+            return await SqliteCloudStateTransaction.BeginAsync(_connection, _databasePath,
+                OnTransactionCompleted, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
-            OnTransactionCompleted();
+            OnTransactionCompleted(SqliteCloudStateTransaction.IsNativeTransactionActive(_connection) ? exception : null);
             if (exception is OperationCanceledException or SqliteCloudStateStoreException)
             {
                 throw;
@@ -480,7 +482,12 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
             {
                 try
                 {
-                    SqliteWalLifetime.Checkpoint(_connection);
+                    // An incomplete rollback fences transaction admission. Closing the native
+                    // connection rolls back that transaction and leaves committed WAL frames intact.
+                    if (!SqliteCloudStateTransaction.IsNativeTransactionActive(_connection))
+                    {
+                        SqliteWalLifetime.Checkpoint(_connection);
+                    }
                 }
                 finally
                 {
@@ -507,10 +514,11 @@ internal sealed class SqliteCloudStateStore : ICloudStateStore
         }
     }
 
-    private void OnTransactionCompleted()
+    private void OnTransactionCompleted(Exception? unfinished)
     {
         lock (_lifecycleGate)
         {
+            _unfinishedTransaction = unfinished;
             _activeTransactions--;
         }
 
