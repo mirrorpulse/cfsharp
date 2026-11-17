@@ -9,13 +9,13 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
 {
     private readonly SqliteConnection _connection;
     private readonly string _databasePath;
-    private readonly Action<Exception?> _completed;
+    private readonly Action<Exception?>? _completed;
     private int _terminal;
 
     private SqliteCloudStateTransaction(
         SqliteConnection connection,
         string databasePath,
-        Action<Exception?> completed)
+        Action<Exception?>? completed)
     {
         _connection = connection;
         _databasePath = databasePath;
@@ -43,7 +43,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
     internal static async ValueTask<SqliteCloudStateTransaction> BeginAsync(
         SqliteConnection connection,
         string databasePath,
-        Action<Exception?> completed,
+        Action<Exception?>? completed,
         CancellationToken cancellationToken)
     {
         // This connection runs one immediate transaction at a time. Use SQLite's native
@@ -198,7 +198,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         cleanupFailure ??= unfinished;
         try
         {
-            _completed(unfinished);
+            _completed?.Invoke(unfinished);
         }
         catch (Exception exception)
         {

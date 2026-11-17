@@ -107,9 +107,15 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
     /// incompatible, or SQLite could not initialize it. SQLite result codes are retained when
     /// available.
     /// </exception>
-    public async ValueTask<ICloudStateStore> OpenAsync(
+    public ValueTask<ICloudStateStore> OpenAsync(
         CloudStateStoreContext context,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        OpenAsync(context, static connectionString => new SqliteConnection(connectionString), cancellationToken);
+
+    internal async ValueTask<ICloudStateStore> OpenAsync(
+        CloudStateStoreContext context,
+        Func<string, SqliteConnection> createConnection,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
         cancellationToken.ThrowIfCancellationRequested();
@@ -170,7 +176,7 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         {
             cancellationToken.ThrowIfCancellationRequested();
             ValidateSafeLocation(context.SyncRootPath);
-            connection = new SqliteConnection(CreateConnectionString());
+            connection = createConnection(CreateConnectionString());
             await SqliteSchema.InitializeAsync(
                 connection,
                 _busyTimeoutMilliseconds,
@@ -194,8 +200,13 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
             }
             finally
             {
-                databaseLease?.Dispose();
-                await ownerLock.DisposeAsync().ConfigureAwait(false);
+                // Close rolls back any remaining native transaction. Release file ownership
+                // only after SQLite has relinquished its connection handle.
+                if (connection?.Handle is null)
+                {
+                    databaseLease.Dispose();
+                    await ownerLock.DisposeAsync().ConfigureAwait(false);
+                }
             }
 
             throw;
@@ -814,6 +825,11 @@ internal static class SqliteSchema
     internal const int CurrentVersion = 9;
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
+    private static ValueTask<SqliteCloudStateTransaction> BeginSchemaTransactionAsync(
+        SqliteConnection connection, string databasePath, CancellationToken cancellationToken) =>
+        // Initialization owns the connection exclusively and closes it on any migration error.
+        SqliteCloudStateTransaction.BeginAsync(connection, databasePath, completed: null, cancellationToken);
+
     internal static async Task InitializeAsync(
         SqliteConnection connection,
         int busyTimeoutMilliseconds,
@@ -850,6 +866,7 @@ internal static class SqliteSchema
 
                 await CreateVersionOneAsync(
                     connection,
+                    databasePath,
                     syncRootPath,
                     addSyncRootColumn: false,
                     schemaVersion: CurrentVersion,
@@ -871,25 +888,25 @@ internal static class SqliteSchema
 
             if (version < 1)
             {
-                await MigrateVersionZeroAsync(connection, syncRootPath, cancellationToken)
+                await MigrateVersionZeroAsync(connection, databasePath, syncRootPath, cancellationToken)
                     .ConfigureAwait(false);
             }
 
             if (version < 2)
             {
-                await MigrateVersionTwoAsync(connection, cancellationToken)
+                await MigrateVersionTwoAsync(connection, databasePath, cancellationToken)
                     .ConfigureAwait(false);
             }
 
             if (version < 3)
             {
-                await MigrateVersionThreeAsync(connection, cancellationToken)
+                await MigrateVersionThreeAsync(connection, databasePath, cancellationToken)
                     .ConfigureAwait(false);
             }
 
             if (version < 4)
             {
-                await MigrateVersionFourAsync(connection, cancellationToken)
+                await MigrateVersionFourAsync(connection, databasePath, cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -935,7 +952,7 @@ internal static class SqliteSchema
 
             if (version < 9)
             {
-                await MigrateVersionNineAsync(connection, cancellationToken).ConfigureAwait(false);
+                await MigrateVersionNineAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
             }
 
             await ValidateCurrentVersionAsync(
@@ -986,26 +1003,21 @@ internal static class SqliteSchema
 
     private static async Task CreateVersionOneAsync(
         SqliteConnection connection,
+        string databasePath,
         string syncRootPath,
         bool addSyncRootColumn,
         int schemaVersion,
         CancellationToken cancellationToken)
     {
-        await using SqliteTransaction transaction = (SqliteTransaction)await connection
-            .BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
         if (addSyncRootColumn)
         {
-            await using SqliteCommand alterCommand = connection.CreateCommand();
-            alterCommand.Transaction = transaction;
-            alterCommand.CommandText =
-                "ALTER TABLE cfsharp_schema ADD COLUMN sync_root_path TEXT NULL;";
+            await using SqliteCommand alterCommand = transaction.CreateCommand(
+                "ALTER TABLE cfsharp_schema ADD COLUMN sync_root_path TEXT NULL;", cancellationToken);
             await alterCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await using SqliteCommand command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        await using SqliteCommand command = transaction.CreateCommand("""
             CREATE TABLE IF NOT EXISTS cfsharp_schema (
                 singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL,
@@ -1089,7 +1101,7 @@ internal static class SqliteSchema
             ON CONFLICT(singleton) DO UPDATE SET
                 version = excluded.version,
                 sync_root_path = excluded.sync_root_path;
-            """;
+            """, cancellationToken);
         command.Parameters.AddWithValue("$sync_root_path", syncRootPath);
         command.Parameters.AddWithValue("$version", schemaVersion);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -1098,6 +1110,7 @@ internal static class SqliteSchema
 
     private static async Task MigrateVersionZeroAsync(
         SqliteConnection connection,
+        string databasePath,
         string syncRootPath,
         CancellationToken cancellationToken)
     {
@@ -1108,6 +1121,7 @@ internal static class SqliteSchema
             cancellationToken).ConfigureAwait(false);
         await CreateVersionOneAsync(
             connection,
+            databasePath,
             syncRootPath,
             addSyncRootColumn: !syncRootColumnExists,
             schemaVersion: 1,
@@ -1127,6 +1141,7 @@ internal static class SqliteSchema
 
     private static async Task MigrateVersionTwoAsync(
         SqliteConnection connection,
+        string databasePath,
         CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "remote_batches", cancellationToken)
@@ -1135,33 +1150,25 @@ internal static class SqliteSchema
             return;
         }
 
-        await using SqliteTransaction transaction = (SqliteTransaction)await connection
-            .BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
         if (!await ColumnExistsAsync(connection, "remote_batches", "fingerprint", cancellationToken)
                 .ConfigureAwait(false))
         {
-            await using SqliteCommand addFingerprint = connection.CreateCommand();
-            addFingerprint.Transaction = transaction;
-            addFingerprint.CommandText =
-                "ALTER TABLE remote_batches ADD COLUMN fingerprint BLOB NOT NULL DEFAULT X'';";
+            await using SqliteCommand addFingerprint = transaction.CreateCommand(
+                "ALTER TABLE remote_batches ADD COLUMN fingerprint BLOB NOT NULL DEFAULT X'';", cancellationToken);
             await addFingerprint.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
         if (!await ColumnExistsAsync(connection, "remote_batches", "last_change_id", cancellationToken)
                 .ConfigureAwait(false))
         {
-            await using SqliteCommand addLastChange = connection.CreateCommand();
-            addLastChange.Transaction = transaction;
-            addLastChange.CommandText =
-                "ALTER TABLE remote_batches ADD COLUMN last_change_id TEXT NULL;";
+            await using SqliteCommand addLastChange = transaction.CreateCommand(
+                "ALTER TABLE remote_batches ADD COLUMN last_change_id TEXT NULL;", cancellationToken);
             await addLastChange.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await using SqliteCommand updateVersion = connection.CreateCommand();
-        updateVersion.Transaction = transaction;
-        updateVersion.CommandText =
-            "UPDATE cfsharp_schema SET version = $version WHERE singleton = 1;";
+        await using SqliteCommand updateVersion = transaction.CreateCommand(
+            "UPDATE cfsharp_schema SET version = $version WHERE singleton = 1;", cancellationToken);
         updateVersion.Parameters.AddWithValue("$version", 2);
         await updateVersion.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1169,6 +1176,7 @@ internal static class SqliteSchema
 
     private static async Task MigrateVersionThreeAsync(
         SqliteConnection connection,
+        string databasePath,
         CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "echo_suppressions", cancellationToken)
@@ -1177,19 +1185,15 @@ internal static class SqliteSchema
             return;
         }
 
-        await using SqliteTransaction transaction = (SqliteTransaction)await connection
-            .BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
+        await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
         if (!await ColumnExistsAsync(
                 connection,
                 "echo_suppressions",
                 "previous_relative_path",
                 cancellationToken).ConfigureAwait(false))
         {
-            await using SqliteCommand addPreviousPath = connection.CreateCommand();
-            addPreviousPath.Transaction = transaction;
-            addPreviousPath.CommandText =
-                "ALTER TABLE echo_suppressions ADD COLUMN previous_relative_path TEXT NULL COLLATE CFSHARP_UNICODE_NOCASE;";
+            await using SqliteCommand addPreviousPath = transaction.CreateCommand(
+                "ALTER TABLE echo_suppressions ADD COLUMN previous_relative_path TEXT NULL COLLATE CFSHARP_UNICODE_NOCASE;", cancellationToken);
             await addPreviousPath.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -1199,17 +1203,13 @@ internal static class SqliteSchema
                 "remaining_observations",
                 cancellationToken).ConfigureAwait(false))
         {
-            await using SqliteCommand addRemaining = connection.CreateCommand();
-            addRemaining.Transaction = transaction;
-            addRemaining.CommandText =
-                "ALTER TABLE echo_suppressions ADD COLUMN remaining_observations INTEGER NOT NULL DEFAULT 1;";
+            await using SqliteCommand addRemaining = transaction.CreateCommand(
+                "ALTER TABLE echo_suppressions ADD COLUMN remaining_observations INTEGER NOT NULL DEFAULT 1;", cancellationToken);
             await addRemaining.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await using SqliteCommand updateVersion = connection.CreateCommand();
-        updateVersion.Transaction = transaction;
-        updateVersion.CommandText =
-            "UPDATE cfsharp_schema SET version = $version WHERE singleton = 1;";
+        await using SqliteCommand updateVersion = transaction.CreateCommand(
+            "UPDATE cfsharp_schema SET version = $version WHERE singleton = 1;", cancellationToken);
         updateVersion.Parameters.AddWithValue("$version", 3);
         await updateVersion.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1217,6 +1217,7 @@ internal static class SqliteSchema
 
     private static async Task MigrateVersionFourAsync(
         SqliteConnection connection,
+        string databasePath,
         CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "items", cancellationToken).ConfigureAwait(false))
@@ -1224,22 +1225,19 @@ internal static class SqliteSchema
             return;
         }
 
-        await using SqliteTransaction transaction = (SqliteTransaction)await connection
-            .BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
-        await using SqliteCommand createIndex = connection.CreateCommand();
-        createIndex.Transaction = transaction;
-        createIndex.CommandText = """
+        await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
+        await using SqliteCommand createIndex = transaction.CreateCommand("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_items_relative_path_unicode_nocase
                 ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE);
             UPDATE cfsharp_schema SET version = 4 WHERE singleton = 1;
-            """;
+            """, cancellationToken);
         await createIndex.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task MigrateVersionNineAsync(
         SqliteConnection connection,
+        string databasePath,
         CancellationToken cancellationToken)
     {
         if (!await TableExistsAsync(connection, "items", cancellationToken).ConfigureAwait(false))
@@ -1259,12 +1257,8 @@ internal static class SqliteSchema
 
         try
         {
-            await using SqliteTransaction transaction = (SqliteTransaction)await connection
-                .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            await using (SqliteCommand rebuild = connection.CreateCommand())
-            {
-                rebuild.Transaction = transaction;
-                rebuild.CommandText = """
+            await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
+            await using (SqliteCommand rebuild = transaction.CreateCommand("""
                     CREATE TABLE items_generation_upgrade (
                         item_id TEXT NOT NULL PRIMARY KEY,
                         remote_id TEXT NOT NULL UNIQUE,
@@ -1286,14 +1280,13 @@ internal static class SqliteSchema
                         ON items(relative_path COLLATE CFSHARP_UNICODE_NOCASE, is_tombstone,
                             updated_at_ticks DESC, item_id);
                     UPDATE cfsharp_schema SET version = 9 WHERE singleton = 1;
-                    """;
+                    """, cancellationToken))
+            {
                 await rebuild.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await using (SqliteCommand check = connection.CreateCommand())
+            await using (SqliteCommand check = transaction.CreateCommand("PRAGMA foreign_key_check;", cancellationToken))
             {
-                check.Transaction = transaction;
-                check.CommandText = "PRAGMA foreign_key_check;";
                 await using SqliteDataReader reader = await check.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
@@ -1305,9 +1298,14 @@ internal static class SqliteSchema
         }
         finally
         {
-            await using SqliteCommand enable = connection.CreateCommand();
-            enable.CommandText = "PRAGMA foreign_keys = ON;";
-            await enable.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+            // A failed rollback leaves the connection for initialization cleanup. A PRAGMA
+            // inside that transaction cannot turn foreign-key enforcement back on.
+            if (!SqliteCloudStateTransaction.IsNativeTransactionActive(connection))
+            {
+                await using SqliteCommand enable = connection.CreateCommand();
+                enable.CommandText = "PRAGMA foreign_keys = ON;";
+                await enable.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+            }
         }
     }
 
