@@ -9,11 +9,18 @@ internal static class SqliteOwnershipProcess
         {
             if (arguments[2] == "ownership-provider-startup")
             {
+                if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
+                {
+                    throw new PlatformNotSupportedException("Configured Cloud Files dependency verification requires Windows 10 version 1709 or later.");
+                }
                 string parent = Path.GetDirectoryName(arguments[0])!;
                 if (Directory.Exists(parent)) { throw new InvalidOperationException("The configuration-only fixture already exists."); }
                 SqliteCloudStateStoreFactory factory = new(arguments[0]);
+                await using CloudFileSystem configured = CloudFileSystem.CreateBuilder(arguments[1]).WithStateStore(factory).Build();
                 string?[] loaded = AppDomain.CurrentDomain.GetAssemblies().Select(assembly => assembly.GetName().Name).ToArray();
-                if (Directory.Exists(parent) || !loaded.Contains("System.Runtime.InteropServices.RuntimeInformation", StringComparer.Ordinal))
+                if (configured.LifecycleState != CloudFileSystemLifecycleState.Created || Directory.Exists(parent) ||
+                    !loaded.Contains("System.Runtime.InteropServices.RuntimeInformation", StringComparer.Ordinal) ||
+                    !loaded.Contains("System.IO.FileSystem.AccessControl", StringComparer.Ordinal))
                 {
                     throw new InvalidOperationException("Provider dependencies must initialize before any database file access.");
                 }

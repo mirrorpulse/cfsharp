@@ -1,5 +1,11 @@
 # Protected local operations
 
+Build `CloudFileSystem` in an application identity that can read its deployed assemblies before
+entering an impersonated namespace role. Construction resolves the managed access-descriptor types
+used by protected callbacks, without reading or changing a descriptor or opening the state store.
+An impersonated MSIX identity can have different access to packaged framework assemblies even
+when it represents the same local user; callback return types must be available before that boundary.
+
 `CloudItem.RunProtectedLocalOperationAsync` awaits short application work while CfSharp retains
 facade path admission, official state-store ownership and the original Windows file object.
 Capture and durably retain the original `CloudLocalFileBinding` before beginning an operation.

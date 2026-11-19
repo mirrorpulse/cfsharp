@@ -1,5 +1,7 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 
 namespace CfSharp;
 
@@ -13,6 +15,11 @@ namespace CfSharp;
 /// configured durable state store, opens or registers the persistent sync root, and optionally
 /// connects a content provider. The state-store factory is never called for invalid local-root or
 /// builder configuration.
+/// </para>
+/// <para>
+/// Construction resolves managed access-descriptor types without reading or changing permissions.
+/// Build the file system while the application identity can read its deployed assemblies, before
+/// entering an impersonated execution context that may have different access to packaged binaries.
 /// </para>
 /// <para>
 /// A successfully opened state store and provider session are owned exclusively by this instance.
@@ -67,6 +74,11 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         _contentProvider = contentProvider;
         _runtime = runtime;
         _protectedLocalStopping = _contentConfirmationStopping.Token;
+        // Protected access-descriptor callbacks expose FileSystemSecurity to the caller.
+        // Resolve that managed contract before an impersonated MSIX startup can JIT the
+        // callback; resolving its return type there can otherwise fail before our API runs.
+        // Type initialization reads no descriptor and acquires no filesystem resource.
+        RuntimeHelpers.RunClassConstructor(typeof(FileSystemSecurity).TypeHandle);
     }
 
     /// <summary>Gets the normalized absolute path of the managed sync root.</summary>
@@ -824,6 +836,10 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
         /// </returns>
         /// <exception cref="DirectoryNotFoundException">The local root does not exist.</exception>
         /// <exception cref="InvalidOperationException">No state-store factory was configured.</exception>
+        /// <exception cref="TypeInitializationException">
+        /// A managed runtime dependency could not initialize. The original loader or initialization
+        /// failure is retained as the inner exception.
+        /// </exception>
         public CloudFileSystem Build()
         {
             if (!Directory.Exists(_syncRootPath))
