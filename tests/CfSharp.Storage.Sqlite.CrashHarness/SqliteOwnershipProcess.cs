@@ -7,6 +7,24 @@ internal static class SqliteOwnershipProcess
     {
         try
         {
+            if (arguments[2] == "ownership-provider-startup")
+            {
+                string parent = Path.GetDirectoryName(arguments[0])!;
+                if (Directory.Exists(parent)) { throw new InvalidOperationException("The configuration-only fixture already exists."); }
+                SqliteCloudStateStoreFactory factory = new(arguments[0]);
+                string?[] loaded = AppDomain.CurrentDomain.GetAssemblies().Select(assembly => assembly.GetName().Name).ToArray();
+                if (Directory.Exists(parent) || !loaded.Contains("System.Runtime.InteropServices.RuntimeInformation", StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException("Provider dependencies must initialize before any database file access.");
+                }
+                await using (ICloudStateStore initial = await factory.OpenAsync(new(arguments[1])))
+                {
+                    await using ICloudStateTransaction write = await initial.BeginTransactionAsync();
+                    await write.Checkpoints.UpsertAsync(new("ownership", new byte[] { 11, 22 }, DateTimeOffset.UtcNow));
+                    await write.CommitAsync();
+                }
+                Console.WriteLine("ProviderInitializedBeforeStoreIO");
+            }
             await using ICloudStateStore store = await new SqliteCloudStateStoreFactory(arguments[0])
                 .OpenAsync(new CloudStateStoreContext(arguments[1]));
             await VerifyCheckpointAsync(store);

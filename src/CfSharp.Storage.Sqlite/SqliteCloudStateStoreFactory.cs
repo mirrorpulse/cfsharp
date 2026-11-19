@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
@@ -38,6 +39,12 @@ namespace CfSharp.Storage.Sqlite;
 /// each transaction and its repositories remain single-consumer objects as required by the core
 /// state-store contract. This provider supports Windows only.
 /// </para>
+/// <para>
+/// Construction initializes Microsoft.Data.Sqlite and the bundled provider,
+/// without opening a database or acquiring file ownership. Construct the factory in an application
+/// identity that can read the deployed binaries before using it in an impersonated execution context.
+/// Opening and all file access still run under the caller's identity; the factory never changes tokens.
+/// </para>
 /// </remarks>
 public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
 {
@@ -58,6 +65,10 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">
     /// The timeout is not positive or exceeds the SQLite integer millisecond range.
+    /// </exception>
+    /// <exception cref="TypeInitializationException">
+    /// SQLite or its runtime dependencies could not initialize. The original
+    /// loader or native initialization exception is retained as the inner exception.
     /// </exception>
     public SqliteCloudStateStoreFactory(string databasePath, TimeSpan? busyTimeout = null)
     {
@@ -86,6 +97,14 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         DatabasePath = normalizedPath;
         BusyTimeout = selectedTimeout;
         _busyTimeoutMilliseconds = checked((int)Math.Ceiling(selectedTimeout.TotalMilliseconds));
+        // SQLite's provider can be marked beforefieldinit: opening a connection need not run
+        // the initializer used by its variadic db_config path. Defer neither initializer to
+        // OpenAsync, which can run under an impersonation token unable to read MSIX binaries.
+        // Initialize Microsoft.Data.Sqlite through its normal type initializer, without replacing its
+        // provider explicitly or reverting impersonation. No database, connection, path guard
+        // or ownership lock is opened here.
+        RuntimeHelpers.RunClassConstructor(typeof(SqliteConnection).TypeHandle);
+        RuntimeHelpers.RunClassConstructor(typeof(SQLite3Provider_e_sqlite3).TypeHandle);
     }
 
     /// <summary>Gets the normalized absolute database path.</summary>
