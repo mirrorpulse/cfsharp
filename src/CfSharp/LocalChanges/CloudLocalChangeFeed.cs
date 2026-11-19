@@ -16,7 +16,7 @@ namespace CfSharp;
 /// <para>
 /// Windows directory notifications are advisory. Buffer overflow, watcher errors, inaccessible paths, and malformed
 /// rename pairs produce <see cref="CloudLocalChangeBatch.RequiresFullRescan"/>. A permanently
-/// failed security subscription stops this feed. Dispose and recreate it before resuming. Applications
+/// failed metadata subscription stops this feed. Dispose and recreate it before resuming. Applications
 /// must perform a full reconciliation before acknowledging loss; periodic reconciliation is
 /// intentionally outside CfSharp.
 /// </para>
@@ -25,7 +25,7 @@ namespace CfSharp;
 /// observation commit in one transaction. Ancestor native bindings, immutable directory recovery
 /// evidence and existing pending operations remain unchanged. Shared ancestors are refreshed once.
 /// First discovery of a local file or directory also refreshes captured ancestor membership in
-/// its item/journal transaction, without inferring a managed native binding for that local item.
+/// its item/journal transaction, retaining its native file reference when that can be observed.
 /// </para>
 /// </remarks>
 public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
@@ -57,6 +57,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private long _nextObservation;
     private int _rescanNoticeDelivered;
     private Exception? _failure;
+    private int _terminalSourceSignaled;
     private int _overflowSignaled;
     private int _started;
     private int _disposed;
@@ -661,6 +662,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     cancellationToken, classifyModified: true).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
+            case LocalChangeSourceAction.AttributesModified:
                 await PersistChangeAsync(
                     CloudLocalChangeKind.MetadataUpdate,
                     sourceEvent.RelativePath,
@@ -868,7 +870,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (securityObservation is { } securityEvent)
         {
             SecurityFeedProjection? projection = uncertainDirectory is null
-                ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity) : null;
+                ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity,
+                    allowOrdinary: securityEvent.Action == LocalChangeSourceAction.AttributesModified) : null;
             if (projection is not null)
             {
                 try
@@ -984,7 +987,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 path.RelativePath,
                 Directory.Exists(path.FullPath) ? CloudItemKind.Directory : CloudItemKind.File,
                 remoteRevision: null,
-                localFileId: null,
+                localFileId: TryReadDiscoveredFileId(path),
                 isTombstone: false,
                 observedAt);
         }
@@ -1116,20 +1119,22 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PublishAsync(LocalChangeSourceEvent sourceEvent)
     {
-        if (Volatile.Read(ref _failure) is not null) { return; }
-
-        if (sourceEvent.Action == LocalChangeSourceAction.SecuritySubscriptionFailed)
+        if (sourceEvent.Action is LocalChangeSourceAction.SecuritySubscriptionFailed or LocalChangeSourceAction.AttributeSubscriptionFailed)
         {
-            // Complete out of band: a full notification buffer must not turn permanent
-            // subscription loss into an ordinary overflow. Accepted events drain before
-            // the worker persists the terminal loss; readers fail immediately.
+            if (Interlocked.Exchange(ref _terminalSourceSignaled, 1) != 0) { return; }
+            // Fail readers out of band, but close the input only after every subscription
+            // drains. Another native pump may already hold a decoded historical batch.
+            // Completing the channel here would discard that batch when subscriptions
+            // terminate concurrently (for example, after the watched root is deleted).
             Win32Exception failure = new(sourceEvent.ErrorCode);
             SignalLoss();
             Interlocked.CompareExchange(ref _failure, failure, null);
-            _sourceEvents.Writer.TryComplete(failure);
             _availability.Writer.TryComplete();
+            _ = CompleteFailedSourceAsync(failure);
             return;
         }
+
+        if (Volatile.Read(ref _failure) is not null && Volatile.Read(ref _terminalSourceSignaled) == 0) { return; }
 
         if (sourceEvent.Action is LocalChangeSourceAction.Overflow or LocalChangeSourceAction.Error)
         {
@@ -1144,6 +1149,17 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         Interlocked.Exchange(ref _overflowSignaled, 1);
         SignalLoss();
         await ValueTask.CompletedTask;
+    }
+
+    private async Task CompleteFailedSourceAsync(Exception failure)
+    {
+        try { await _source.DisposeAsync().ConfigureAwait(false); }
+        catch
+        {
+            // Keep the first native error. The terminal channel completion persists the
+            // full-rescan fence even if stopping another subscription also fails.
+        }
+        finally { _sourceEvents.Writer.TryComplete(failure); }
     }
 
     private async ValueTask LoadCheckpointAsync(CancellationToken cancellationToken)

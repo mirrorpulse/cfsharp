@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.ComponentModel;
 
 using CfSharp.Native;
@@ -98,7 +99,7 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private SecurityFeedProjection? TryBindSecurityObservation(CloudItemPath path, CloudItemState? state,
-        LocalSecurityChangeIdentity? identity)
+        LocalSecurityChangeIdentity? identity, bool allowOrdinary = false)
     {
         // Official creation/conversion rows can omit LocalFileId. The kernel/native ID match
         // remains mandatory; the placeholder blob binds that object to the official identity.
@@ -117,11 +118,15 @@ public sealed partial class CloudLocalChangeFeed
             guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
             LocalCloudItemInspection observed = _securityInspection?.Invoke(guard, path.FullPath, state.Kind, _syncRootPath)
                 ?? CloudItemInspector.Inspect(guard, path.FullPath, state.Kind, _syncRootPath);
-            if (observed.LocalFileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
+            long? fileId = observed.LocalFileId ?? NtfsFileId(observed.LocalBinding);
+            bool placeholderMatches = CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) &&
+                placeholder.ItemId == state.ItemId && string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal);
+            bool ordinaryMatches = allowOrdinary && observed.PlaceholderIdentity.Length == 0 &&
+                !observed.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder) && state.LocalFileId == fileId;
+            if (fileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
                 observed.LocalBinding?.VolumeSerialNumber != identity.Value.VolumeSerialNumber ||
                 observed.LocalBinding?.SyncRootFileId != identity.Value.RootFileId ||
-                !CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
-                placeholder.ItemId != state.ItemId || !string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal))
+                (!placeholderMatches && !ordinaryMatches))
             { return null; }
             SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection);
             guard = null;
@@ -140,6 +145,39 @@ public sealed partial class CloudLocalChangeFeed
             guard?.Dispose();
             parents?.Dispose();
         }
+    }
+
+    private long? TryReadDiscoveredFileId(CloudItemPath path)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { return null; }
+        try
+        {
+            // The earlier lexical/physical path walk is not an ancestry lease. Bind the
+            // reference only while parent replacements and renames of this object are barred.
+            using CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]);
+            using SafeFileHandle guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            CloudItemKind kind = (WindowsFileMetadata.ReadBasic(guard.DangerousGetHandle()).Attributes & 0x10) != 0
+                ? CloudItemKind.Directory : CloudItemKind.File;
+            LocalCloudItemInspection observed = CloudItemInspector.Inspect(guard, path.FullPath, kind, _syncRootPath);
+            return observed.LocalFileId ?? NtfsFileId(observed.LocalBinding);
+        }
+        catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            // Discovery still records the ordinary notification. Without a native binding,
+            // a later independent metadata record must remain unbound for reconciliation.
+            return null;
+        }
+    }
+
+    private static long? NtfsFileId(CloudLocalFileBinding? binding)
+    {
+        if (binding is null) { return null; }
+        Span<byte> id = stackalloc byte[16];
+        binding.LocalFileId.TryWriteBytes(id);
+        // NTFS extended notifications carry the 64-bit file reference. Use the full
+        // generation-bearing value only when the native 128-bit ID fits exactly.
+        return BinaryPrimitives.ReadUInt64LittleEndian(id[8..]) == 0
+            ? BinaryPrimitives.ReadInt64LittleEndian(id) : null;
     }
 
     private sealed class SecurityFeedProjection(string root, CloudItemPath path, CloudItemKind kind,

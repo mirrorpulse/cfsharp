@@ -1,13 +1,27 @@
 # Local change feed
 
-Windows security-descriptor notifications use a separate NTFS extended native subscription from data and name
-notifications, retaining the kernel's file ID and volume rather than reopening the event's path to infer origin.
-A security-only change, including a protected Access descriptor write, is delivered
+Windows attribute and security-descriptor notifications each use a separate NTFS extended native
+subscription from data and name notifications, retaining the kernel's file ID and volume rather
+than reopening the event's path to infer origin. An attribute-only or security-only change,
+including a protected Access descriptor write, is delivered
 as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
 Applications distinguish it from content work using the public kind before ACK; no private payload
 or timestamp comparison is required. Directory metadata retains the same public classification.
 Security notifications bypass provider echo suppression. The existing path and operation kind
 cannot establish that a provider write caused an independently reported DACL change.
+
+Attribute notifications follow the same identity validation, staging and reconciliation rules as
+security observations and also bypass provider echo suppression. Windows can report an attribute
+change during a rename without changing resident bytes. That observation remains metadata; the
+independent size, last-write and creation-time subscription still reports conservative content
+candidates, including same-length writes before, between or after successive renames. No content
+read, timestamp heuristic, in-sync flag or rename window suppresses a data notification. An attribute
+record delivered after its path has moved or been replaced remains an unbound metadata observation
+requiring reconciliation, rather than discovering a new object at the historical path.
+For newly discovered ordinary files and directories, the feed also retains the native NTFS file
+reference in the official item row. A later attribute record can bind to that exact object without
+requiring a placeholder identity. Older ordinary rows without that binding remain unbound until
+reconciliation; a path alone never establishes the association.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards
@@ -36,12 +50,12 @@ so concurrent consumers cannot read or acknowledge an unverified association. Fa
 or restart with an unfinished receipt journals the same operation ID without an item association.
 Later independent notifications continue to be journaled.
 
-The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
+The extended metadata subscriptions require NTFS and Windows 10 version 1709 / Windows Server 2019
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
-or a recoverable subscription error requires reconciliation. A terminal security subscription
+or a recoverable subscription error requires reconciliation. A terminal metadata subscription
 failure stops the feed, preserves the native error and fences the journal for the next feed.
 If the next native read fails to start, the decoded batch is delivered before the terminal
-notification. Disposal keeps security callbacks active until the native pump exits, allowing the
+notification. Disposal keeps metadata callbacks active until both native pumps exit, allowing the
 feed to persist terminal loss even when shutdown overlaps its delivery.
 Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
 I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
@@ -53,7 +67,7 @@ with a security write. The feed does not consume a suppression ticket, erase a p
 attribute a later object's data to an earlier Access operation. Generic ambiguous modifications
 remain content candidates; loss/error on either subscription requires reconciliation.
 
-Both subscriptions are started and disposed with the feed. Their observations are serialized into
+All three subscriptions are started and disposed with the feed. Their observations are serialized into
 the existing durable journal, preserving each retained ID, sequence and payload across restart.
 Across subscriptions, sequence order is the order observed by the feed, not a global Windows
 transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot

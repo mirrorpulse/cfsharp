@@ -163,7 +163,8 @@ public sealed partial class CloudDirectoryMoveTests
         Assert.Equal("Moved\\" + Path.GetFileName(scenario.Path), current.RelativePath);
         Assert.Equal(discovered.RemoteId, current.RemoteId);
         Assert.Equal(discovered.Kind, current.Kind);
-        Assert.Null(current.LocalFileId);
+        Assert.NotNull(discovered.LocalFileId);
+        Assert.Equal(discovered.LocalFileId, current.LocalFileId);
         Assert.Null(current.RemoteRevision);
         Assert.False(current.IsTombstone);
         await AssertCheckpointImageAsync(verify, scenario.History);
