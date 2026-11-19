@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsPackable>false</IsPackable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Deterministic>true</Deterministic>
+    <Authors>MirrorPulse Team</Authors>
+    <Copyright>Copyright (c) 2026 MirrorPulse Team</Copyright>
+  </PropertyGroup>
+</Project>

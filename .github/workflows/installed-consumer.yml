@@ -1,0 +1,82 @@
+name: Installed consumer qualification
+
+on:
+  pull_request:
+    paths:
+      - 'src/CfSharp.Storage.Sqlite/**'
+      - '.github/workflows/installed-consumer.yml'
+      - 'eng/*installed-consumer.ps1'
+      - 'eng/verify-unpackaged-consumer.ps1'
+      - 'eng/loader-trace/**'
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: 'Use packages from this CfSharp revision instead of the locked preview.14 reference'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  installed-arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - name: Check out CfSharp
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          path: library
+          persist-credentials: false
+
+      # Keep the product startup, installation and Shell acceptance source fixed across
+      # the reference and candidate runs. Only candidate package inputs are overlaid.
+      - name: Check out the reference consumer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          repository: mirrorpulse/MirrorPulse
+          ref: 12fadb56299e8c10ce3b141e2149ef7601c86807
+          path: consumer
+          persist-credentials: false
+
+      - name: Install pinned SDKs
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: |
+            10.0.401
+            10.0.403
+
+      - name: Prepare the isolated consumer
+        shell: pwsh
+        env:
+          USE_CANDIDATE: ${{ github.event_name != 'workflow_dispatch' || inputs.candidate }}
+        run: |
+          ./library/eng/prepare-installed-consumer.ps1 -ConsumerRoot ./consumer -Candidate:($env:USE_CANDIDATE -ceq 'true')
+
+      - name: Restore the locked consumer
+        working-directory: consumer
+        shell: pwsh
+        run: |
+          pwsh ./eng/restore-adapter-sdk.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned adapter SDK restore failed.' }
+          dotnet restore MirrorPulse.sln --locked-mode
+          if ($LASTEXITCODE -ne 0) { throw 'Locked consumer restore failed.' }
+          pwsh ./eng/prepare-native-ci-volume.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Disposable native volume preparation failed.' }
+
+      - name: Verify installed alias Host and Shell with external loader tracing
+        shell: pwsh
+        env:
+          GITHUB_SHA: 12fadb56299e8c10ce3b141e2149ef7601c86807
+        run: ./library/eng/verify-installed-consumer.ps1 -ConsumerRoot ./consumer
+
+      - name: Preserve qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installed-consumer-arm64
+          path: |
+            consumer/artifacts/evidence/**
+            library/artifacts/installed-consumer/inputs.json
+            library/artifacts/installed-consumer/loader.json
+          if-no-files-found: error
