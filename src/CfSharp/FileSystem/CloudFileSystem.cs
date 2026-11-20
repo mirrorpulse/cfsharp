@@ -131,7 +131,10 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                     }
                 },
                 async (scopes, cancellationToken) => await AcquireOperationCoreAsync(
-                    scopes, allowLocalChangeDrain: true, cancellationToken).ConfigureAwait(false));
+                    scopes, allowLocalChangeDrain: true, cancellationToken: cancellationToken).ConfigureAwait(false),
+                acquireAttributeOperation: async (scopes, cancellationToken) => await AcquireOperationCoreAsync(
+                    scopes, allowLocalChangeDrain: true, protectNamespace: false,
+                    cancellationToken: cancellationToken).ConfigureAwait(false));
         }
     }
 
@@ -452,6 +455,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     private async ValueTask<CloudFileSystemOperationLease> AcquireOperationCoreAsync(
         IEnumerable<CloudItemOperationScope> scopes,
         bool allowLocalChangeDrain = false,
+        bool protectNamespace = true,
         CancellationToken cancellationToken = default)
     {
         RejectProtectedLocalReentry();
@@ -482,9 +486,9 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                         this,
                         stateStore,
                         pathLease: null,
-                        pathHandleLease: CloudPathHandleLease.OpenParentChains(
+                        pathHandleLease: protectNamespace ? CloudPathHandleLease.OpenParentChains(
                             SyncRootPath,
-                            requestedScopes.Select(static scope => scope.Path)),
+                            requestedScopes.Select(static scope => scope.Path)) : null,
                         scopes: []);
                 }
                 catch
@@ -515,12 +519,14 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
             CloudItemOperationCoordinator.CloudItemOperationPathLease pathLease =
                 await _operationCoordinator.AcquireAsync(requestedScopes, cancellationToken)
                     .ConfigureAwait(false);
-            CloudPathHandleLease pathHandleLease;
+            CloudPathHandleLease? pathHandleLease;
             try
             {
-                pathHandleLease = CloudPathHandleLease.OpenParentChains(
+                // Advisory attribute observations need facade ordering and store lifetime,
+                // but must not deny external renames while awaiting journal persistence.
+                pathHandleLease = protectNamespace ? CloudPathHandleLease.OpenParentChains(
                     SyncRootPath,
-                    requestedScopes.Select(static scope => scope.Path));
+                    requestedScopes.Select(static scope => scope.Path)) : null;
             }
             catch
             {

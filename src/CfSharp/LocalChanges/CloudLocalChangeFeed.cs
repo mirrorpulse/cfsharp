@@ -39,6 +39,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private readonly ILocalChangeSource _source;
     private readonly Action<CloudLocalChangeFeed>? _onDisposed;
     private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireOperation;
+    private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireAttributeOperation;
     private readonly CloudSecurityInspection? _securityInspection;
     private readonly Channel<LocalChangeSourceEvent> _sourceEvents;
     private readonly Channel<bool> _availability = Channel.CreateUnbounded<bool>(
@@ -70,7 +71,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         ILocalChangeSource source,
         Action<CloudLocalChangeFeed>? onDisposed = null,
         Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null,
-        CloudSecurityInspection? securityInspection = null)
+        CloudSecurityInspection? securityInspection = null,
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireAttributeOperation = null)
     {
         _syncRootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(syncRootPath));
         _stateStore = stateStore;
@@ -79,6 +81,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         _source = source;
         _onDisposed = onDisposed;
         _acquireOperation = acquireOperation;
+        _acquireAttributeOperation = acquireAttributeOperation;
         _securityInspection = securityInspection;
         _sourceEvents = Channel.CreateBounded<LocalChangeSourceEvent>(
             new BoundedChannelOptions(options.BufferCapacity)
@@ -824,7 +827,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             if (staged is not null)
             {
                 staged.Projection.Validate();
-                await PublishValidatedSecurityObservationAsync(staged.Entry, cancellationToken).ConfigureAwait(false);
+                await PublishValidatedSecurityObservationAsync(staged.Entry, staged.Projection, cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -906,13 +909,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             SecurityFeedProjection? projection = uncertainDirectory is null
                 ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity,
-                    allowOrdinary: securityEvent.Action == LocalChangeSourceAction.AttributesModified) : null;
+                    attributeObservation: securityEvent.Action == LocalChangeSourceAction.AttributesModified) : null;
             if (projection is not null)
             {
                 try
                 {
                     // A committed receipt stays outside the journal until the post-commit
-                    // check succeeds. Retain both native guards until publication commits.
+                    // check succeeds. Security retains native guards; attributes retain an
+                    // identity snapshot and reopen the path without locking a pending rename.
                     LocalChangePayload bound = new(path.RelativePath, null, current!.Kind == CloudItemKind.Directory, observedAt);
                     byte[] receipt = bound.Encode();
                     CloudOperationJournalEntry boundEntry = new(operationId, CloudStateOperationKind.MetadataUpdate, current.ItemId, receipt, observedAt);

@@ -22,6 +22,12 @@ For newly discovered ordinary files and directories, the feed also retains the n
 reference in the official item row. A later attribute record can bind to that exact object without
 requiring a placeholder identity. Older ordinary rows without that binding remain unbound until
 reconciliation; a path alone never establishes the association.
+Attribute inspection uses zero-access metadata handles with delete sharing, retaining neither item
+nor ancestor handles across journal transactions. Facade operation ordering and store lifetime still apply.
+A user can rename the object or its parent while persistence waits. The feed reopens and compares
+the full native identity and physical path before binding, after staging, and inside the publication
+transaction. A changed or replaced path retains the same operation ID as an unbound observation
+requiring reconciliation. Native inspection during ordinary discovery also permits renames.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards

@@ -13,12 +13,16 @@ public sealed partial class CloudLocalChangeFeed
 
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
-    private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry, CancellationToken cancellationToken)
+    private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
+        SecurityFeedProjection projection, CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         string receipt = SecurityValidationName(entry.OperationId);
         if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
         {
+            // Acquiring the publication transaction can itself wait behind another writer.
+            // An attribute snapshot must be checked again after that wait.
+            if (projection.AllowsRename) { projection.Validate(); }
             await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
             await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -85,10 +89,12 @@ public sealed partial class CloudLocalChangeFeed
             throw new CloudNamespaceObservationUncertainException(isDirectory);
         }
 
-        if (_acquireOperation is null) { return null; }
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquire =
+            observation.Action == LocalChangeSourceAction.AttributesModified ? _acquireAttributeOperation : _acquireOperation;
+        if (acquire is null) { return null; }
         try
         {
-            return await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
+            return await acquire([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is CloudPathReparsePointException or IOException { InnerException: Win32Exception })
         {
@@ -99,7 +105,7 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private SecurityFeedProjection? TryBindSecurityObservation(CloudItemPath path, CloudItemState? state,
-        LocalSecurityChangeIdentity? identity, bool allowOrdinary = false)
+        LocalSecurityChangeIdentity? identity, bool attributeObservation = false)
     {
         // Official creation/conversion rows can omit LocalFileId. The kernel/native ID match
         // remains mandatory; the placeholder blob binds that object to the official identity.
@@ -114,21 +120,26 @@ public sealed partial class CloudLocalChangeFeed
         SafeFileHandle? guard = null;
         try
         {
-            parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]);
-            guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            if (!attributeObservation) { parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]); }
+            guard = attributeObservation ? WindowsFileMetadata.OpenMetadataReference(path.FullPath) : WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            if (attributeObservation && !MatchesAttributePath(guard, path)) { return null; }
             LocalCloudItemInspection observed = _securityInspection?.Invoke(guard, path.FullPath, state.Kind, _syncRootPath)
                 ?? CloudItemInspector.Inspect(guard, path.FullPath, state.Kind, _syncRootPath);
             long? fileId = observed.LocalFileId ?? NtfsFileId(observed.LocalBinding);
             bool placeholderMatches = CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) &&
                 placeholder.ItemId == state.ItemId && string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal);
-            bool ordinaryMatches = allowOrdinary && observed.PlaceholderIdentity.Length == 0 &&
+            bool ordinaryMatches = attributeObservation && observed.PlaceholderIdentity.Length == 0 &&
                 !observed.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder) && state.LocalFileId == fileId;
             if (fileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
                 observed.LocalBinding?.VolumeSerialNumber != identity.Value.VolumeSerialNumber ||
                 observed.LocalBinding?.SyncRootFileId != identity.Value.RootFileId ||
                 (!placeholderMatches && !ordinaryMatches))
             { return null; }
-            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection);
+            // Even an all-sharing descendant reference can interfere with a parent rename
+            // on Windows. Attribute snapshots retain identity data, not a live handle, while
+            // a transaction waits; every subsequent check opens a fresh shared reference.
+            if (attributeObservation) { guard.Dispose(); guard = null; }
+            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection, attributeObservation);
             guard = null;
             parents = null;
             return result;
@@ -152,14 +163,14 @@ public sealed partial class CloudLocalChangeFeed
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { return null; }
         try
         {
-            // The earlier lexical/physical path walk is not an ancestry lease. Bind the
-            // reference only while parent replacements and renames of this object are barred.
-            using CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]);
-            using SafeFileHandle guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            // Discovery is advisory too: observe a stable identity without excluding a user
+            // rename. A changed path cannot establish the discovered row's native reference.
+            using SafeFileHandle guard = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+            if (!MatchesAttributePath(guard, path)) { return null; }
             CloudItemKind kind = (WindowsFileMetadata.ReadBasic(guard.DangerousGetHandle()).Attributes & 0x10) != 0
                 ? CloudItemKind.Directory : CloudItemKind.File;
             LocalCloudItemInspection observed = CloudItemInspector.Inspect(guard, path.FullPath, kind, _syncRootPath);
-            return observed.LocalFileId ?? NtfsFileId(observed.LocalBinding);
+            return MatchesAttributePath(guard, path) ? observed.LocalFileId ?? NtfsFileId(observed.LocalBinding) : null;
         }
         catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
         {
@@ -167,6 +178,19 @@ public sealed partial class CloudLocalChangeFeed
             // a later independent metadata record must remain unbound for reconciliation.
             return null;
         }
+    }
+
+    private static bool MatchesAttributePath(SafeFileHandle reference, CloudItemPath path)
+    {
+        // ReadFinalPath alone can still name a deleted object's former path. Reopen with
+        // delete sharing and compare full native identities to reject a replacement there.
+        // Check physical names before calling CFAPI on a path redirected by a junction.
+        if (!string.Equals(WindowsFileMetadata.ReadFinalPath(reference.DangerousGetHandle()), path.FullPath, StringComparison.OrdinalIgnoreCase)) { return false; }
+        using SafeFileHandle current = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+        if (!string.Equals(WindowsFileMetadata.ReadFinalPath(current.DangerousGetHandle()), path.FullPath, StringComparison.OrdinalIgnoreCase)) { return false; }
+        WindowsFileMetadata.FileIdentity expected = WindowsFileMetadata.ReadIdentity(reference.DangerousGetHandle());
+        WindowsFileMetadata.FileIdentity actual = WindowsFileMetadata.ReadIdentity(current.DangerousGetHandle());
+        return expected.VolumeSerialNumber == actual.VolumeSerialNumber && expected.FileId == actual.FileId;
     }
 
     private static long? NtfsFileId(CloudLocalFileBinding? binding)
@@ -181,15 +205,20 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private sealed class SecurityFeedProjection(string root, CloudItemPath path, CloudItemKind kind,
-        LocalCloudItemInspection expected, SafeFileHandle guard, IDisposable parents, CloudSecurityInspection? inspection) : IDisposable
+        LocalCloudItemInspection expected, SafeFileHandle? guard, IDisposable? parents, CloudSecurityInspection? inspection,
+        bool allowRename) : IDisposable
     {
+        internal bool AllowsRename => allowRename;
         internal void Validate()
         {
             if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { throw new PlatformNotSupportedException(); }
             try
             {
-                LocalCloudItemInspection current = inspection?.Invoke(guard, path.FullPath, kind, root)
-                    ?? CloudItemInspector.Inspect(guard, path.FullPath, kind, root);
+                using SafeFileHandle? reference = allowRename ? WindowsFileMetadata.OpenMetadataReference(path.FullPath) : null;
+                SafeFileHandle currentHandle = reference ?? guard!;
+                if (allowRename && !MatchesAttributePath(currentHandle, path)) { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
+                LocalCloudItemInspection current = inspection?.Invoke(currentHandle, path.FullPath, kind, root)
+                    ?? CloudItemInspector.Inspect(currentHandle, path.FullPath, kind, root);
                 if (current.LocalBinding != expected.LocalBinding || current.LocalFileId != expected.LocalFileId ||
                     !current.PlaceholderIdentity.AsSpan().SequenceEqual(expected.PlaceholderIdentity))
                 { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
@@ -200,8 +229,8 @@ public sealed partial class CloudLocalChangeFeed
 
         public void Dispose()
         {
-            guard.Dispose();
-            parents.Dispose();
+            guard?.Dispose();
+            parents?.Dispose();
         }
     }
 }
