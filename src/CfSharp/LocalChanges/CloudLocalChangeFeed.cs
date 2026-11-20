@@ -123,6 +123,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <exception cref="UnauthorizedAccessException">Access to the watched directory is denied.</exception>
     /// <exception cref="System.ComponentModel.Win32Exception">Windows cannot open or start the native directory subscription; the native error is retained.</exception>
     /// <exception cref="EntryPointNotFoundException">Windows does not provide the required extended directory API.</exception>
+    /// <exception cref="NotSupportedException">A custom journal cannot clear an unvalidated item association during recovery; its evidence remains pending.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate)

@@ -79,9 +79,23 @@ public sealed partial class CloudLocalChangeFeed
             if (existing.Kind != CloudStateOperationKind.MetadataUpdate) { throw new InvalidDataException("A metadata validation receipt references a different operation kind."); }
             // The row may already have committed while its validation receipt still withheld
             // delivery. Clear only its association, preserving ordering and retry metadata.
-            await transaction.Operations.UpdateAsync(new(existing.OperationId, existing.Kind, null,
-                existing.Payload.Span, existing.CreatedAt, existing.AttemptCount, existing.RetryAfter, existing.Sequence),
-                cancellationToken).ConfigureAwait(false);
+            CloudOperationJournalEntry unbound = new(existing.OperationId, existing.Kind, null,
+                existing.Payload.Span, existing.CreatedAt, existing.AttemptCount, existing.RetryAfter, existing.Sequence);
+            await transaction.Operations.UpdateAsync(unbound, cancellationToken).ConfigureAwait(false);
+            // Older custom journals were documented to update only retries and payload.
+            // Verify read-your-writes before consuming the evidence; otherwise a full rescan
+            // could make the rejected association publicly deliverable after recovery.
+            CloudOperationJournalEntry? retained = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
+            if (retained is null || retained.ItemId is not null)
+            {
+                throw new NotSupportedException("The custom operation journal must clear an item's association during metadata recovery. The validation receipt remains pending.");
+            }
+            if (retained.OperationId != existing.OperationId || retained.Sequence != existing.Sequence || retained.Kind != existing.Kind ||
+                retained.CreatedAt != existing.CreatedAt || retained.AttemptCount != existing.AttemptCount || retained.RetryAfter != existing.RetryAfter ||
+                !retained.Payload.Span.SequenceEqual(existing.Payload.Span))
+            {
+                throw new InvalidDataException("The custom operation journal changed the original metadata observation during recovery.");
+            }
         }
 
         await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);

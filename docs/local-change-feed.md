@@ -35,6 +35,11 @@ receipt cleanup, which is bookkeeping rather than a second publication boundary.
 fails, the original row is made unbound with the same ID and sequence and requires reconciliation.
 A crash with the receipt still present recovers that same unbound row before startup completes.
 Direct state-store readers must treat rows with outstanding validation receipts as provisional.
+Recovery reads back a custom journal's `UpdateAsync` result before removing the receipt. A legacy
+journal that retains the rejected `ItemId` fails recovery with `NotSupportedException`; its transaction
+rolls back and the original evidence remains pending. Implement item-association updates in that
+journal before retrying. Recovery also rejects changes to the original ID, sequence, payload or retry
+metadata. A full-rescan acknowledgement cannot bypass an incomplete startup/recovery.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards
