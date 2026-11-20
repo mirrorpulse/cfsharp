@@ -101,6 +101,11 @@ exception is available separately in `Exception.Data["CfSharp.LocalChangeFeed.St
 the `cfsharp.local-change-feed.startup-cleanup` diagnostic activity reports its type and HRESULT
 without paths. If persisting the loss marker failed, keep the store open and retry disposal before
 recreating the feed. A failing diagnostic listener cannot change the startup result.
+The native source applies the same exception preservation when a later subscription fails after
+an earlier one opened. Its cleanup failure is retained under
+`Exception.Data["CfSharp.LocalChangeSource.StartupCleanupFailure"]` and the
+`cfsharp.local-change-source.startup-cleanup` diagnostic activity. Source and feed cleanup failures
+have separate keys; neither can replace the original subscription exception or native error code.
 Across subscriptions, sequence order is the order observed by the feed, not a global Windows
 transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
 infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and

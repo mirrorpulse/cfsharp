@@ -76,6 +76,48 @@ public sealed partial class CloudLocalChangeFeedTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task PartialNativeSubscriptionFailureKeepsItsOriginalErrorWhenCleanupAlsoFails(bool throughFeed)
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        Win32Exception original = new(5);
+        IOException cleanup = new("injected native subscription cleanup failure");
+        int initialized = 0, disposed = 0;
+        WindowsLocalChangeSource native = new(_syncRootPath, 4096,
+            beforeAttributeStart: () => { initialized++; throw original; },
+            afterMetadataDisposal: () => { disposed++; throw cleanup; });
+        CloudLocalChangeFeed? feed = throughFeed ? CloudLocalChangeFeed.CreateForTesting(_syncRootPath, store, new(), native) : null;
+        Exception? observed = await Record.ExceptionAsync(async () =>
+        {
+            if (feed is not null) { await feed.StartAsync(); }
+            else { await native.StartAsync(_ => ValueTask.CompletedTask, default); }
+        });
+        try
+        {
+            Assert.Same(original, observed);
+            Assert.Equal(5, original.NativeErrorCode);
+            Assert.Same(cleanup, original.Data["CfSharp.LocalChangeSource.StartupCleanupFailure"]);
+            Assert.Equal(1, initialized);
+            Assert.Equal(1, disposed);
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => native.StartAsync(_ => ValueTask.CompletedTask, default));
+            // The real data watcher and security pump were opened before the injected attribute
+            // startup failure. They must no longer retain the watched directory or native I/O.
+            Directory.Delete(_syncRootPath);
+            if (feed is not null)
+            {
+                Assert.False(feed.IsStarted);
+                Assert.Same(cleanup, original.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"]);
+            }
+        }
+        finally
+        {
+            if (feed is not null) { await feed.DisposeAsync(); }
+            else { await Record.ExceptionAsync(() => native.DisposeAsync().AsTask()); }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task SourceStartupFailurePropagatesAndReleasesPartialResources(bool delayed)
     {
         await using ICloudStateStore store = await OpenStoreAsync();

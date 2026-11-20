@@ -20,6 +20,8 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private readonly int _bufferCapacity;
     private readonly Action? _beforeSecurityRearm;
     private readonly Action? _beforeTerminalSecurityDelivery;
+    private readonly Action? _beforeAttributeStart;
+    private readonly Action? _afterMetadataDisposal;
     private readonly object _gate = new();
     private FileSystemWatcher? _watcher;
     private WindowsSecurityChangeSource? _securityWatcher;
@@ -29,12 +31,14 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private Task? _disposal;
 
     internal WindowsLocalChangeSource(string rootPath, int bufferCapacity, Action? beforeSecurityRearm = null,
-        Action? beforeTerminalSecurityDelivery = null)
+        Action? beforeTerminalSecurityDelivery = null, Action? beforeAttributeStart = null, Action? afterMetadataDisposal = null)
     {
         _rootPath = rootPath;
         _bufferCapacity = Math.Clamp(bufferCapacity, 4096, 64 * 1024);
         _beforeSecurityRearm = beforeSecurityRearm;
         _beforeTerminalSecurityDelivery = beforeTerminalSecurityDelivery;
+        _beforeAttributeStart = beforeAttributeStart;
+        _afterMetadataDisposal = afterMetadataDisposal;
     }
 
     public async Task StartAsync(
@@ -79,12 +83,20 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                 _watcher = watcher;
                 watcher.EnableRaisingEvents = true;
                 _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError, _beforeSecurityRearm);
+                _beforeAttributeStart?.Invoke();
                 _attributeWatcher = new(_rootPath, _bufferCapacity, OnAttributesChanged, OnAttributeError, notifyFilter: 0x4);
             }
         }
-        catch
+        catch (Exception startupFailure)
         {
-            if (initializing) { await DisposeAsync().ConfigureAwait(false); }
+            if (initializing)
+            {
+                try { await DisposeAsync().ConfigureAwait(false); }
+                catch (Exception cleanupFailure)
+                {
+                    LocalChangeStartupFailure.Preserve(startupFailure, cleanupFailure, source: true);
+                }
+            }
             throw;
         }
     }
@@ -121,6 +133,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             finally
             {
                 if (security is not null) { await security.DisposeAsync().ConfigureAwait(false); }
+                _afterMetadataDisposal?.Invoke();
             }
         }
         finally

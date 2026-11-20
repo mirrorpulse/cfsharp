@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
 
@@ -156,24 +155,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             try { await DisposeAsync().ConfigureAwait(false); }
             catch (Exception cleanupFailure)
             {
-                try { startupFailure.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"] = cleanupFailure; }
-                catch { /* Exception data supplied by a custom exception can be read-only. */ }
-                try { ReportStartupCleanupFailure(cleanupFailure); }
-                catch { /* Optional diagnostics must preserve the original startup exception. */ }
+                LocalChangeStartupFailure.Preserve(startupFailure, cleanupFailure, source: false);
             }
             throw;
         }
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void ReportStartupCleanupFailure(Exception failure)
-    {
-        // Keep optional diagnostic dependencies outside normal startup compilation, including
-        // an impersonated packaged process that cannot load a previously unused assembly.
-        System.Diagnostics.Activity? activity = CloudDiagnostics.StartActivity(
-            "cfsharp.local-change-feed.startup-cleanup", "local-change-feed.startup");
-        CloudDiagnostics.RecordException(activity, failure);
-        CloudDiagnostics.StopActivity(activity, "failed");
     }
 
     /// <summary>
