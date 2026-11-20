@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
 
@@ -104,6 +105,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// Startup completes only after every native subscription has opened successfully. A startup
     /// failure disposes this feed and its acquired resources before propagating the original error;
     /// create a new feed before retrying.
+    /// A cleanup failure is retained in the original exception's <see cref="Exception.Data"/>
+    /// under <c>CfSharp.LocalChangeFeed.StartupCleanupFailure</c> and reported through
+    /// <see cref="CloudDiagnostics"/>. Keep the store open and retry disposal if its loss marker
+    /// could not be persisted. Cleanup and diagnostic failures do not replace the startup error.
     /// Security notifications use the NTFS extended directory API on Windows 10 version 1709 / Windows
     /// Server 2019 or later. The feed owns its security read issuer until native cancellation completes;
     /// callers do not need to retain the startup thread. Unprovable security associations require reconciliation.
@@ -134,12 +139,35 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             await _sourceTask.ConfigureAwait(false);
             _processorTask = ProcessEventsAsync();
         }
-        catch
+        catch (Exception startupFailure)
         {
             Interlocked.Exchange(ref _started, 0);
-            await DisposeAsync().ConfigureAwait(false);
+            // Startup has already observed this task. Do not observe its error again as a
+            // disposal error. A partial source can have accepted notifications before failing,
+            // so persist loss explicitly even though the normalization worker never started.
+            _sourceTask = null;
+            SignalLoss();
+            try { await DisposeAsync().ConfigureAwait(false); }
+            catch (Exception cleanupFailure)
+            {
+                try { startupFailure.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"] = cleanupFailure; }
+                catch { /* Exception data supplied by a custom exception can be read-only. */ }
+                try { ReportStartupCleanupFailure(cleanupFailure); }
+                catch { /* Optional diagnostics must preserve the original startup exception. */ }
+            }
             throw;
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ReportStartupCleanupFailure(Exception failure)
+    {
+        // Keep optional diagnostic dependencies outside normal startup compilation, including
+        // an impersonated packaged process that cannot load a previously unused assembly.
+        System.Diagnostics.Activity? activity = CloudDiagnostics.StartActivity(
+            "cfsharp.local-change-feed.startup-cleanup", "local-change-feed.startup");
+        CloudDiagnostics.RecordException(activity, failure);
+        CloudDiagnostics.StopActivity(activity, "failed");
     }
 
     /// <summary>

@@ -73,6 +73,11 @@ Await `CloudLocalChangeFeed.StartAsync` before reading: it completes only after 
 has opened successfully. Startup failure propagates to that caller after releasing acquired source
 resources and disposing the feed. Create a new feed before retrying; a failed startup never represents
 a running watcher.
+Cleanup failure does not replace the original startup exception or its native error code. Its
+exception is available separately in `Exception.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"]`;
+the `cfsharp.local-change-feed.startup-cleanup` diagnostic activity reports its type and HRESULT
+without paths. If persisting the loss marker failed, keep the store open and retry disposal before
+recreating the feed. A failing diagnostic listener cannot change the startup result.
 Across subscriptions, sequence order is the order observed by the feed, not a global Windows
 transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
 infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and
