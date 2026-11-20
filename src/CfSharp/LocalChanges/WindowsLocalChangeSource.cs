@@ -4,6 +4,7 @@ namespace CfSharp;
 
 internal interface ILocalChangeSource : IAsyncDisposable
 {
+    /// <summary>Opens subscriptions, completing only after startup succeeds or fails.</summary>
     Task StartAsync(
         Func<LocalChangeSourceEvent, ValueTask> eventHandler,
         CancellationToken cancellationToken);

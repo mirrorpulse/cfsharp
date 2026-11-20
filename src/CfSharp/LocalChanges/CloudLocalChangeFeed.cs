@@ -101,12 +101,18 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <param name="cancellationToken">Token that cancels startup before the watcher is opened.</param>
     /// <remarks>
     /// Background notification consumption does not require pumping the starting synchronization context.
+    /// Startup completes only after every native subscription has opened successfully. A startup
+    /// failure disposes this feed and its acquired resources before propagating the original error;
+    /// create a new feed before retrying.
     /// Security notifications use the NTFS extended directory API on Windows 10 version 1709 / Windows
     /// Server 2019 or later. The feed owns its security read issuer until native cancellation completes;
     /// callers do not need to retain the startup thread. Unprovable security associations require reconciliation.
     /// </remarks>
     /// <exception cref="InvalidOperationException">The feed has already been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    /// <exception cref="ArgumentException">The watched directory no longer exists.</exception>
+    /// <exception cref="IOException">The native watcher cannot access the directory.</exception>
+    /// <exception cref="UnauthorizedAccessException">Access to the watched directory is denied.</exception>
     /// <exception cref="System.ComponentModel.Win32Exception">Windows cannot open or start the native directory subscription; the native error is retained.</exception>
     /// <exception cref="EntryPointNotFoundException">Windows does not provide the required extended directory API.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
@@ -125,6 +131,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             await LoadCheckpointAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             _sourceTask = _source.StartAsync(PublishAsync, _shutdown.Token);
+            await _sourceTask.ConfigureAwait(false);
             _processorTask = ProcessEventsAsync();
         }
         catch

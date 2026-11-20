@@ -69,6 +69,10 @@ remain content candidates; loss/error on either subscription requires reconcilia
 
 All three subscriptions are started and disposed with the feed. Their observations are serialized into
 the existing durable journal, preserving each retained ID, sequence and payload across restart.
+Await `CloudLocalChangeFeed.StartAsync` before reading: it completes only after every subscription
+has opened successfully. Startup failure propagates to that caller after releasing acquired source
+resources and disposing the feed. Create a new feed before retrying; a failed startup never represents
+a running watcher.
 Across subscriptions, sequence order is the order observed by the feed, not a global Windows
 transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
 infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and
