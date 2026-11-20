@@ -28,6 +28,13 @@ A user can rename the object or its parent while persistence waits. The feed reo
 the full native identity and physical path before binding, after staging, and inside the publication
 transaction. A changed or replaced path retains the same operation ID as an unbound observation
 requiring reconciliation. Native inspection during ordinary discovery also permits renames.
+Attribute publication keeps its validation receipt atomically with the journal write and checks
+identity again after that commit. Public pages and legacy batches withhold an unvalidated row, and
+ACK rejects it; paging does not advance beyond it. Successful validation makes it eligible before
+receipt cleanup, which is bookkeeping rather than a second publication boundary. If validation
+fails, the original row is made unbound with the same ID and sequence and requires reconciliation.
+A crash with the receipt still present recovers that same unbound row before startup completes.
+Direct state-store readers must treat rows with outstanding validation receipts as provisional.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards

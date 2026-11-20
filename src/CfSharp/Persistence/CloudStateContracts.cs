@@ -211,7 +211,7 @@ public interface ICloudOperationJournal
         int maximumCount,
         CancellationToken cancellationToken = default);
 
-    /// <summary>Replaces retry metadata and payload for an existing operation.</summary>
+    /// <summary>Replaces an existing operation's metadata, item association and payload, preserving its assigned sequence.</summary>
     ValueTask UpdateAsync(
         CloudOperationJournalEntry operation,
         CancellationToken cancellationToken = default);

@@ -203,6 +203,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             bool creation = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
+            int validatedCount = await ValidatedMetadataPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             ThrowIfFailed();
             // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
@@ -216,9 +217,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
             }
 
-            if (!rescan && operations.Count != 0)
+            if (!rescan && validatedCount != 0)
             {
-                return new CloudLocalChangeBatch(operations.Select(ToChange).ToArray(), requiresFullRescan: false);
+                return new CloudLocalChangeBatch(operations.Take(validatedCount).Select(ToChange).ToArray(), requiresFullRescan: false);
             }
 
             try
@@ -241,7 +242,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <remarks>
     /// Acknowledgement is idempotent: an already removed operation is ignored. The overload
     /// accepting revision-aware acknowledgements can atomically update the durable revision.
+    /// An operation still awaiting post-commit metadata validation cannot be acknowledged.
     /// </remarks>
+    /// <exception cref="InvalidOperationException">A supplied operation still awaits metadata validation.</exception>
     public async ValueTask AcknowledgeAsync(
         IEnumerable<Guid> operationIds,
         CancellationToken cancellationToken = default)
@@ -262,6 +265,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="acknowledgements">Operation acknowledgements from a delivered batch.</param>
     /// <param name="cancellationToken">Token that cancels before the acknowledgement commits.</param>
+    /// <exception cref="InvalidOperationException">A supplied operation still awaits metadata validation.</exception>
     public async ValueTask AcknowledgeAsync(
         IEnumerable<CloudLocalChangeAcknowledgement> acknowledgements,
         CancellationToken cancellationToken = default)
@@ -287,6 +291,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             if (operation is not null)
             {
+                if (await ValidatedMetadataPrefixLengthAsync(transaction, [operation], cancellationToken).ConfigureAwait(false) == 0)
+                {
+                    throw new InvalidOperationException("The local metadata observation has not completed validation.");
+                }
                 if (acknowledgement.RemoteRevision is not null && operation.ItemId is Guid itemId)
                 {
                     CloudItemState? item = await transaction.Items
@@ -309,6 +317,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
                 await transaction.Operations.RemoveAsync(acknowledgement.OperationId, cancellationToken)
                     .ConfigureAwait(false);
+                await transaction.Checkpoints.RemoveAsync(SecurityValidationName(acknowledgement.OperationId), cancellationToken).ConfigureAwait(false);
             }
         }
 

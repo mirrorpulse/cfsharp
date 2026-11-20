@@ -10,33 +10,78 @@ namespace CfSharp;
 public sealed partial class CloudLocalChangeFeed
 {
     internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
+    private long _validatedAttributeSequence;
 
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
     private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
         SecurityFeedProjection projection, CancellationToken cancellationToken)
     {
-        await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         string receipt = SecurityValidationName(entry.OperationId);
-        if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
+        CloudOperationJournalEntry? published = null;
+        await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
         {
-            // Acquiring the publication transaction can itself wait behind another writer.
-            // An attribute snapshot must be checked again after that wait.
-            if (projection.AllowsRename) { projection.Validate(); }
-            await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
-            await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            SignalAvailable();
+            if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
+            {
+                if (projection.AllowsRename) { projection.Validate(); }
+                published = await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
+                // A snapshot can change during CommitAsync. Keep its receipt atomically with
+                // the journal row: readers and ACK must withhold it until post-commit validation.
+                if (!projection.AllowsRename) { await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false); }
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
+        if (published is null) { return; }
+        if (projection.AllowsRename)
+        {
+            projection.Validate();
+            // The worker serializes publication, so one monotonic watermark covers all
+            // successfully validated rows without retaining an unbounded per-operation cache.
+            Volatile.Write(ref _validatedAttributeSequence, published.Sequence);
+            SignalAvailable();
+            // Eligibility is established above, without another publication commit window.
+            // A crash before this bookkeeping completes leaves the receipt for safe recovery.
+            await using ICloudStateTransaction completed = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            await completed.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
+            await completed.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else { SignalAvailable(); }
+    }
+
+    private async ValueTask<int> ValidatedMetadataPrefixLengthAsync(ICloudStateTransaction transaction,
+        IReadOnlyList<CloudOperationJournalEntry> operations, CancellationToken cancellationToken)
+    {
+        if (operations.Count == 0) { return 0; }
+        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
+            cancellationToken).ConfigureAwait(false);
+        if (receipts.Count == 0) { return operations.Count; }
+        HashSet<string> pending = new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
+        long validated = Volatile.Read(ref _validatedAttributeSequence);
+        for (int index = 0; index < operations.Count; index++)
+        {
+            CloudOperationJournalEntry operation = operations[index];
+            if (operation.Sequence > validated && pending.Contains(SecurityValidationName(operation.OperationId))) { return index; }
+        }
+        return operations.Count;
     }
 
     private static async ValueTask RetainUnboundSecurityObservationAsync(ICloudStateTransaction transaction, Guid operationId,
         ReadOnlyMemory<byte> payload, DateTimeOffset observedAt, CancellationToken cancellationToken)
     {
-        if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        CloudOperationJournalEntry? existing = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
+        if (existing is null)
         {
             await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
                 payload.Span, observedAt), cancellationToken).ConfigureAwait(false);
+        }
+        else if (existing.ItemId is not null)
+        {
+            if (existing.Kind != CloudStateOperationKind.MetadataUpdate) { throw new InvalidDataException("A metadata validation receipt references a different operation kind."); }
+            // The row may already have committed while its validation receipt still withheld
+            // delivery. Clear only its association, preserving ordering and retry metadata.
+            await transaction.Operations.UpdateAsync(new(existing.OperationId, existing.Kind, null,
+                existing.Payload.Span, existing.CreatedAt, existing.AttemptCount, existing.RetryAfter, existing.Sequence),
+                cancellationToken).ConfigureAwait(false);
         }
 
         await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);

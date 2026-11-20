@@ -7,22 +7,29 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Theory]
-    [InlineData(false, false, "leaf", false)]
-    [InlineData(false, true, "leaf", false)]
-    [InlineData(true, false, "leaf", false)]
-    [InlineData(true, true, "leaf", false)]
-    [InlineData(false, true, "parent", false)]
-    [InlineData(true, false, "parent", false)]
-    [InlineData(false, true, "replace", false)]
-    [InlineData(true, true, "replace", false)]
-    [InlineData(false, true, "case", false)]
-    [InlineData(false, true, "leaf", true)]
-    [InlineData(true, false, "leaf", true)]
+    [InlineData(false, false, "leaf", "staging")]
+    [InlineData(false, true, "leaf", "staging")]
+    [InlineData(true, false, "leaf", "staging")]
+    [InlineData(true, true, "leaf", "staging")]
+    [InlineData(false, true, "parent", "staging")]
+    [InlineData(true, false, "parent", "staging")]
+    [InlineData(false, true, "replace", "staging")]
+    [InlineData(true, true, "replace", "staging")]
+    [InlineData(false, true, "case", "staging")]
+    [InlineData(false, true, "leaf", "publication-start")]
+    [InlineData(true, false, "leaf", "publication-start")]
+    [InlineData(false, false, "replace", "publication-commit")]
+    [InlineData(false, true, "replace", "publication-commit")]
+    [InlineData(true, false, "replace", "publication-commit")]
+    [InlineData(true, true, "replace", "publication-commit")]
+    [InlineData(false, true, "replace", "publication-committed")]
+    [InlineData(true, false, "replace", "publication-committed")]
+    [InlineData(false, true, "unchanged", "publication-committed")]
     public async Task AttributeObservationAllowsRenameWhilePersistenceIsPaused(bool directory, bool placeholder,
-        string move, bool pausePublication)
+        string move, string boundary)
     {
         AttributeCommitFactory? factory = null;
-        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, pausePublication));
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
         string parent = Path.Combine(fixture.Root, "parent");
         Directory.CreateDirectory(parent);
         string relative = "parent\\original";
@@ -54,18 +61,48 @@ public sealed partial class CloudContentConfirmationTests
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
         await feed.StartAsync();
         Guid observationId;
-        string destination = move == "parent" ? Path.Combine(fixture.Root, "moved-parent", "original")
+        string destination = move == "unchanged" ? path : move == "parent" ? Path.Combine(fixture.Root, "moved-parent", "original")
             : Path.Combine(parent, move == "case" ? "ORIGINAL" : "moved");
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         try
         {
             File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
             observationId = await factory.Paused.Task.WaitAsync(deadline.Token);
+            if (boundary == "publication-committed")
+            {
+                await using (ICloudStateTransaction raw = await factory.Inner!.BeginTransactionAsync(deadline.Token))
+                {
+                    CloudOperationJournalEntry tentative = (await raw.Operations.GetAsync(observationId, deadline.Token))!;
+                    Assert.Equal(identity.ItemId, tentative.ItemId);
+                    factory.PublishedSequence = tentative.Sequence;
+                }
+                CloudLocalChangeScan pending = await feed.BeginScanAsync(deadline.Token);
+                Assert.False(pending.RequiresFullRescan);
+                CloudLocalChangePage withheld = await feed.ReadPageAsync(pending, 0, 1000, deadline.Token);
+                Assert.DoesNotContain(withheld.Changes, change => change.OperationId == observationId);
+                Assert.True(withheld.HasMore);
+                Assert.Equal(0, withheld.LastScannedSequence);
+                using CancellationTokenSource reading = new();
+                Task<CloudLocalChangeBatch> batch = feed.ReadBatchAsync(reading.Token).AsTask();
+                try
+                {
+                    Assert.NotSame(batch, await Task.WhenAny(batch, Task.Delay(100, deadline.Token)));
+                    await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeAsync([observationId], deadline.Token).AsTask());
+                }
+                finally
+                {
+                    reading.Cancel();
+                    await Record.ExceptionAsync(() => batch);
+                }
+            }
             // No retry: an advisory observation must not make an ordinary user rename fail,
             // even while the exact transaction/publication boundary is deliberately stalled.
-            if (move == "parent") { Directory.Move(parent, Path.GetDirectoryName(destination)!); }
-            else if (directory) { Directory.Move(path, destination); }
-            else { File.Move(path, destination); }
+            if (move != "unchanged")
+            {
+                if (move == "parent") { Directory.Move(parent, Path.GetDirectoryName(destination)!); }
+                else if (directory) { Directory.Move(path, destination); }
+                else { File.Move(path, destination); }
+            }
             if (move == "replace")
             {
                 if (directory) { Directory.CreateDirectory(path); }
@@ -79,15 +116,16 @@ public sealed partial class CloudContentConfirmationTests
         {
             await using ICloudStateTransaction read = await factory.Inner!.BeginTransactionAsync(deadline.Token);
             rows = await read.Operations.ListAsync(1000, deadline.Token);
-            if (rows.Any(row => row.OperationId == observationId) && rows.Any(row => row.Kind == CloudStateOperationKind.Move)) { break; }
+            if (rows.Any(row => row.OperationId == observationId) && (move == "unchanged" || rows.Any(row => row.Kind == CloudStateOperationKind.Move))) { break; }
             await Task.Delay(20, deadline.Token);
         } while (true);
         await feed.DisposeAsync();
         CloudOperationJournalEntry observation = Assert.Single(rows.Where(row => row.OperationId == observationId));
         Assert.Equal(CloudStateOperationKind.MetadataUpdate, observation.Kind);
         Assert.Equal(relative, LocalChangePayload.Decode(observation.Payload).RelativePath);
-        if (move == "case") { Assert.Equal(identity.ItemId, observation.ItemId); }
+        if (move is "case" or "unchanged") { Assert.Equal(identity.ItemId, observation.ItemId); }
         else { Assert.Null(observation.ItemId); }
+        if (factory.PublishedSequence is long assigned) { Assert.Equal(assigned, observation.Sequence); }
         Assert.DoesNotContain(rows, row => row.Kind == CloudStateOperationKind.ContentUpdate);
         CloudItem movedItem = directory
             ? fixture.System.GetDirectory(Path.GetRelativePath(fixture.Root, destination))
@@ -100,7 +138,8 @@ public sealed partial class CloudContentConfirmationTests
         await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
         await reopened.StartAsync();
         CloudLocalChangeScan scan = await reopened.BeginScanAsync();
-        if (move != "case") { Assert.True(scan.RequiresFullRescan); }
+        if (move is not ("case" or "unchanged")) { Assert.True(scan.RequiresFullRescan); }
+        if (move == "unchanged") { Assert.False(scan.RequiresFullRescan); }
         if (scan.RequiresFullRescan) { await reopened.AcknowledgeFullRescanAsync(); }
         CloudLocalChangePage page = await reopened.ReadPageAsync(await reopened.BeginScanAsync(), 0, 1000);
         CloudLocalChange retained = Assert.Single(page.Changes.Where(change => change.OperationId == observationId));
@@ -108,16 +147,17 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(observation.ItemId, retained.ItemId);
         await reopened.AcknowledgeAsync([observationId]);
         Assert.Equal(0, fixture.Provider.Fetches);
-        output.WriteLine($"Native attribute observation {observationId}: directory={directory}; placeholder={placeholder}; move={move}; publication={pausePublication}; original={before.LocalBinding}; rename succeeded without retry.");
+        output.WriteLine($"Native attribute observation {observationId}: directory={directory}; placeholder={placeholder}; move={move}; boundary={boundary}; original={before.LocalBinding}; rename succeeded without retry.");
     }
 
-    private sealed class AttributeCommitFactory(string path, bool pausePublication) : ICloudStateStoreFactory
+    private sealed class AttributeCommitFactory(string path, string boundary) : ICloudStateStoreFactory
     {
-        private readonly bool _pausePublication = pausePublication;
+        private readonly string _boundary = boundary;
         private int _paused;
         private Guid? _committed;
         internal string? RelativePath { get; set; }
         internal ICloudStateStore? Inner { get; private set; }
+        internal long? PublishedSequence { get; set; }
         internal TaskCompletionSource<Guid> Paused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource Resume { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -138,7 +178,7 @@ public sealed partial class CloudContentConfirmationTests
         {
             public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
             {
-                if (owner._pausePublication && owner._committed is Guid operationId) { await owner.PauseAsync(operationId, cancellationToken); }
+                if (owner._boundary == "publication-start" && owner._committed is Guid operationId) { await owner.PauseAsync(operationId, cancellationToken); }
                 return new AttributeCommitTransaction(await inner.BeginTransactionAsync(cancellationToken), owner);
             }
             public ValueTask DisposeAsync() => inner.DisposeAsync();
@@ -158,9 +198,15 @@ public sealed partial class CloudContentConfirmationTests
                 CloudStateCheckpoint? receipt = receipts.FirstOrDefault(value =>
                     LocalChangePayload.Decode(value.Value).RelativePath == owner.RelativePath);
                 Guid? operationId = receipt is null ? null : Guid.ParseExact(receipt.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N");
-                if (!owner._pausePublication && operationId is Guid staged) { await owner.PauseAsync(staged, cancellationToken); }
+                CloudOperationJournalEntry? published = owner._committed is Guid committed
+                    ? await inner.Operations.GetAsync(committed, cancellationToken) : null;
+                bool publishing = published is not null;
+                if (published is not null) { owner.PublishedSequence ??= published.Sequence; }
+                if (owner._boundary == "staging" && operationId is Guid staged) { await owner.PauseAsync(staged, cancellationToken); }
+                if (owner._boundary == "publication-commit" && publishing) { await owner.PauseAsync(owner._committed!.Value, cancellationToken); }
                 await inner.CommitAsync(cancellationToken);
                 if (operationId.HasValue) { owner._committed = operationId; }
+                if (owner._boundary == "publication-committed" && publishing) { await owner.PauseAsync(owner._committed!.Value, cancellationToken); }
             }
             public ValueTask RollbackAsync(CancellationToken cancellationToken = default) => inner.RollbackAsync(cancellationToken);
             public ValueTask DisposeAsync() => inner.DisposeAsync();
