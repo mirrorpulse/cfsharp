@@ -134,10 +134,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             }
         }
 
+        bool sourceMayHaveStarted = false;
         try
         {
             await LoadCheckpointAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            sourceMayHaveStarted = true;
             _sourceTask = _source.StartAsync(PublishAsync, _shutdown.Token);
             await _sourceTask.ConfigureAwait(false);
             _processorTask = ProcessEventsAsync();
@@ -146,10 +148,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             Interlocked.Exchange(ref _started, 0);
             // Startup has already observed this task. Do not observe its error again as a
-            // disposal error. A partial source can have accepted notifications before failing,
-            // so persist loss explicitly even though the normalization worker never started.
+            // disposal error. Only an attempted source can have accepted notifications. A
+            // canceled checkpoint read must not wait for a writer to record nonexistent loss.
             _sourceTask = null;
-            SignalLoss();
+            if (sourceMayHaveStarted) { SignalLoss(); }
             try { await DisposeAsync().ConfigureAwait(false); }
             catch (Exception cleanupFailure)
             {

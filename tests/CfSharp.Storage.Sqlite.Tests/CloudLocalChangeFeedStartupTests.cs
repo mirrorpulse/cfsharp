@@ -5,6 +5,54 @@ namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationBeforeSourceStartupDoesNotWaitForAnExistingWriter(bool afterCheckpointRead)
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        RaceStore observedStore = new(store);
+        StartupSource source = new(Path.Combine(_temporaryDirectory, "startup.lock"));
+        using CancellationTokenSource cancellation = new();
+        ICloudStateTransaction? writer = null;
+        if (afterCheckpointRead)
+        {
+            observedStore.AfterRollback = async () =>
+            {
+                writer = await store.BeginTransactionAsync();
+                cancellation.Cancel();
+            };
+        }
+        else
+        {
+            writer = await store.BeginTransactionAsync();
+            cancellation.Cancel();
+        }
+        await using CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(_syncRootPath, observedStore, new(), source);
+        Task starting = feed.StartAsync(cancellation.Token).AsTask();
+        try
+        {
+            OperationCanceledException failure = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => starting.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Equal(cancellation.Token, failure.CancellationToken);
+            Assert.False(source.Entered.Task.IsCompleted);
+            Assert.False(feed.IsStarted);
+        }
+        finally
+        {
+            if (writer is not null)
+            {
+                await writer.RollbackAsync();
+                await writer.DisposeAsync();
+            }
+            source.Ready.TrySetResult();
+            await Record.ExceptionAsync(() => starting.WaitAsync(TimeSpan.FromSeconds(10)));
+        }
+        Assert.Equal(1, source.DisposeCount);
+        await using ICloudStateTransaction read = await store.BeginTransactionAsync();
+        Assert.Null(await read.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName));
+    }
+
     [Fact]
     public async Task FeedStartupWaitsForSourceReadiness()
     {

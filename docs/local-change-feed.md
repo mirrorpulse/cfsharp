@@ -79,6 +79,8 @@ Await `CloudLocalChangeFeed.StartAsync` before reading: it completes only after 
 has opened successfully. Startup failure propagates to that caller after releasing acquired source
 resources and disposing the feed. Create a new feed before retrying; a failed startup never represents
 a running watcher.
+Cancellation or checkpoint-read failure before source opening does not write a new loss marker.
+Once source startup has been attempted, partial subscription failure still requires that marker.
 Cleanup failure does not replace the original startup exception or its native error code. Its
 exception is available separately in `Exception.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"]`;
 the `cfsharp.local-change-feed.startup-cleanup` diagnostic activity reports its type and HRESULT
