@@ -21,6 +21,7 @@ public sealed partial class CloudLocalChangeFeed
         CloudOperationJournalEntry? published = null;
         await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
         {
+            RequireJournalAssociationUpdates(transaction);
             if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
             {
                 if (projection.AllowsRename) { projection.Validate(); }
@@ -76,6 +77,7 @@ public sealed partial class CloudLocalChangeFeed
         }
         else if (existing.ItemId is not null)
         {
+            RequireJournalAssociationUpdates(transaction);
             if (existing.Kind != CloudStateOperationKind.MetadataUpdate) { throw new InvalidDataException("A metadata validation receipt references a different operation kind."); }
             // The row may already have committed while its validation receipt still withheld
             // delivery. Clear only its association, preserving ordering and retry metadata.
@@ -99,6 +101,14 @@ public sealed partial class CloudLocalChangeFeed
         }
 
         await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void RequireJournalAssociationUpdates(ICloudStateTransaction transaction)
+    {
+        if (transaction.Operations is not ICloudOperationJournalItemAssociationUpdates)
+        {
+            throw new NotSupportedException("The local change feed requires ICloudOperationJournalItemAssociationUpdates on every journal transaction. Migrate the custom journal before starting the feed; no validation evidence has been consumed.");
+        }
     }
 
     private static async ValueTask<bool> RecoverStagedSecurityObservationsAsync(ICloudStateTransaction transaction,

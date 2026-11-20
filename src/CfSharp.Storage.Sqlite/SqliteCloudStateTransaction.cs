@@ -508,7 +508,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         }
     }
 
-    private sealed class OperationRepository : ICloudOperationJournal, ICloudOperationJournalPaging
+    private sealed class OperationRepository : ICloudOperationJournalItemAssociationUpdates, ICloudOperationJournalPaging
     {
         private const string SelectColumns = """
             SELECT operation_id, kind, item_id, payload, created_at_ticks,

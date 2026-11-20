@@ -1900,6 +1900,7 @@
       "method System.Threading.Tasks.ValueTask\u003CCfSharp.CloudOperationJournalEntry\u003E GetAsync(System.Guid operationId,System.Threading.CancellationToken cancellationToken)",
       "method System.Threading.Tasks.ValueTask\u003CSystem.Collections.Generic.IReadOnlyList\u003CCfSharp.CloudOperationJournalEntry\u003E\u003E ListAsync(System.Int32 maximumCount,System.Threading.CancellationToken cancellationToken)",
       "method System.Threading.Tasks.ValueTask\u003CSystem.Collections.Generic.IReadOnlyList\u003CCfSharp.CloudOperationJournalEntry\u003E\u003E ListByItemIdAsync(System.Guid itemId,System.Int32 maximumCount,System.Threading.CancellationToken cancellationToken)",
+      "type CfSharp.ICloudOperationJournalItemAssociationUpdates",
       "type CfSharp.ICloudOperationJournalPaging",
       "method System.Threading.Tasks.ValueTask\u003CCfSharp.CloudOperationJournalPage\u003E ReadPageAsync(System.Int64 afterSequence,System.Int64 throughSequence,System.Int32 limit,System.Threading.CancellationToken cancellationToken)",
       "method System.Threading.Tasks.ValueTask\u003CSystem.Int64\u003E GetHighWaterSequenceAsync(System.Threading.CancellationToken cancellationToken)",

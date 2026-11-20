@@ -123,7 +123,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <exception cref="UnauthorizedAccessException">Access to the watched directory is denied.</exception>
     /// <exception cref="System.ComponentModel.Win32Exception">Windows cannot open or start the native directory subscription; the native error is retained.</exception>
     /// <exception cref="EntryPointNotFoundException">Windows does not provide the required extended directory API.</exception>
-    /// <exception cref="NotSupportedException">A custom journal cannot clear an unvalidated item association during recovery; its evidence remains pending.</exception>
+    /// <exception cref="NotSupportedException">The journal does not declare or honor <see cref="ICloudOperationJournalItemAssociationUpdates"/>. No notification source is opened; recovery evidence remains pending.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate)
@@ -1217,6 +1217,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     {
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        // Negotiate before recovery or source opening, and again on publication transactions.
+        // A wrapper must not return a less capable journal after accepting startup.
+        RequireJournalAssociationUpdates(transaction);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
         if (await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false))

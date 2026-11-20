@@ -384,6 +384,7 @@ public abstract class CloudStateStoreContractTests
         }
         await using (ICloudStateTransaction update = await store.BeginTransactionAsync())
         {
+            Assert.IsAssignableFrom<ICloudOperationJournalItemAssociationUpdates>(update.Operations);
             await update.Operations.UpdateAsync(new(original.OperationId, original.Kind, null, original.Payload.Span,
                 original.CreatedAt, original.AttemptCount, original.RetryAfter, original.Sequence));
             Assert.Null((await update.Operations.GetAsync(original.OperationId))!.ItemId);
