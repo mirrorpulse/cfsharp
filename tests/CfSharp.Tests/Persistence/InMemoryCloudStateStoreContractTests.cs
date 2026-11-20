@@ -55,7 +55,7 @@ public sealed class InMemoryCloudStateStoreContractTests : CloudStateStoreContra
         ICloudStateTransaction,
         ICloudItemStateRepository,
         ICloudCheckpointRepository,
-        ICloudOperationJournal,
+        ICloudOperationJournalItemAssociationUpdates,
         ICloudOperationJournalPaging,
         ICloudConflictRepository,
         ICloudRemoteBatchRepository,

@@ -16,6 +16,20 @@ C:\ProgramData\ExampleProvider\Accounts\account-42\cfsharp.db
 One database is bound to one sync root and one active CfSharp owner. Do not open the same database
 from two unrelated provider sessions.
 
+Construct `SqliteCloudStateStoreFactory` while the application identity can read its deployed
+assemblies, before entering an impersonated namespace role. Construction initializes Microsoft.Data.Sqlite
+and the bundled SQLite provider without opening a connection or database, creating directories or
+acquiring file ownership. SQLite can otherwise defer a provider initializer until `sqlite3_db_config`
+during `OpenAsync`; an impersonated MSIX process may then be denied access to a packaged framework
+assembly that was not previously loaded. Initialization failures retain their original exception
+chain. Provider selection follows Microsoft.Data.Sqlite's normal initialization. The factory does not install a resolver,
+capture a token or change the identity used by any subsequent file or store operation. Applications
+that explicitly select another SQLitePCL provider must initialize its dependencies in a suitable
+execution context themselves.
+Optional cleanup diagnostics are isolated from normal transaction compilation. An unavailable
+diagnostic assembly or a throwing trace listener cannot change a committed result or mask the
+exception already being unwound during transaction disposal.
+
 Main, WAL (`-wal`), shared-memory (`-shm`) and `.cfsharp.lock` files must each be regular,
 single-hard-link files. A pre-existing multiple-link layout is rejected with `InvalidPath` before
 SQLite initialization or migration. The provider does not remove aliases, reset journals or repair

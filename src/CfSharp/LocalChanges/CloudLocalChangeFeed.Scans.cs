@@ -52,6 +52,8 @@ public sealed partial class CloudLocalChangeFeed
     /// Reads preserve original journal identifiers, nullable item associations, sequences, paths,
     /// and observation times. An ACK between pages may remove rows; new writes never extend this
     /// scan. Stop on RequiresFullRescan even if HasMore is true. No remote-provider code is invoked.
+    /// A committed metadata row awaiting post-commit validation can produce an empty page with
+    /// HasMore true. Its cursor does not advance until validation completes; retry the page later.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The scan is null.</exception>
     /// <exception cref="ArgumentException">The scan belongs to a different feed or runtime.</exception>
@@ -83,7 +85,12 @@ public sealed partial class CloudLocalChangeFeed
         bool rescan = scan.RequiresFullRescan || HasUnpersistedLoss ||
             ScanIsInvalidated(scan) ||
             await RequiresScanReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
-        CloudLocalChange[] changes = rescan ? [] : journalPage.Operations.Select(DecodeScannedChange).ToArray();
+        int validatedCount = rescan ? 0 : await ValidatedMetadataPrefixLengthAsync(transaction, journalPage.Operations, cancellationToken).ConfigureAwait(false);
+        bool pendingValidation = validatedCount < journalPage.Operations.Count;
+        CloudLocalChange[] changes = rescan ? [] : journalPage.Operations.Take(validatedCount).Select(DecodeScannedChange).ToArray();
+        long lastScanned = pendingValidation
+            ? validatedCount == 0 ? afterSequence : journalPage.Operations[validatedCount - 1].Sequence
+            : journalPage.LastScannedSequence;
         await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
         ThrowIfFailed();
         rescan |= HasUnpersistedLoss || ScanIsInvalidated(scan);
@@ -92,8 +99,8 @@ public sealed partial class CloudLocalChangeFeed
             changes = [];
         }
 
-        return new CloudLocalChangePage(changes, rescan ? afterSequence : journalPage.LastScannedSequence,
-            rescan ? journalPage.Operations.Count != 0 : journalPage.HasMore, rescan);
+        return new CloudLocalChangePage(changes, rescan ? afterSequence : lastScanned,
+            rescan ? journalPage.Operations.Count != 0 : pendingValidation || journalPage.HasMore, rescan);
     }
 
     private CloudLocalChange DecodeScannedChange(CloudOperationJournalEntry operation)

@@ -247,7 +247,7 @@ public sealed partial class CloudLocalChangeFeedTests
         public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 
-    private sealed class LegacyJournal(ICloudOperationJournal inner) : ICloudOperationJournal
+    private sealed class LegacyJournal(ICloudOperationJournal inner) : ICloudOperationJournalItemAssociationUpdates
     {
         public ValueTask<CloudOperationJournalEntry> EnqueueAsync(CloudOperationJournalEntry operation,
             CancellationToken cancellationToken = default) => inner.EnqueueAsync(operation, cancellationToken);

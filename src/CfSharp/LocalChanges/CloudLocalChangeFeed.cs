@@ -16,7 +16,7 @@ namespace CfSharp;
 /// <para>
 /// Windows directory notifications are advisory. Buffer overflow, watcher errors, inaccessible paths, and malformed
 /// rename pairs produce <see cref="CloudLocalChangeBatch.RequiresFullRescan"/>. A permanently
-/// failed security subscription stops this feed. Dispose and recreate it before resuming. Applications
+/// failed metadata subscription stops this feed. Dispose and recreate it before resuming. Applications
 /// must perform a full reconciliation before acknowledging loss; periodic reconciliation is
 /// intentionally outside CfSharp.
 /// </para>
@@ -25,7 +25,7 @@ namespace CfSharp;
 /// observation commit in one transaction. Ancestor native bindings, immutable directory recovery
 /// evidence and existing pending operations remain unchanged. Shared ancestors are refreshed once.
 /// First discovery of a local file or directory also refreshes captured ancestor membership in
-/// its item/journal transaction, without inferring a managed native binding for that local item.
+/// its item/journal transaction, retaining its native file reference when that can be observed.
 /// </para>
 /// </remarks>
 public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
@@ -38,6 +38,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private readonly ILocalChangeSource _source;
     private readonly Action<CloudLocalChangeFeed>? _onDisposed;
     private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireOperation;
+    private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireAttributeOperation;
     private readonly CloudSecurityInspection? _securityInspection;
     private readonly Channel<LocalChangeSourceEvent> _sourceEvents;
     private readonly Channel<bool> _availability = Channel.CreateUnbounded<bool>(
@@ -57,6 +58,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private long _nextObservation;
     private int _rescanNoticeDelivered;
     private Exception? _failure;
+    private int _terminalSourceSignaled;
     private int _overflowSignaled;
     private int _started;
     private int _disposed;
@@ -68,7 +70,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         ILocalChangeSource source,
         Action<CloudLocalChangeFeed>? onDisposed = null,
         Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null,
-        CloudSecurityInspection? securityInspection = null)
+        CloudSecurityInspection? securityInspection = null,
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireAttributeOperation = null)
     {
         _syncRootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(syncRootPath));
         _stateStore = stateStore;
@@ -77,6 +80,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         _source = source;
         _onDisposed = onDisposed;
         _acquireOperation = acquireOperation;
+        _acquireAttributeOperation = acquireAttributeOperation;
         _securityInspection = securityInspection;
         _sourceEvents = Channel.CreateBounded<LocalChangeSourceEvent>(
             new BoundedChannelOptions(options.BufferCapacity)
@@ -100,14 +104,25 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <param name="cancellationToken">Token that cancels startup before the watcher is opened.</param>
     /// <remarks>
     /// Background notification consumption does not require pumping the starting synchronization context.
+    /// Startup completes only after every native subscription has opened successfully. A startup
+    /// failure disposes this feed and its acquired resources before propagating the original error;
+    /// create a new feed before retrying.
+    /// A cleanup failure is retained in the original exception's <see cref="Exception.Data"/>
+    /// under <c>CfSharp.LocalChangeFeed.StartupCleanupFailure</c> and reported through
+    /// <see cref="CloudDiagnostics"/>. Keep the store open and retry disposal if its loss marker
+    /// could not be persisted. Cleanup and diagnostic failures do not replace the startup error.
     /// Security notifications use the NTFS extended directory API on Windows 10 version 1709 / Windows
     /// Server 2019 or later. The feed owns its security read issuer until native cancellation completes;
     /// callers do not need to retain the startup thread. Unprovable security associations require reconciliation.
     /// </remarks>
     /// <exception cref="InvalidOperationException">The feed has already been started.</exception>
     /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    /// <exception cref="ArgumentException">The watched directory no longer exists.</exception>
+    /// <exception cref="IOException">The native watcher cannot access the directory.</exception>
+    /// <exception cref="UnauthorizedAccessException">Access to the watched directory is denied.</exception>
     /// <exception cref="System.ComponentModel.Win32Exception">Windows cannot open or start the native directory subscription; the native error is retained.</exception>
     /// <exception cref="EntryPointNotFoundException">Windows does not provide the required extended directory API.</exception>
+    /// <exception cref="NotSupportedException">The journal does not declare or honor <see cref="ICloudOperationJournalItemAssociationUpdates"/>. No notification source is opened; recovery evidence remains pending.</exception>
     public async ValueTask StartAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate)
@@ -119,17 +134,29 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             }
         }
 
+        bool sourceMayHaveStarted = false;
         try
         {
             await LoadCheckpointAsync(cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            sourceMayHaveStarted = true;
             _sourceTask = _source.StartAsync(PublishAsync, _shutdown.Token);
+            await _sourceTask.ConfigureAwait(false);
             _processorTask = ProcessEventsAsync();
         }
-        catch
+        catch (Exception startupFailure)
         {
             Interlocked.Exchange(ref _started, 0);
-            await DisposeAsync().ConfigureAwait(false);
+            // Startup has already observed this task. Do not observe its error again as a
+            // disposal error. Only an attempted source can have accepted notifications. A
+            // canceled checkpoint read must not wait for a writer to record nonexistent loss.
+            _sourceTask = null;
+            if (sourceMayHaveStarted) { SignalLoss(); }
+            try { await DisposeAsync().ConfigureAwait(false); }
+            catch (Exception cleanupFailure)
+            {
+                LocalChangeStartupFailure.Preserve(startupFailure, cleanupFailure, source: false);
+            }
             throw;
         }
     }
@@ -162,6 +189,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             bool creation = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
+            int validatedCount = await ValidatedMetadataPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             ThrowIfFailed();
             // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
@@ -175,9 +203,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
             }
 
-            if (!rescan && operations.Count != 0)
+            if (!rescan && validatedCount != 0)
             {
-                return new CloudLocalChangeBatch(operations.Select(ToChange).ToArray(), requiresFullRescan: false);
+                return new CloudLocalChangeBatch(operations.Take(validatedCount).Select(ToChange).ToArray(), requiresFullRescan: false);
             }
 
             try
@@ -200,7 +228,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <remarks>
     /// Acknowledgement is idempotent: an already removed operation is ignored. The overload
     /// accepting revision-aware acknowledgements can atomically update the durable revision.
+    /// An operation still awaiting post-commit metadata validation cannot be acknowledged.
     /// </remarks>
+    /// <exception cref="InvalidOperationException">A supplied operation still awaits metadata validation.</exception>
     public async ValueTask AcknowledgeAsync(
         IEnumerable<Guid> operationIds,
         CancellationToken cancellationToken = default)
@@ -221,6 +251,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="acknowledgements">Operation acknowledgements from a delivered batch.</param>
     /// <param name="cancellationToken">Token that cancels before the acknowledgement commits.</param>
+    /// <exception cref="InvalidOperationException">A supplied operation still awaits metadata validation.</exception>
     public async ValueTask AcknowledgeAsync(
         IEnumerable<CloudLocalChangeAcknowledgement> acknowledgements,
         CancellationToken cancellationToken = default)
@@ -246,6 +277,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             if (operation is not null)
             {
+                if (await ValidatedMetadataPrefixLengthAsync(transaction, [operation], cancellationToken).ConfigureAwait(false) == 0)
+                {
+                    throw new InvalidOperationException("The local metadata observation has not completed validation.");
+                }
                 if (acknowledgement.RemoteRevision is not null && operation.ItemId is Guid itemId)
                 {
                     CloudItemState? item = await transaction.Items
@@ -268,6 +303,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
                 await transaction.Operations.RemoveAsync(acknowledgement.OperationId, cancellationToken)
                     .ConfigureAwait(false);
+                await transaction.Checkpoints.RemoveAsync(SecurityValidationName(acknowledgement.OperationId), cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -661,6 +697,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     cancellationToken, classifyModified: true).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
+            case LocalChangeSourceAction.AttributesModified:
                 await PersistChangeAsync(
                     CloudLocalChangeKind.MetadataUpdate,
                     sourceEvent.RelativePath,
@@ -787,7 +824,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             if (staged is not null)
             {
                 staged.Projection.Validate();
-                await PublishValidatedSecurityObservationAsync(staged.Entry, cancellationToken).ConfigureAwait(false);
+                await PublishValidatedSecurityObservationAsync(staged.Entry, staged.Projection, cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -868,13 +905,15 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (securityObservation is { } securityEvent)
         {
             SecurityFeedProjection? projection = uncertainDirectory is null
-                ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity) : null;
+                ? TryBindSecurityObservation(path, current, securityEvent.SecurityIdentity,
+                    attributeObservation: securityEvent.Action == LocalChangeSourceAction.AttributesModified) : null;
             if (projection is not null)
             {
                 try
                 {
                     // A committed receipt stays outside the journal until the post-commit
-                    // check succeeds. Retain both native guards until publication commits.
+                    // check succeeds. Security retains native guards; attributes retain an
+                    // identity snapshot and reopen the path without locking a pending rename.
                     LocalChangePayload bound = new(path.RelativePath, null, current!.Kind == CloudItemKind.Directory, observedAt);
                     byte[] receipt = bound.Encode();
                     CloudOperationJournalEntry boundEntry = new(operationId, CloudStateOperationKind.MetadataUpdate, current.ItemId, receipt, observedAt);
@@ -984,7 +1023,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 path.RelativePath,
                 Directory.Exists(path.FullPath) ? CloudItemKind.Directory : CloudItemKind.File,
                 remoteRevision: null,
-                localFileId: null,
+                localFileId: TryReadDiscoveredFileId(path),
                 isTombstone: false,
                 observedAt);
         }
@@ -1116,20 +1155,22 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PublishAsync(LocalChangeSourceEvent sourceEvent)
     {
-        if (Volatile.Read(ref _failure) is not null) { return; }
-
-        if (sourceEvent.Action == LocalChangeSourceAction.SecuritySubscriptionFailed)
+        if (sourceEvent.Action is LocalChangeSourceAction.SecuritySubscriptionFailed or LocalChangeSourceAction.AttributeSubscriptionFailed)
         {
-            // Complete out of band: a full notification buffer must not turn permanent
-            // subscription loss into an ordinary overflow. Accepted events drain before
-            // the worker persists the terminal loss; readers fail immediately.
+            if (Interlocked.Exchange(ref _terminalSourceSignaled, 1) != 0) { return; }
+            // Fail readers out of band, but close the input only after every subscription
+            // drains. Another native pump may already hold a decoded historical batch.
+            // Completing the channel here would discard that batch when subscriptions
+            // terminate concurrently (for example, after the watched root is deleted).
             Win32Exception failure = new(sourceEvent.ErrorCode);
             SignalLoss();
             Interlocked.CompareExchange(ref _failure, failure, null);
-            _sourceEvents.Writer.TryComplete(failure);
             _availability.Writer.TryComplete();
+            _ = CompleteFailedSourceAsync(failure);
             return;
         }
+
+        if (Volatile.Read(ref _failure) is not null && Volatile.Read(ref _terminalSourceSignaled) == 0) { return; }
 
         if (sourceEvent.Action is LocalChangeSourceAction.Overflow or LocalChangeSourceAction.Error)
         {
@@ -1146,10 +1187,24 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         await ValueTask.CompletedTask;
     }
 
+    private async Task CompleteFailedSourceAsync(Exception failure)
+    {
+        try { await _source.DisposeAsync().ConfigureAwait(false); }
+        catch
+        {
+            // Keep the first native error. The terminal channel completion persists the
+            // full-rescan fence even if stopping another subscription also fails.
+        }
+        finally { _sourceEvents.Writer.TryComplete(failure); }
+    }
+
     private async ValueTask LoadCheckpointAsync(CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        // Negotiate before recovery or source opening, and again on publication transactions.
+        // A wrapper must not return a less capable journal after accepting startup.
+        RequireJournalAssociationUpdates(transaction);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
         if (await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false))

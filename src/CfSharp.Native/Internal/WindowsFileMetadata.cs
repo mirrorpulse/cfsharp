@@ -25,6 +25,20 @@ internal static unsafe partial class WindowsFileMetadata
         return handle;
     }
 
+    internal static SafeFileHandle OpenMetadataReference(string path)
+    {
+        // The same zero-access/all-sharing contract used by ordinary item inspection.
+        // Retain the file object for identity queries without requesting data or delete access.
+        SafeFileHandle handle = CreateFile(path, 0, 7, 0, 3, 0x02200000, 0);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+        return handle;
+    }
+
     internal static SafeFileHandle OpenForRename(string path)
     {
         // DELETE addresses rename permission; no data access is requested, so an online-only

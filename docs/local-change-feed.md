@@ -1,13 +1,48 @@
 # Local change feed
 
-Windows security-descriptor notifications use a separate NTFS extended native subscription from data and name
-notifications, retaining the kernel's file ID and volume rather than reopening the event's path to infer origin.
-A security-only change, including a protected Access descriptor write, is delivered
+Windows attribute and security-descriptor notifications each use a separate NTFS extended native
+subscription from data and name notifications, retaining the kernel's file ID and volume rather
+than reopening the event's path to infer origin. An attribute-only or security-only change,
+including a protected Access descriptor write, is delivered
 as `CloudLocalChangeKind.MetadataUpdate` and stored as `CloudStateOperationKind.MetadataUpdate`.
 Applications distinguish it from content work using the public kind before ACK; no private payload
 or timestamp comparison is required. Directory metadata retains the same public classification.
 Security notifications bypass provider echo suppression. The existing path and operation kind
 cannot establish that a provider write caused an independently reported DACL change.
+
+Attribute notifications follow the same identity validation, staging and reconciliation rules as
+security observations and also bypass provider echo suppression. Windows can report an attribute
+change during a rename without changing resident bytes. That observation remains metadata; the
+independent size, last-write and creation-time subscription still reports conservative content
+candidates, including same-length writes before, between or after successive renames. No content
+read, timestamp heuristic, in-sync flag or rename window suppresses a data notification. An attribute
+record delivered after its path has moved or been replaced remains an unbound metadata observation
+requiring reconciliation, rather than discovering a new object at the historical path.
+For newly discovered ordinary files and directories, the feed also retains the native NTFS file
+reference in the official item row. A later attribute record can bind to that exact object without
+requiring a placeholder identity. Older ordinary rows without that binding remain unbound until
+reconciliation; a path alone never establishes the association.
+Attribute inspection uses zero-access metadata handles with delete sharing, retaining neither item
+nor ancestor handles across journal transactions. Facade operation ordering and store lifetime still apply.
+A user can rename the object or its parent while persistence waits. The feed reopens and compares
+the full native identity and physical path before binding, after staging, and inside the publication
+transaction. A changed or replaced path retains the same operation ID as an unbound observation
+requiring reconciliation. Native inspection during ordinary discovery also permits renames.
+Attribute publication keeps its validation receipt atomically with the journal write and checks
+identity again after that commit. Public pages and legacy batches withhold an unvalidated row, and
+ACK rejects it; paging does not advance beyond it. Successful validation makes it eligible before
+receipt cleanup, which is bookkeeping rather than a second publication boundary. If validation
+fails, the original row is made unbound with the same ID and sequence and requires reconciliation.
+A crash with the receipt still present recovers that same unbound row before startup completes.
+Direct state-store readers must treat rows with outstanding validation receipts as provisional.
+The feed requires the explicit `ICloudOperationJournalItemAssociationUpdates` capability on each
+transaction's `Operations` repository before opening a source or recovering validation receipts.
+This is a breaking change for custom feed stores. The base `UpdateAsync` contract still only
+requires retry metadata and payload updates. See [custom journal migration](custom-journal-migration.md)
+before enabling this feed version. SQLite already supports the new capability without a schema change.
+Recovery also reads back the update before consuming evidence, rejecting a false capability claim
+or changes to the original ID, sequence, payload or retry metadata. A full-rescan acknowledgement
+cannot bypass an incomplete startup/recovery.
 
 Before binding a security observation, the feed verifies its kernel ID against the existing durable
 item and the current native placeholder identity, holding the object and ancestor namespace guards
@@ -36,12 +71,12 @@ so concurrent consumers cannot read or acknowledge an unverified association. Fa
 or restart with an unfinished receipt journals the same operation ID without an item association.
 Later independent notifications continue to be journaled.
 
-The extended security subscription requires NTFS and Windows 10 version 1709 / Windows Server 2019
+The extended metadata subscriptions require NTFS and Windows 10 version 1709 / Windows Server 2019
 or later. Unsupported native subscription startup reports the original Windows failure. Overflow
-or a recoverable subscription error requires reconciliation. A terminal security subscription
+or a recoverable subscription error requires reconciliation. A terminal metadata subscription
 failure stops the feed, preserves the native error and fences the journal for the next feed.
 If the next native read fails to start, the decoded batch is delivered before the terminal
-notification. Disposal keeps security callbacks active until the native pump exits, allowing the
+notification. Disposal keeps metadata callbacks active until both native pumps exit, allowing the
 feed to persist terminal loss even when shutdown overlaps its delivery.
 Dispose and recreate the feed before acknowledging reconciliation. Disposal cancels pending native
 I/O and observes its completion before releasing its buffer, event, directory handle and overlapped state.
@@ -53,8 +88,24 @@ with a security write. The feed does not consume a suppression ticket, erase a p
 attribute a later object's data to an earlier Access operation. Generic ambiguous modifications
 remain content candidates; loss/error on either subscription requires reconciliation.
 
-Both subscriptions are started and disposed with the feed. Their observations are serialized into
+All three subscriptions are started and disposed with the feed. Their observations are serialized into
 the existing durable journal, preserving each retained ID, sequence and payload across restart.
+Await `CloudLocalChangeFeed.StartAsync` before reading: it completes only after every subscription
+has opened successfully. Startup failure propagates to that caller after releasing acquired source
+resources and disposing the feed. Create a new feed before retrying; a failed startup never represents
+a running watcher.
+Cancellation or checkpoint-read failure before source opening does not write a new loss marker.
+Once source startup has been attempted, partial subscription failure still requires that marker.
+Cleanup failure does not replace the original startup exception or its native error code. Its
+exception is available separately in `Exception.Data["CfSharp.LocalChangeFeed.StartupCleanupFailure"]`;
+the `cfsharp.local-change-feed.startup-cleanup` diagnostic activity reports its type and HRESULT
+without paths. If persisting the loss marker failed, keep the store open and retry disposal before
+recreating the feed. A failing diagnostic listener cannot change the startup result.
+The native source applies the same exception preservation when a later subscription fails after
+an earlier one opened. Its cleanup failure is retained under
+`Exception.Data["CfSharp.LocalChangeSource.StartupCleanupFailure"]` and the
+`cfsharp.local-change-source.startup-cleanup` diagnostic activity. Source and feed cleanup failures
+have separate keys; neither can replace the original subscription exception or native error code.
 Across subscriptions, sequence order is the order observed by the feed, not a global Windows
 transaction order. Existing retained ContentUpdate rows remain ContentUpdate: an upgrade cannot
 infer their old cause or silently acknowledge/reclassify them. Schema, payload format, paging and

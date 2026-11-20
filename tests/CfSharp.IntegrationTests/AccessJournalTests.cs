@@ -146,7 +146,7 @@ public sealed partial class CloudContentConfirmationTests
                 int count = (await AccessRowsAsync(factory!)).Count;
                 File.SetAttributes(fixture.File.FullPath, File.GetAttributes(fixture.File.FullPath) | FileAttributes.Hidden);
                 await WaitForAccessRowsAsync(factory!, rows => rows.Count > count && rows.Any(row =>
-                    row.Kind == CloudStateOperationKind.ContentUpdate && original.All(old => old.OperationId != row.OperationId)));
+                    row.Kind == CloudStateOperationKind.MetadataUpdate && original.All(old => old.OperationId != row.OperationId)));
             }
             byte[] edit = scenario == "truncate" ? "short"u8.ToArray() : content.Select(value => (byte)(value ^ 1)).ToArray();
             await WriteAccessTestContentAsync(fixture.File.FullPath, edit);

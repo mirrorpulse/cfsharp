@@ -259,7 +259,20 @@ public sealed partial class SqliteCloudStateStoreTests
         await AssertOwnershipStateAsync(reopened);
     }
 
-    private static OwnershipChild StartOwnershipChild(string database, string root, string? ready = null)
+    [Fact]
+    public async Task FactoryInitializesProviderDependenciesBeforeDeferredStoreAccess()
+    {
+        string database = Path.Combine(_temporaryDirectory, "configured-only", "state.db");
+        Assert.False(Directory.Exists(Path.GetDirectoryName(database)));
+        using OwnershipChild child = StartOwnershipChild(database, _syncRootPath, mode: "ownership-provider-startup");
+        await child.RequireResultAsync(null);
+        Assert.Contains("ProviderInitializedBeforeStoreIO", await child.Output);
+        await using ICloudStateStore reopened = await new SqliteCloudStateStoreFactory(database).OpenAsync(CreateContext());
+        await using ICloudStateTransaction read = await reopened.BeginTransactionAsync();
+        Assert.Equal(new byte[] { 11, 22 }, (await read.Checkpoints.GetAsync("ownership"))!.Value.ToArray());
+    }
+
+    private static OwnershipChild StartOwnershipChild(string database, string root, string? ready = null, string? mode = null)
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);
         while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "CfSharp.sln"))) { directory = directory.Parent; }
@@ -275,7 +288,7 @@ public sealed partial class SqliteCloudStateStoreTests
             RedirectStandardOutput = true,
             CreateNoWindow = true
         };
-        foreach (string argument in new[] { "exec", harness, database, root, ready is null ? "ownership-attempt" : "ownership-owner" })
+        foreach (string argument in new[] { "exec", harness, database, root, mode ?? (ready is null ? "ownership-attempt" : "ownership-owner") })
         {
             start.ArgumentList.Add(argument);
         }

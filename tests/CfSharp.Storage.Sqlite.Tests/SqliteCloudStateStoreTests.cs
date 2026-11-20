@@ -130,6 +130,50 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ThrowingCleanupDiagnosticsPreserveCommitAndOriginalFailure(bool commit)
+    {
+        await using SqliteConnection connection = new("Data Source=:memory:");
+        await connection.OpenAsync();
+        using ThrowingCleanupTraceListener listener = new();
+        Trace.Listeners.Add(listener);
+        InvalidOperationException original = new("original application failure");
+        int completed = 0;
+        try
+        {
+            Exception? observed = await Record.ExceptionAsync(async () =>
+            {
+                await using SqliteCloudStateTransaction transaction = await SqliteCloudStateTransaction.BeginAsync(
+                    connection, "in-memory", _ =>
+                    {
+                        completed++;
+                        throw new IOException("cleanup callback failure");
+                    }, CancellationToken.None);
+                if (commit) { await transaction.CommitAsync(); }
+                else { throw original; }
+            });
+            if (commit) { Assert.Null(observed); }
+            else { Assert.Same(original, observed); }
+            Assert.Equal(1, completed);
+            Assert.True(listener.Attempted);
+            Assert.False(SqliteCloudStateTransaction.IsNativeTransactionActive(connection));
+        }
+        finally { Trace.Listeners.Remove(listener); }
+    }
+
+    private sealed class ThrowingCleanupTraceListener : TraceListener
+    {
+        internal bool Attempted { get; private set; }
+        public override void Write(string? message)
+        {
+            Attempted = true;
+            throw new IOException("diagnostic listener failure");
+        }
+        public override void WriteLine(string? message) => Write(message);
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task RejectedCommitDoesNotStrandWaitingTransactionOrStoreOwnership(bool sqliteRollsBack)

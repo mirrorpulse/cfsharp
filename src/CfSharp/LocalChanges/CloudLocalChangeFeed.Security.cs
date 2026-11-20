@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.ComponentModel;
 
 using CfSharp.Native;
@@ -9,32 +10,105 @@ namespace CfSharp;
 public sealed partial class CloudLocalChangeFeed
 {
     internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
+    private long _validatedAttributeSequence;
 
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
-    private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry, CancellationToken cancellationToken)
+    private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
+        SecurityFeedProjection projection, CancellationToken cancellationToken)
     {
-        await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         string receipt = SecurityValidationName(entry.OperationId);
-        if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
+        CloudOperationJournalEntry? published = null;
+        await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
         {
-            await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
-            await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            SignalAvailable();
+            RequireJournalAssociationUpdates(transaction);
+            if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
+            {
+                if (projection.AllowsRename) { projection.Validate(); }
+                published = await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
+                // A snapshot can change during CommitAsync. Keep its receipt atomically with
+                // the journal row: readers and ACK must withhold it until post-commit validation.
+                if (!projection.AllowsRename) { await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false); }
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
+        if (published is null) { return; }
+        if (projection.AllowsRename)
+        {
+            projection.Validate();
+            // The worker serializes publication, so one monotonic watermark covers all
+            // successfully validated rows without retaining an unbounded per-operation cache.
+            Volatile.Write(ref _validatedAttributeSequence, published.Sequence);
+            SignalAvailable();
+            // Eligibility is established above, without another publication commit window.
+            // A crash before this bookkeeping completes leaves the receipt for safe recovery.
+            await using ICloudStateTransaction completed = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            await completed.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
+            await completed.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else { SignalAvailable(); }
+    }
+
+    private async ValueTask<int> ValidatedMetadataPrefixLengthAsync(ICloudStateTransaction transaction,
+        IReadOnlyList<CloudOperationJournalEntry> operations, CancellationToken cancellationToken)
+    {
+        if (operations.Count == 0) { return 0; }
+        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
+            cancellationToken).ConfigureAwait(false);
+        if (receipts.Count == 0) { return operations.Count; }
+        HashSet<string> pending = new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
+        long validated = Volatile.Read(ref _validatedAttributeSequence);
+        for (int index = 0; index < operations.Count; index++)
+        {
+            CloudOperationJournalEntry operation = operations[index];
+            if (operation.Sequence > validated && pending.Contains(SecurityValidationName(operation.OperationId))) { return index; }
+        }
+        return operations.Count;
     }
 
     private static async ValueTask RetainUnboundSecurityObservationAsync(ICloudStateTransaction transaction, Guid operationId,
         ReadOnlyMemory<byte> payload, DateTimeOffset observedAt, CancellationToken cancellationToken)
     {
-        if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
+        CloudOperationJournalEntry? existing = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
+        if (existing is null)
         {
             await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
                 payload.Span, observedAt), cancellationToken).ConfigureAwait(false);
         }
+        else if (existing.ItemId is not null)
+        {
+            RequireJournalAssociationUpdates(transaction);
+            if (existing.Kind != CloudStateOperationKind.MetadataUpdate) { throw new InvalidDataException("A metadata validation receipt references a different operation kind."); }
+            // The row may already have committed while its validation receipt still withheld
+            // delivery. Clear only its association, preserving ordering and retry metadata.
+            CloudOperationJournalEntry unbound = new(existing.OperationId, existing.Kind, null,
+                existing.Payload.Span, existing.CreatedAt, existing.AttemptCount, existing.RetryAfter, existing.Sequence);
+            await transaction.Operations.UpdateAsync(unbound, cancellationToken).ConfigureAwait(false);
+            // Older custom journals were documented to update only retries and payload.
+            // Verify read-your-writes before consuming the evidence; otherwise a full rescan
+            // could make the rejected association publicly deliverable after recovery.
+            CloudOperationJournalEntry? retained = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
+            if (retained is null || retained.ItemId is not null)
+            {
+                throw new NotSupportedException("The custom operation journal must clear an item's association during metadata recovery. The validation receipt remains pending.");
+            }
+            if (retained.OperationId != existing.OperationId || retained.Sequence != existing.Sequence || retained.Kind != existing.Kind ||
+                retained.CreatedAt != existing.CreatedAt || retained.AttemptCount != existing.AttemptCount || retained.RetryAfter != existing.RetryAfter ||
+                !retained.Payload.Span.SequenceEqual(existing.Payload.Span))
+            {
+                throw new InvalidDataException("The custom operation journal changed the original metadata observation during recovery.");
+            }
+        }
 
         await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void RequireJournalAssociationUpdates(ICloudStateTransaction transaction)
+    {
+        if (transaction.Operations is not ICloudOperationJournalItemAssociationUpdates)
+        {
+            throw new NotSupportedException("The local change feed requires ICloudOperationJournalItemAssociationUpdates on every journal transaction. Migrate the custom journal before starting the feed; no validation evidence has been consumed.");
+        }
     }
 
     private static async ValueTask<bool> RecoverStagedSecurityObservationsAsync(ICloudStateTransaction transaction,
@@ -84,10 +158,12 @@ public sealed partial class CloudLocalChangeFeed
             throw new CloudNamespaceObservationUncertainException(isDirectory);
         }
 
-        if (_acquireOperation is null) { return null; }
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquire =
+            observation.Action == LocalChangeSourceAction.AttributesModified ? _acquireAttributeOperation : _acquireOperation;
+        if (acquire is null) { return null; }
         try
         {
-            return await _acquireOperation([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
+            return await acquire([CloudItemOperationScope.Exact(path.FullPath)], cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is CloudPathReparsePointException or IOException { InnerException: Win32Exception })
         {
@@ -98,7 +174,7 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private SecurityFeedProjection? TryBindSecurityObservation(CloudItemPath path, CloudItemState? state,
-        LocalSecurityChangeIdentity? identity)
+        LocalSecurityChangeIdentity? identity, bool attributeObservation = false)
     {
         // Official creation/conversion rows can omit LocalFileId. The kernel/native ID match
         // remains mandatory; the placeholder blob binds that object to the official identity.
@@ -113,17 +189,26 @@ public sealed partial class CloudLocalChangeFeed
         SafeFileHandle? guard = null;
         try
         {
-            parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]);
-            guard = WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            if (!attributeObservation) { parents = CloudPathHandleLease.OpenParentChains(_syncRootPath, [path.FullPath]); }
+            guard = attributeObservation ? WindowsFileMetadata.OpenMetadataReference(path.FullPath) : WindowsFileMetadata.OpenNamespaceGuard(path.FullPath);
+            if (attributeObservation && !MatchesAttributePath(guard, path)) { return null; }
             LocalCloudItemInspection observed = _securityInspection?.Invoke(guard, path.FullPath, state.Kind, _syncRootPath)
                 ?? CloudItemInspector.Inspect(guard, path.FullPath, state.Kind, _syncRootPath);
-            if (observed.LocalFileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
+            long? fileId = observed.LocalFileId ?? NtfsFileId(observed.LocalBinding);
+            bool placeholderMatches = CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) &&
+                placeholder.ItemId == state.ItemId && string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal);
+            bool ordinaryMatches = attributeObservation && observed.PlaceholderIdentity.Length == 0 &&
+                !observed.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder) && state.LocalFileId == fileId;
+            if (fileId is not long nativeFileId || unchecked((ulong)nativeFileId) != identity.Value.FileId ||
                 observed.LocalBinding?.VolumeSerialNumber != identity.Value.VolumeSerialNumber ||
                 observed.LocalBinding?.SyncRootFileId != identity.Value.RootFileId ||
-                !CloudPlaceholderIdentity.TryDecode(observed.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
-                placeholder.ItemId != state.ItemId || !string.Equals(placeholder.RemoteId, state.RemoteId, StringComparison.Ordinal))
+                (!placeholderMatches && !ordinaryMatches))
             { return null; }
-            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection);
+            // Even an all-sharing descendant reference can interfere with a parent rename
+            // on Windows. Attribute snapshots retain identity data, not a live handle, while
+            // a transaction waits; every subsequent check opens a fresh shared reference.
+            if (attributeObservation) { guard.Dispose(); guard = null; }
+            SecurityFeedProjection result = new(_syncRootPath, path, state.Kind, observed, guard, parents, _securityInspection, attributeObservation);
             guard = null;
             parents = null;
             return result;
@@ -142,16 +227,67 @@ public sealed partial class CloudLocalChangeFeed
         }
     }
 
-    private sealed class SecurityFeedProjection(string root, CloudItemPath path, CloudItemKind kind,
-        LocalCloudItemInspection expected, SafeFileHandle guard, IDisposable parents, CloudSecurityInspection? inspection) : IDisposable
+    private long? TryReadDiscoveredFileId(CloudItemPath path)
     {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { return null; }
+        try
+        {
+            // Discovery is advisory too: observe a stable identity without excluding a user
+            // rename. A changed path cannot establish the discovered row's native reference.
+            using SafeFileHandle guard = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+            if (!MatchesAttributePath(guard, path)) { return null; }
+            CloudItemKind kind = (WindowsFileMetadata.ReadBasic(guard.DangerousGetHandle()).Attributes & 0x10) != 0
+                ? CloudItemKind.Directory : CloudItemKind.File;
+            LocalCloudItemInspection observed = CloudItemInspector.Inspect(guard, path.FullPath, kind, _syncRootPath);
+            return MatchesAttributePath(guard, path) ? observed.LocalFileId ?? NtfsFileId(observed.LocalBinding) : null;
+        }
+        catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            // Discovery still records the ordinary notification. Without a native binding,
+            // a later independent metadata record must remain unbound for reconciliation.
+            return null;
+        }
+    }
+
+    private static bool MatchesAttributePath(SafeFileHandle reference, CloudItemPath path)
+    {
+        // ReadFinalPath alone can still name a deleted object's former path. Reopen with
+        // delete sharing and compare full native identities to reject a replacement there.
+        // Check physical names before calling CFAPI on a path redirected by a junction.
+        if (!string.Equals(WindowsFileMetadata.ReadFinalPath(reference.DangerousGetHandle()), path.FullPath, StringComparison.OrdinalIgnoreCase)) { return false; }
+        using SafeFileHandle current = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+        if (!string.Equals(WindowsFileMetadata.ReadFinalPath(current.DangerousGetHandle()), path.FullPath, StringComparison.OrdinalIgnoreCase)) { return false; }
+        WindowsFileMetadata.FileIdentity expected = WindowsFileMetadata.ReadIdentity(reference.DangerousGetHandle());
+        WindowsFileMetadata.FileIdentity actual = WindowsFileMetadata.ReadIdentity(current.DangerousGetHandle());
+        return expected.VolumeSerialNumber == actual.VolumeSerialNumber && expected.FileId == actual.FileId;
+    }
+
+    private static long? NtfsFileId(CloudLocalFileBinding? binding)
+    {
+        if (binding is null) { return null; }
+        Span<byte> id = stackalloc byte[16];
+        binding.LocalFileId.TryWriteBytes(id);
+        // NTFS extended notifications carry the 64-bit file reference. Use the full
+        // generation-bearing value only when the native 128-bit ID fits exactly.
+        return BinaryPrimitives.ReadUInt64LittleEndian(id[8..]) == 0
+            ? BinaryPrimitives.ReadInt64LittleEndian(id) : null;
+    }
+
+    private sealed class SecurityFeedProjection(string root, CloudItemPath path, CloudItemKind kind,
+        LocalCloudItemInspection expected, SafeFileHandle? guard, IDisposable? parents, CloudSecurityInspection? inspection,
+        bool allowRename) : IDisposable
+    {
+        internal bool AllowsRename => allowRename;
         internal void Validate()
         {
             if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { throw new PlatformNotSupportedException(); }
             try
             {
-                LocalCloudItemInspection current = inspection?.Invoke(guard, path.FullPath, kind, root)
-                    ?? CloudItemInspector.Inspect(guard, path.FullPath, kind, root);
+                using SafeFileHandle? reference = allowRename ? WindowsFileMetadata.OpenMetadataReference(path.FullPath) : null;
+                SafeFileHandle currentHandle = reference ?? guard!;
+                if (allowRename && !MatchesAttributePath(currentHandle, path)) { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
+                LocalCloudItemInspection current = inspection?.Invoke(currentHandle, path.FullPath, kind, root)
+                    ?? CloudItemInspector.Inspect(currentHandle, path.FullPath, kind, root);
                 if (current.LocalBinding != expected.LocalBinding || current.LocalFileId != expected.LocalFileId ||
                     !current.PlaceholderIdentity.AsSpan().SequenceEqual(expected.PlaceholderIdentity))
                 { throw new CloudNamespaceObservationUncertainException(kind == CloudItemKind.Directory); }
@@ -162,8 +298,8 @@ public sealed partial class CloudLocalChangeFeed
 
         public void Dispose()
         {
-            guard.Dispose();
-            parents.Dispose();
+            guard?.Dispose();
+            parents?.Dispose();
         }
     }
 }

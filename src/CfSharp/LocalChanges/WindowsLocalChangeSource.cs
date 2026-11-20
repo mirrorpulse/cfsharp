@@ -4,13 +4,14 @@ namespace CfSharp;
 
 internal interface ILocalChangeSource : IAsyncDisposable
 {
+    /// <summary>Opens subscriptions, completing only after startup succeeds or fails.</summary>
     Task StartAsync(
         Func<LocalChangeSourceEvent, ValueTask> eventHandler,
         CancellationToken cancellationToken);
 }
 
 /// <summary>
-/// Combines the Windows data/name watcher and identity-bearing extended security notifications
+/// Combines the Windows data/name watcher and identity-bearing attribute and security notifications
 /// into the immutable local-change source contract.
 /// </summary>
 internal sealed class WindowsLocalChangeSource : ILocalChangeSource
@@ -19,75 +20,85 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private readonly int _bufferCapacity;
     private readonly Action? _beforeSecurityRearm;
     private readonly Action? _beforeTerminalSecurityDelivery;
+    private readonly Action? _beforeAttributeStart;
+    private readonly Action? _afterMetadataDisposal;
     private readonly object _gate = new();
     private FileSystemWatcher? _watcher;
     private WindowsSecurityChangeSource? _securityWatcher;
+    private WindowsSecurityChangeSource? _attributeWatcher;
     private Func<LocalChangeSourceEvent, ValueTask>? _eventHandler;
     private int _disposed;
     private Task? _disposal;
 
     internal WindowsLocalChangeSource(string rootPath, int bufferCapacity, Action? beforeSecurityRearm = null,
-        Action? beforeTerminalSecurityDelivery = null)
+        Action? beforeTerminalSecurityDelivery = null, Action? beforeAttributeStart = null, Action? afterMetadataDisposal = null)
     {
         _rootPath = rootPath;
         _bufferCapacity = Math.Clamp(bufferCapacity, 4096, 64 * 1024);
         _beforeSecurityRearm = beforeSecurityRearm;
         _beforeTerminalSecurityDelivery = beforeTerminalSecurityDelivery;
+        _beforeAttributeStart = beforeAttributeStart;
+        _afterMetadataDisposal = afterMetadataDisposal;
     }
 
-    public Task StartAsync(
+    public async Task StartAsync(
         Func<LocalChangeSourceEvent, ValueTask> eventHandler,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(eventHandler);
         cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate)
+        bool initializing = false;
+        try
         {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            if (_watcher is not null)
+            lock (_gate)
             {
-                throw new InvalidOperationException("The local-change source has already started.");
-            }
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                if (_watcher is not null)
+                {
+                    throw new InvalidOperationException("The local-change source has already started.");
+                }
 
-            FileSystemWatcher watcher = new(_rootPath)
-            {
-                IncludeSubdirectories = true,
-                NotifyFilter = NotifyFilters.FileName |
-                    NotifyFilters.DirectoryName |
-                    NotifyFilters.Attributes |
-                    NotifyFilters.Size |
-                    NotifyFilters.LastWrite |
-                    NotifyFilters.CreationTime,
-                InternalBufferSize = _bufferCapacity,
-                Filter = "*",
-            };
-            watcher.Created += OnCreated;
-            watcher.Changed += OnChanged;
-            watcher.Deleted += OnDeleted;
-            watcher.Renamed += OnRenamed;
-            watcher.Error += OnError;
-            // FILE_ACTION_MODIFIED does not carry the triggering filter. Keep security on a
-            // separate native subscription so a DACL write cannot masquerade as file data.
-            // Never suppress an event by path, timestamp or protected-operation completion:
-            // the data watcher must still deliver any simultaneous or later ordinary write.
-            _eventHandler = eventHandler;
-            _watcher = watcher;
-            try
-            {
+                initializing = true;
+                FileSystemWatcher watcher = new(_rootPath)
+                {
+                    IncludeSubdirectories = true,
+                    NotifyFilter = NotifyFilters.FileName |
+                        NotifyFilters.DirectoryName |
+                        NotifyFilters.Size |
+                        NotifyFilters.LastWrite |
+                        NotifyFilters.CreationTime,
+                    InternalBufferSize = _bufferCapacity,
+                    Filter = "*",
+                };
+                watcher.Created += OnCreated;
+                watcher.Changed += OnChanged;
+                watcher.Deleted += OnDeleted;
+                watcher.Renamed += OnRenamed;
+                watcher.Error += OnError;
+                // FILE_ACTION_MODIFIED does not carry the triggering filter. Keep attributes and
+                // security on separate subscriptions so neither notification masquerades as data.
+                // Never suppress an event by path, timestamp or protected-operation completion:
+                // the data watcher must still deliver any simultaneous or later ordinary write.
+                _eventHandler = eventHandler;
+                _watcher = watcher;
                 watcher.EnableRaisingEvents = true;
                 _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError, _beforeSecurityRearm);
-            }
-            catch
-            {
-                _watcher = null;
-                _securityWatcher = null;
-                _eventHandler = null;
-                watcher.Dispose();
-                throw;
+                _beforeAttributeStart?.Invoke();
+                _attributeWatcher = new(_rootPath, _bufferCapacity, OnAttributesChanged, OnAttributeError, notifyFilter: 0x4);
             }
         }
-
-        return Task.CompletedTask;
+        catch (Exception startupFailure)
+        {
+            if (initializing)
+            {
+                try { await DisposeAsync().ConfigureAwait(false); }
+                catch (Exception cleanupFailure)
+                {
+                    LocalChangeStartupFailure.Preserve(startupFailure, cleanupFailure, source: true);
+                }
+            }
+            throw;
+        }
     }
 
     public ValueTask DisposeAsync()
@@ -104,16 +115,26 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
 
         FileSystemWatcher? watcher;
         WindowsSecurityChangeSource? security;
+        WindowsSecurityChangeSource? attributes;
         lock (_gate)
         {
             watcher = _watcher;
             _watcher = null;
             security = _securityWatcher;
+            attributes = _attributeWatcher;
         }
 
         try
         {
-            if (security is not null) { await security.DisposeAsync().ConfigureAwait(false); }
+            try
+            {
+                if (attributes is not null) { await attributes.DisposeAsync().ConfigureAwait(false); }
+            }
+            finally
+            {
+                if (security is not null) { await security.DisposeAsync().ConfigureAwait(false); }
+                _afterMetadataDisposal?.Invoke();
+            }
         }
         finally
         {
@@ -122,6 +143,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             lock (_gate)
             {
                 _securityWatcher = null;
+                _attributeWatcher = null;
                 _eventHandler = null;
             }
             watcher?.Dispose();
@@ -143,6 +165,31 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             PublishCore(new(LocalChangeSourceAction.SecurityModified, change.RelativePath, SecurityIdentity:
                 new(_securityWatcher.VolumeSerialNumber, _securityWatcher.RootFileId, change.FileId, change.ParentFileId, change.IsDirectory)),
                 fromSecurityPump: true);
+        }
+    }
+
+    private void OnAttributesChanged(WindowsSecurityChange change)
+    {
+        lock (_gate)
+        {
+            if (_attributeWatcher is null) { return; }
+            PublishCore(new(LocalChangeSourceAction.AttributesModified, change.RelativePath, SecurityIdentity:
+                new(_attributeWatcher.VolumeSerialNumber, _attributeWatcher.RootFileId, change.FileId, change.ParentFileId, change.IsDirectory)),
+                fromSecurityPump: true);
+        }
+    }
+
+    private void OnAttributeError(int error, bool terminal)
+    {
+        lock (_gate)
+        {
+            if (_attributeWatcher is not null)
+            {
+                // Loss of either metadata subscription invalidates the feed until rebuilt.
+                PublishCore(new(terminal ? LocalChangeSourceAction.AttributeSubscriptionFailed :
+                    error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error, string.Empty, error),
+                    fromSecurityPump: true);
+            }
         }
     }
 

@@ -7,15 +7,19 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(false, 0)]
-    [InlineData(true, 0)]
-    [InlineData(false, 1)]
-    [InlineData(true, 1)]
-    [InlineData(false, 2)]
-    [InlineData(true, 2)]
-    [InlineData(false, 3)]
-    [InlineData(true, 3)]
-    public async Task DelayedNativeSecurityAfterRenameRetainsUnboundObservation(bool directory, int replacement)
+    [InlineData(false, 0, false)]
+    [InlineData(true, 0, false)]
+    [InlineData(false, 1, false)]
+    [InlineData(true, 1, false)]
+    [InlineData(false, 2, false)]
+    [InlineData(true, 2, false)]
+    [InlineData(false, 3, false)]
+    [InlineData(true, 3, false)]
+    [InlineData(false, 0, true)]
+    [InlineData(true, 0, true)]
+    [InlineData(false, 3, true)]
+    [InlineData(true, 3, true)]
+    public async Task DelayedNativeSecurityAfterRenameRetainsUnboundObservation(bool directory, int replacement, bool attributes)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -35,21 +39,29 @@ public sealed partial class CloudContentConfirmationTests
             await seed.CommitAsync();
         }
         IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
-        DelayedSecuritySource source = new(fixture.Root, line => output.WriteLine(line));
+        DelayedSecuritySource source = new(fixture.Root, line => output.WriteLine(line),
+            observation: attributes ? LocalChangeSourceAction.AttributesModified : LocalChangeSourceAction.SecurityModified);
         Guid delayedId;
         Guid? replacementId = null;
         await using (CloudLocalChangeFeed feed = CloudLocalChangeFeed.CreateForTesting(fixture.Root, factory!.Store!,
             new CloudLocalChangeFeedOptions { BufferCapacity = 64 }, source))
         {
             await feed.StartAsync();
-            CloudProtectedLocalOperationResult applied = await original.RunProtectedLocalOperationAsync(new(snapshot.LocalBinding!,
-                directory ? CloudProtectedLocalOperationMode.DirectoryMetadata : CloudProtectedLocalOperationMode.ExclusiveFile), async (scope, stop) =>
+            if (attributes)
             {
-                FileSystemSecurity access = await scope.ReadAccessDescriptorAsync(stop);
-                access.AddAccessRule(AccessTestRule());
-                await scope.ApplyAccessDescriptorAsync(access, stop);
-            });
-            Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
+                File.SetAttributes(before, File.GetAttributes(before) | FileAttributes.Hidden);
+            }
+            else
+            {
+                CloudProtectedLocalOperationResult applied = await original.RunProtectedLocalOperationAsync(new(snapshot.LocalBinding!,
+                    directory ? CloudProtectedLocalOperationMode.DirectoryMetadata : CloudProtectedLocalOperationMode.ExclusiveFile), async (scope, stop) =>
+                {
+                    FileSystemSecurity access = await scope.ReadAccessDescriptorAsync(stop);
+                    access.AddAccessRule(AccessTestRule());
+                    await scope.ApplyAccessDescriptorAsync(access, stop);
+                });
+                Assert.True(applied.AccessDescriptorApplied && applied.AccessDescriptorReadBack);
+            }
             using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
             LocalChangeSourceEvent security = await source.Security.Task.WaitAsync(deadline.Token);
             if (directory) { Directory.Move(before, after); }
@@ -115,7 +127,8 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(0, fixture.Provider.Fetches);
     }
 
-    private sealed class DelayedSecuritySource(string root, Action<string> trace, string securityPath = "before") : ILocalChangeSource
+    private sealed class DelayedSecuritySource(string root, Action<string> trace, string securityPath = "before",
+        LocalChangeSourceAction observation = LocalChangeSourceAction.SecurityModified) : ILocalChangeSource
     {
         private readonly WindowsLocalChangeSource _native = new(root, 64 * 1024);
         private Func<LocalChangeSourceEvent, ValueTask>? _handler;
@@ -133,7 +146,7 @@ public sealed partial class CloudContentConfirmationTests
                 {
                     Security.TrySetException(new IOException($"Native security source error: {change.ErrorCode}."));
                 }
-                if (change.Action == LocalChangeSourceAction.SecurityModified && change.RelativePath == securityPath) { Security.TrySetResult(change); }
+                if (change.Action == observation && change.RelativePath == securityPath) { Security.TrySetResult(change); }
                 if (change.Action == LocalChangeSourceAction.RenamedNewName && change.RelativePath == "after") { Rename.TrySetResult(); }
                 return ValueTask.CompletedTask;
             }, stop);

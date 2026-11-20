@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using Microsoft.Data.Sqlite;
 using SQLitePCL;
 
@@ -84,9 +85,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         Exception? cleanupFailure = await CompleteAsync().ConfigureAwait(false);
         if (cleanupFailure is not null)
         {
-            Trace.TraceError(
-                "CfSharp SQLite transaction committed, but cleanup failed: {0}",
-                cleanupFailure);
+            ReportCleanupFailure(cleanupFailure, committed: true);
         }
     }
 
@@ -111,11 +110,27 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
             // an await-using scope. Do not mask that business failure with best-effort rollback
             // or connection cleanup diagnostics; explicit RollbackAsync remains available when
             // callers need a surfaced rollback result.
-            Trace.TraceError(
-                "CfSharp SQLite transaction disposal cleanup failed for '{0}': {1}",
-                _databasePath,
-                rollbackFailure);
+            ReportCleanupFailure(rollbackFailure, committed: false);
         }
+    }
+
+    private void ReportCleanupFailure(Exception failure, bool committed)
+    {
+        try { WriteCleanupDiagnostic(_databasePath, failure, committed); }
+        catch (Exception diagnosticFailure) when (diagnosticFailure is not OutOfMemoryException)
+        {
+            // Completion already fenced any unfinished native transaction. Optional tracing
+            // must neither turn a committed transaction into failure nor mask an unwinding error.
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void WriteCleanupDiagnostic(string databasePath, Exception failure, bool committed)
+    {
+        // Keep the Trace reference out of normal transaction JIT compilation. Its assembly
+        // may be inaccessible under an impersonated MSIX identity, even if no error occurs.
+        Trace.TraceError(committed ? "CfSharp SQLite transaction committed, but cleanup failed: {1}" :
+            "CfSharp SQLite transaction disposal cleanup failed for '{0}': {1}", databasePath, failure);
     }
 
     internal SqliteCommand CreateCommand(string commandText, CancellationToken cancellationToken)
@@ -493,7 +508,7 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
         }
     }
 
-    private sealed class OperationRepository : ICloudOperationJournal, ICloudOperationJournalPaging
+    private sealed class OperationRepository : ICloudOperationJournalItemAssociationUpdates, ICloudOperationJournalPaging
     {
         private const string SelectColumns = """
             SELECT operation_id, kind, item_id, payload, created_at_ticks,

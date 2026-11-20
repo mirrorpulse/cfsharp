@@ -212,6 +212,10 @@ public interface ICloudOperationJournal
         CancellationToken cancellationToken = default);
 
     /// <summary>Replaces retry metadata and payload for an existing operation.</summary>
+    /// <remarks>
+    /// Item-association changes additionally require <see cref="ICloudOperationJournalItemAssociationUpdates"/>.
+    /// The supplied operation must retain its assigned sequence.
+    /// </remarks>
     ValueTask UpdateAsync(
         CloudOperationJournalEntry operation,
         CancellationToken cancellationToken = default);

@@ -16,6 +16,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private readonly Action<int, bool> _error;
     private readonly Action? _beforeRearm;
     private readonly int _capacity;
+    private readonly uint _notifyFilter;
     private readonly nint _buffer;
     private readonly nint _overlapped;
     private readonly Task _pump = Task.CompletedTask;
@@ -24,11 +25,13 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private bool _stopping;
 
     internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed,
-        Action<int, bool> error, Action? beforeRearm = null)
+        Action<int, bool> error, Action? beforeRearm = null, uint notifyFilter = 0x100)
     {
+        if (notifyFilter is not (0x100 or 0x4)) { throw new ArgumentOutOfRangeException(nameof(notifyFilter)); }
         _changed = changed;
         _error = error;
         _beforeRearm = beforeRearm;
+        _notifyFilter = notifyFilter;
         _capacity = Math.Clamp(capacity, 4096, 64 * 1024);
         // FILE_LIST_DIRECTORY, all sharing, BACKUP_SEMANTICS | OVERLAPPED. No content read.
         _directory = CreateFile(path, 0x81, 7, 0, 3, 0x42000000, 0);
@@ -64,7 +67,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     {
         // One stable, DWORD-aligned buffer and OVERLAPPED belong to this handle until its
         // last completion is observed. Reset/reuse only after GetOverlappedResult completes.
-        if (!ReadDirectoryChangesEx(_directory, (void*)_buffer, (uint)_capacity, 1, 0x100,
+        if (!ReadDirectoryChangesEx(_directory, (void*)_buffer, (uint)_capacity, 1, _notifyFilter,
             null, (NativeOverlapped*)_overlapped, 0, 2))
         {
             int code = Marshal.GetLastPInvokeError();
@@ -175,7 +178,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
             if (record.FileNameLength == 0 || (record.FileNameLength & 1) != 0 || record.FileNameLength > buffer.Length - header)
             { throw new InvalidDataException("The security notification name is truncated."); }
             int end = checked(header + (int)record.FileNameLength);
-            if (record.Action != 3) { throw new InvalidDataException("Unexpected action in a security-only subscription."); }
+            if (record.Action != 3) { throw new InvalidDataException("Unexpected action in a metadata-only subscription."); }
             changes.Add(new(new string(MemoryMarshal.Cast<byte, char>(buffer[header..end])), record.FileId,
                 record.ParentFileId, (record.FileAttributes & 0x10) != 0));
             if (record.NextEntryOffset == 0) { return changes.ToArray(); }

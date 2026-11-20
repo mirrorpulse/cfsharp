@@ -369,6 +369,37 @@ public abstract class CloudStateStoreContractTests
     }
 
     [Fact]
+    public async Task JournalUpdateClearsItemAssociationAndPreservesOriginalSequence()
+    {
+        await using ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext());
+        Guid itemId = Guid.NewGuid();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        CloudOperationJournalEntry original;
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            await seed.Items.UpsertAsync(new(itemId, "original", "original.bin", CloudItemKind.File, "v1", null, false, now));
+            original = await seed.Operations.EnqueueAsync(new(Guid.NewGuid(), CloudStateOperationKind.MetadataUpdate,
+                itemId, [1, 2], now, 2, now.AddMinutes(1)));
+            await seed.CommitAsync();
+        }
+        await using (ICloudStateTransaction update = await store.BeginTransactionAsync())
+        {
+            Assert.IsAssignableFrom<ICloudOperationJournalItemAssociationUpdates>(update.Operations);
+            await update.Operations.UpdateAsync(new(original.OperationId, original.Kind, null, original.Payload.Span,
+                original.CreatedAt, original.AttemptCount, original.RetryAfter, original.Sequence));
+            Assert.Null((await update.Operations.GetAsync(original.OperationId))!.ItemId);
+            await update.CommitAsync();
+        }
+        await using ICloudStateTransaction read = await store.BeginTransactionAsync();
+        CloudOperationJournalEntry retained = (await read.Operations.GetAsync(original.OperationId))!;
+        Assert.Null(retained.ItemId);
+        Assert.Equal((original.Sequence, original.Kind, original.CreatedAt, original.AttemptCount, original.RetryAfter),
+            (retained.Sequence, retained.Kind, retained.CreatedAt, retained.AttemptCount, retained.RetryAfter));
+        Assert.Equal(original.Payload.ToArray(), retained.Payload.ToArray());
+        Assert.Empty(await read.Operations.ListByItemIdAsync(itemId, 10));
+    }
+
+    [Fact]
     public async Task JournalPreservesSequenceAndRetryUpdates()
     {
         ICloudStateStoreFactory factory = CreateFactory();
