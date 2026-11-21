@@ -27,14 +27,19 @@ internal sealed class CloudMetadataEchoAuthority
         lock (_gate) { return _applying.Contains(id); }
     }
 
-    internal bool IsAuthorized(Guid id, Guid itemId, CloudLocalFileBinding? binding)
+    internal bool IsAuthorized(RemoteMetadataIntent intent)
     {
-        if (binding is null) { return false; }
+        if (intent.Binding is not { } binding || !intent.Coordinated || intent.Passthrough || intent.Superseded ||
+            intent.Reconciled || intent.RequiresReconciliation || intent.HasUnconfirmedOutcome)
+        {
+            return false;
+        }
+
         lock (_gate)
         {
             Prune();
-            return _authorized.TryGetValue(id, out HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>? objects) &&
-                objects.Contains((itemId, binding));
+            return _authorized.TryGetValue(intent.CallId, out HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>? objects) &&
+                objects.Contains((intent.ItemId, binding));
         }
     }
 

@@ -1122,8 +1122,10 @@ public sealed partial class CloudFileSystem
         {
             // Keep unresolved observations and other generations for reconciliation,
             // while revoking any earlier permission before the native write.
-            bool replaceable = previous.Reconciled || (!previous.UsesReconciliationPolicy &&
-                !previous.RequiresReconciliation && (!previous.HasUnconfirmedOutcome || previous.CallId == intent.CallId));
+            bool replaceable = previous.Reconciled || previous.IsConfirmedPassthrough ||
+                _metadataEchoAuthority.IsAuthorized(previous) ||
+                (previous.CallId == intent.CallId && !previous.UsesReconciliationPolicy &&
+                    !previous.RequiresReconciliation && !previous.Superseded);
             if (previous.Completed && replaceable && previous.Binding == binding && previous.Covers(change.RelativePath))
             {
                 await preparation.Checkpoints.RemoveAsync(previous.Name, cancellationToken).ConfigureAwait(false);
@@ -1160,10 +1162,24 @@ public sealed partial class CloudFileSystem
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> checkpoints = await transaction.Checkpoints.ListAsync(
             RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
-        return checkpoints.Select(RemoteMetadataIntent.Decode).Any(intent => !intent.Reconciled &&
-            (intent.Covers(path) || (binding is not null && intent.Binding == binding)) &&
-            (intent.RequiresReconciliation || intent.UsesReconciliationPolicy ||
-                (intent.HasUnconfirmedOutcome && intent.CallId != _metadataEchoCall?.Id)));
+        foreach (CloudStateCheckpoint checkpoint in checkpoints)
+        {
+            RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
+            bool sameObject = binding is not null && intent.Binding == binding;
+            if (intent.Reconciled || (!intent.Covers(path) && !sameObject)) { continue; }
+
+            // The declared writer guarantee covers entries in the current call. A
+            // later call needs a live grant even when the earlier outcome was confirmed.
+            bool currentCall = intent.CallId == _metadataEchoCall?.Id;
+            bool lostCoordination = intent.Coordinated && (!sameObject || intent.Superseded ||
+                (!currentCall && !_metadataEchoAuthority.IsAuthorized(intent)));
+            if (intent.RequiresReconciliation || intent.UsesReconciliationPolicy || lostCoordination ||
+                (intent.HasUnconfirmedOutcome && !currentCall))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,

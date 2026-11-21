@@ -88,6 +88,87 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProtectedUpsertRequiresLiveMetadataCoordinationBeforeNotificationDelivery(bool partialBatch)
+    {
+        const string relative = "Documents";
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-coordination-protected-upsert");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        DelayedMetadataSource source = new(fixture.Root);
+        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        CloudRemoteChangeBatch batch = MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory);
+        CloudRemoteApplyOptions options = new()
+        {
+            AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
+            EchoSuppressionLifetime = partialBatch ? TimeSpan.FromMinutes(2) : TimeSpan.FromMilliseconds(250),
+            MaximumEntries = 1,
+        };
+        if (partialBatch)
+        {
+            CloudRemoteChange second = new("second", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+                "remote-later", CloudItemKind.Directory, relative, identity.ItemId,
+                metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+            batch = new("metadata-partial", Array.Empty<byte>(), [batch.Changes[0], second], new byte[] { 2 });
+        }
+        CloudRemoteApplyResult first = await fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token);
+        Assert.Equal(partialBatch ? CloudRemoteBatchStatus.Applying : CloudRemoteBatchStatus.Applied, first.Status);
+        Assert.Equal(partialBatch, first.RequiresRetry);
+        Assert.Equal(1, first.AppliedEntryCount);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, first.Entries[0].Status);
+        if (partialBatch) { Assert.Equal(CloudRemoteApplyEntryStatus.NotProcessed, first.Entries[1].Status); }
+        if (!partialBatch) { await Task.Delay(options.EchoSuppressionLifetime, deadline.Token); }
+
+        LocalChangeSourceEvent remoteFirst = await source.NextAsync(deadline.Token);
+        LocalChangeSourceEvent remoteSecond = await source.NextAsync(deadline.Token);
+        string path = Path.Combine(fixture.Root, relative);
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        LocalChangeSourceEvent local = await source.NextAsync(deadline.Token);
+        Assert.Equal(relative, local.RelativePath);
+        Assert.Empty(await AccessRowsAsync(factory!));
+        await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+        {
+            RemoteMetadataIntent receipt = RemoteMetadataIntent.Decode(Assert.Single(
+                await state.Checkpoints.ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+            Assert.True(receipt is { Coordinated: true, OutcomeConfirmed: true, RequiresReconciliation: false, Reconciled: false });
+        }
+
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        CloudRemoteApplyResult blocked = await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-protected-upsert", Array.Empty<byte>(), [upsert], new byte[] { 3 }), cancellationToken: deadline.Token);
+        CloudRemoteApplyEntryResult outcome = Assert.Single(blocked.Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, outcome.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, outcome.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        Assert.Equal("remote-r1", (await fixture.System.GetDirectory(relative).InspectAsync(deadline.Token)).RemoteRevision);
+        Assert.Empty(await AccessRowsAsync(factory!));
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        await source.DeliverAsync(remoteFirst);
+        await source.DeliverAsync(remoteSecond);
+        await source.DeliverAsync(local);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 3);
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        Assert.All(originals, row => Assert.Null(row.ItemId));
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await AssertAccessPublicRowsAsync(factory!, feed);
+        await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
+        CloudRemoteApplyResult reconciled = await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-reconciled-upsert", Array.Empty<byte>(), [upsert], new byte[] { 4 }), cancellationToken: deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(reconciled.Entries).Status);
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task ExpiredMetadataCoordinationCannotConsumeTheNextRealAttributeWrite()
     {

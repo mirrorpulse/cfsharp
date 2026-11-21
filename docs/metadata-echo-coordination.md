@@ -58,6 +58,9 @@ and durable observation staging. No attribute or ancestor handle is retained acr
 Generic data/name notifications and independent DACL notifications never redeem this authorization.
 The observation count option for other remote operation kinds does not limit this declared window.
 Authority expires using a monotonic clock, so a wall-clock adjustment cannot extend the promise.
+Once the window expires, the receipt requires reconciliation before the next protected write.
+Entries confirmed in a call stopped by `MaximumEntries` also require reconciliation. Such a
+partial call never activates coordinated authority, even for entries that were applied successfully.
 A subsequent metadata operation or in-place upsert supersedes earlier permission for the affected
 object before writing attributes. An upsert with attribution history under the default policy
 retains uncertain observations for reconciliation. Default upserts without attribution history
@@ -77,12 +80,13 @@ already contains the outcome. The retained preparation requires reconciliation a
 genuine writes. A different native generation cannot inherit authorization at the same name.
 Completed observations staged before a crash recover through the existing metadata-validation
 receipt protocol with the same original operation IDs and sequences.
-The running feed reads retained preparations directly. A failed preparation or an unreconciled
-default-policy result requires reconciliation before any corresponding watcher notification arrives.
-A protected file or directory upsert or metadata update checks this same evidence and reports a
-metadata conflict before writing to the affected placeholder. This applies with an empty journal
-and with unbound observations. Reconciling the object and acknowledging the full rescan allows a
-later protected update. The retained originals still need their individual acknowledgements.
+The running feed reads retained preparations directly. A failed preparation, an unreconciled
+default-policy result, or an unreconciled coordinated receipt without current authorization
+requires reconciliation before any corresponding watcher notification arrives. A protected file
+or directory upsert or metadata update checks this same evidence for the affected native object
+and reports a metadata conflict before writing. This applies with an empty journal and with
+unbound observations. Reconciling the object and acknowledging the full rescan allows a later
+protected update. The retained originals still need their individual acknowledgements.
 
 Passthrough becomes effective for each confirmed entry, including entries applied in a partial
 call limited by `MaximumEntries`. A later failure leaves those confirmed entries intact. If an
