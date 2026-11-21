@@ -326,19 +326,25 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <remarks>
     /// Preserves valid caller-coordinated metadata receipts, including when their windows
     /// expire while acknowledgement waits for storage. An expired receipt can still require
-    /// reconciliation before a subsequent protected remote update.
+    /// reconciliation before a subsequent protected remote update. Receipts from an in-flight
+    /// remote call also remain pending if the call finishes while acknowledgement waits.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// The feed has not started or has stopped with a failure, a remote creation, file move or Delete
-    /// remains pending, a loss signal is not yet durable, or new loss raced this acknowledgement.
+    /// remains pending, a loss signal is not yet durable, or new loss or a new remote metadata
+    /// preparation raced this acknowledgement.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
     public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
     {
         EnsureStarted();
         long generation = Volatile.Read(ref _lossGeneration);
-        Func<RemoteMetadataIntent, bool>? retainAuthorization = _metadataEchoAuthority?.CaptureReconciliationRetention();
+        var retention = _metadataEchoAuthority?.CaptureReconciliationRetention();
         using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        if (retention?.PreparationGeneration != _metadataEchoAuthority?.PreparationGeneration)
+        {
+            throw new InvalidOperationException("A remote metadata update was prepared during acknowledgement. Repeat reconciliation before acknowledging the rescan.");
+        }
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
@@ -349,7 +355,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             throw new InvalidOperationException("Replay pending remote creations, moves and deletions before acknowledging reconciliation.");
         }
-        await ClearReconciledMetadataIntentsAsync(transaction, retainAuthorization, cancellationToken).ConfigureAwait(false);
+        await ClearReconciledMetadataIntentsAsync(transaction, retention?.RetainReceipt, cancellationToken).ConfigureAwait(false);
 
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken).ConfigureAwait(false))

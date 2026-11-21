@@ -209,15 +209,7 @@ public sealed partial class CloudContentConfirmationTests
         await feed.StartAsync(deadline.Token);
         TimeSpan lifetime = TimeSpan.FromSeconds(3);
         await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
-        while (true)
-        {
-            await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
-            {
-                CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
-                if (checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).RequiresFullRescan) { break; }
-            }
-            await Task.Delay(20, deadline.Token);
-        }
+        await WaitForMetadataRescanMarkerAsync(factory!.Store!, deadline.Token);
 
         factory!.Armed = beforeAuthorization;
         Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
@@ -250,6 +242,69 @@ public sealed partial class CloudContentConfirmationTests
         Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
         await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token))
         { Assert.Empty(await state.Operations.ListAsync(10, deadline.Token)); }
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("protected-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StaleRescanAcknowledgementCannotClearANewMetadataReceipt(bool pauseBeforePreparation)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path,
+            pauseBeforePreparation ? "rescan-before-preparation" : "rescan-awaiting-authorization"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-stale-rescan");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
+        await WaitForMetadataRescanMarkerAsync(factory!.Store!, deadline.Token);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        factory.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), cancellationToken: deadline.Token).AsTask();
+        string path = Path.Combine(fixture.Root, relative);
+        Task acknowledge;
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            acknowledge = feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask();
+            Assert.False(acknowledge.IsCompleted);
+            if (!pauseBeforePreparation) { File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden); }
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        if (pauseBeforePreparation)
+        {
+            InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => acknowledge.WaitAsync(deadline.Token));
+            Assert.Contains("A remote metadata update was prepared", error.Message, StringComparison.Ordinal);
+        }
+        else { await acknowledge.WaitAsync(deadline.Token); }
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
+        if (pauseBeforePreparation) { File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden); }
+
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token))
+        {
+            RemoteMetadataIntent receipt = RemoteMetadataIntent.Decode(Assert.Single(
+                await state.Checkpoints.ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+            Assert.True(receipt is { Completed: true, OutcomeConfirmed: true, Reconciled: false });
+            Assert.Empty(await state.Operations.ListAsync(10, deadline.Token));
+        }
         CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
             CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
             metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
@@ -722,6 +777,19 @@ public sealed partial class CloudContentConfirmationTests
         }
     }
 
+    private static async Task WaitForMetadataRescanMarkerAsync(ICloudStateStore store, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await using (ICloudStateTransaction state = await store.BeginTransactionAsync(cancellationToken))
+            {
+                CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, cancellationToken);
+                if (checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).RequiresFullRescan) { return; }
+            }
+            await Task.Delay(20, cancellationToken);
+        }
+    }
+
     private sealed class ControlledMetadataSource : ILocalChangeSource
     {
         private Func<LocalChangeSourceEvent, ValueTask>? _handler;
@@ -740,6 +808,7 @@ public sealed partial class CloudContentConfirmationTests
     {
         private readonly string _boundary = boundary;
         private int _failed;
+        private int _itemMetadataReads;
         private int _pauseNextTransaction;
         internal bool Armed { get; set; }
         internal ICloudStateStore? Store { get; private set; }
@@ -775,7 +844,7 @@ public sealed partial class CloudContentConfirmationTests
             private readonly List<Func<ICloudStateTransaction, CancellationToken, ValueTask>> _writes = [];
             private bool _writesReconciliation;
             public ICloudItemStateRepository Items => inner.Items;
-            public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites ? this : inner.Checkpoints;
+            public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites || owner._boundary == "rescan-before-preparation" ? this : inner.Checkpoints;
             public ICloudOperationJournal Operations => inner.Operations;
             public ICloudConflictRepository Conflicts => inner.Conflicts;
             public ICloudRemoteBatchRepository RemoteBatches => owner.OverlappingWrites ? this : inner.RemoteBatches;
@@ -783,8 +852,18 @@ public sealed partial class CloudContentConfirmationTests
 
             ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken) =>
                 inner.Checkpoints.GetAsync(name, cancellationToken);
-            ValueTask<IReadOnlyList<CloudStateCheckpoint>> ICloudCheckpointRepository.ListAsync(string namePrefix, CancellationToken cancellationToken) =>
-                inner.Checkpoints.ListAsync(namePrefix, cancellationToken);
+            async ValueTask<IReadOnlyList<CloudStateCheckpoint>> ICloudCheckpointRepository.ListAsync(string namePrefix, CancellationToken cancellationToken)
+            {
+                // For a protected write, the first per-item lookup is preflight. The
+                // second is inside preparation after it acquired the publication lease.
+                if (owner.Armed && owner._boundary == "rescan-before-preparation" && namePrefix != RemoteMetadataIntent.Prefix &&
+                    namePrefix.StartsWith(RemoteMetadataIntent.Prefix, StringComparison.Ordinal) && Interlocked.Increment(ref owner._itemMetadataReads) == 2)
+                {
+                    owner.OutcomePaused.TrySetResult();
+                    await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
+                }
+                return await inner.Checkpoints.ListAsync(namePrefix, cancellationToken);
+            }
             ValueTask ICloudCheckpointRepository.UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken)
             {
                 _writes.Add((transaction, token) => transaction.Checkpoints.UpsertAsync(checkpoint, token));

@@ -14,6 +14,9 @@ internal sealed class CloudMetadataEchoAuthority
     private readonly HashSet<Guid> _applying = [];
     private readonly Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> _authorized = [];
     private readonly PriorityQueue<Guid, long> _expirations = new();
+    private long _preparationGeneration;
+
+    internal long PreparationGeneration => Volatile.Read(ref _preparationGeneration);
 
     internal Call Begin()
     {
@@ -58,19 +61,17 @@ internal sealed class CloudMetadataEchoAuthority
         }
     }
 
-    internal Func<RemoteMetadataIntent, bool> CaptureReconciliationRetention()
+    internal (long PreparationGeneration, Func<RemoteMetadataIntent, bool> RetainReceipt) CaptureReconciliationRetention()
     {
-        Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> grants;
-        HashSet<Guid> applying;
         lock (_gate)
         {
             Prune();
             // The sets are copied from the call on authorization and never subsequently changed.
-            grants = new(_authorized);
-            // A call can finish authorizing while the acknowledgement waits for publication.
-            applying = new(_applying);
+            Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> grants = new(_authorized);
+            // A call can publish an outcome while the acknowledgement waits for publication.
+            HashSet<Guid> applying = new(_applying);
+            return (_preparationGeneration, intent => applying.Contains(intent.CallId) || CanAuthorize(intent) && Covers(grants, intent));
         }
-        return intent => CanAuthorize(intent) && (applying.Contains(intent.CallId) || Covers(grants, intent));
     }
 
     private static bool CanAuthorize(RemoteMetadataIntent intent) => intent.Binding is not null &&
@@ -107,7 +108,11 @@ internal sealed class CloudMetadataEchoAuthority
         internal bool HasMetadataPreparation { get; private set; }
         internal IReadOnlyList<string> CommittedOutcomes => _committedOutcomes;
 
-        internal void TrackPreparation() => HasMetadataPreparation = true;
+        internal void TrackPreparation()
+        {
+            HasMetadataPreparation = true;
+            lock (owner._gate) { Interlocked.Increment(ref owner._preparationGeneration); }
+        }
 
         internal void RecordCommittedOutcome(RemoteMetadataIntent? intent)
         {
