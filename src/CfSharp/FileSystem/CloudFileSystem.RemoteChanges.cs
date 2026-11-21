@@ -611,11 +611,12 @@ public sealed partial class CloudFileSystem
 
         RemoteEntryContext context = await ReadRemoteEntryContextAsync(change, cancellationToken)
             .ConfigureAwait(false);
-        if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert &&
-            ((change.ItemId is Guid explicitId && context.LocalState is not null &&
-                context.LocalState.ItemId != explicitId) ||
-            (context.ByItemId is not null && context.ByItemId.RemoteId != change.RemoteId) ||
-            (context.LocalState is not null && context.LocalState.Kind != change.ItemKind)))
+        bool upsert = change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert;
+        bool explicitIdMismatch = change.ItemId is Guid explicitId && context.LocalState is { } resolved &&
+            resolved.ItemId != explicitId;
+        if (((upsert || change.Kind == CloudRemoteChangeKind.MetadataUpdate) && explicitIdMismatch) ||
+            (upsert && ((context.ByItemId is not null && context.ByItemId.RemoteId != change.RemoteId) ||
+                (context.LocalState is not null && context.LocalState.Kind != change.ItemKind))))
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(
                 change, context.LocalState, CloudRemoteConflictReason.PathCollision));
@@ -672,8 +673,6 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.StaleRemoteRevision));
         }
 
-        bool upsert = change.Kind is CloudRemoteChangeKind.FileUpsert or
-            CloudRemoteChangeKind.DirectoryUpsert;
         if (options.PreserveUnsynchronizedLocalContent &&
             context.LocalState is not null && context.LocalOperations.Count != 0)
         {
@@ -705,7 +704,7 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.Move));
         }
 
-        Guid itemId = change.ItemId ?? context.LocalState?.ItemId ?? Guid.NewGuid();
+        Guid itemId = context.LocalState?.ItemId ?? change.ItemId ?? Guid.NewGuid();
         bool localExists = change.ItemKind is CloudItemKind.Directory
             ? Directory.Exists(ToFullPath(change.RelativePath))
             : File.Exists(ToFullPath(change.RelativePath));

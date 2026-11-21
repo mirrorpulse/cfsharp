@@ -34,6 +34,7 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
             'FullyQualifiedName~ProtectedUpsertRequiresLiveMetadataCoordinationBeforeNotificationDelivery',
             'FullyQualifiedName~ProtectedUpsertRechecksMetadataCoordinationAfterPreparation',
             'FullyQualifiedName~RemoteMetadataCompletionPreservesConcurrentReconciliation',
+            'FullyQualifiedName~MetadataUpdateRejectsAnExplicitIdForADifferentItem',
             'FullyQualifiedName~ExpiredMetadataCoordinationWakesIdleRead',
             'FullyQualifiedName~InPlaceMetadataWriteReplacesTheEarlierCoordinatedPolicy',
             'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes',
@@ -45,7 +46,7 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
     elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
-    elseif ($Suite -eq 'AccessJournal') { 34 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
+    elseif ($Suite -eq 'AccessJournal') { 36 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null

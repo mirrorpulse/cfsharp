@@ -84,6 +84,8 @@ already contains the outcome. The retained preparation requires reconciliation a
 genuine writes. A different native generation cannot inherit authorization at the same name.
 If the feed requires reconciliation during the remote apply, the outcome transaction preserves
 that requirement alongside the completed receipt.
+An explicit item ID on a metadata update must match the resolved item before the update
+can write a receipt or change the placeholder.
 Completed observations staged before a crash recover through the existing metadata-validation
 receipt protocol with the same original operation IDs and sequences.
 The running feed reads retained preparations directly. A failed preparation, an unreconciled

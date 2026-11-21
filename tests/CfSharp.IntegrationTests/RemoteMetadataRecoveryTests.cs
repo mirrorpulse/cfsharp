@@ -92,6 +92,61 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MetadataUpdateRejectsAnExplicitIdForADifferentItem(bool staleIdExists)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity target = new(Guid.NewGuid(), "metadata-target", "r1");
+        CloudPlaceholderIdentity other = new(Guid.NewGuid(), "metadata-other", "r1");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, target).WithInSyncState(true).Build(),
+        ]);
+        if (staleIdExists)
+        {
+            await fixture.System.Root.CreatePlaceholdersAsync([
+                CloudDirectoryPlaceholderSpec.CreateBuilder("Other", other).WithInSyncState(true).Build(),
+            ]);
+        }
+        CloudDirectory item = fixture.System.GetDirectory(relative);
+        CloudItemSnapshot original = await item.InspectAsync();
+        DateTime originalLastWrite = Directory.GetLastWriteTimeUtc(item.FullPath);
+        DateTime remoteLastWrite = new(2020, 3, 4, 12, 0, 0, DateTimeKind.Utc);
+        CloudPlaceholderMetadata metadata = CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(remoteLastWrite).Build();
+        CloudRemoteChange stale = new("metadata", CloudRemoteChangeKind.MetadataUpdate, target.RemoteId, "r2",
+            CloudItemKind.Directory, relative, other.ItemId, previousRemoteRevision: "r1", metadata: metadata);
+        CloudRemoteApplyEntryResult rejected = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-stale-id", Array.Empty<byte>(), [stale], new byte[] { 1 }))).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, rejected.Status);
+        Assert.Equal(CloudRemoteConflictReason.PathCollision, rejected.Conflict!.Reason);
+        Assert.Equal(target.ItemId, rejected.Conflict.LocalState!.ItemId);
+        Assert.Equal(originalLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+        CloudItemSnapshot unchanged = await item.InspectAsync();
+        Assert.Equal(original.PlaceholderIdentity.ToArray(), unchanged.PlaceholderIdentity.ToArray());
+        Assert.Equal("r1", unchanged.RemoteRevision);
+        await using (ICloudStateTransaction transaction = await factory!.Store!.BeginTransactionAsync())
+        {
+            Assert.Empty(await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix));
+        }
+
+        CloudRemoteChange valid = new("metadata", CloudRemoteChangeKind.MetadataUpdate, target.RemoteId, "r2",
+            CloudItemKind.Directory, relative, staleIdExists ? target.ItemId : null, previousRemoteRevision: "r1", metadata: metadata);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-valid-id", Array.Empty<byte>(), [valid], new byte[] { 2 }))).Entries).Status);
+        CloudItemSnapshot applied = await item.InspectAsync();
+        Assert.Equal(target.ItemId, applied.ItemId);
+        Assert.Equal("r2", applied.RemoteRevision);
+        Assert.Equal(remoteLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+        await using ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync();
+        RemoteMetadataIntent receipt = RemoteMetadataIntent.Decode(Assert.Single(await state.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)));
+        Assert.Equal(target.ItemId, receipt.ItemId);
+        Assert.Equal(original.LocalBinding, receipt.Binding);
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task ProtectedUpsertRechecksMetadataCoordinationAfterPreparation()
     {
