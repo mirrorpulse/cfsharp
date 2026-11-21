@@ -841,7 +841,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
 
 internal static class SqliteSchema
 {
-    internal const int CurrentVersion = 9;
+    internal const int CurrentVersion = 10;
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
     private static ValueTask<SqliteCloudStateTransaction> BeginSchemaTransactionAsync(
@@ -980,6 +980,24 @@ internal static class SqliteSchema
                 syncRootPath,
                 cancellationToken).ConfigureAwait(false);
             await EnsureOperationItemIndexAsync(connection, cancellationToken).ConfigureAwait(false);
+
+            if (version < CurrentVersion)
+            {
+                // Remote metadata receipts use existing tables, but a schema-9 reader
+                // would ignore pending reconciliation. Commit the fence before opening the store.
+                await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(
+                    connection, databasePath, cancellationToken).ConfigureAwait(false);
+                await using SqliteCommand upgrade = transaction.CreateCommand(
+                    "UPDATE cfsharp_schema SET version = $version WHERE singleton = 1;", cancellationToken);
+                upgrade.Parameters.AddWithValue("$version", CurrentVersion);
+                await upgrade.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                if (await ReadVersionAsync(connection, databasePath, cancellationToken).ConfigureAwait(false) != CurrentVersion)
+                {
+                    throw new SqliteCloudStateStoreException(SqliteCloudStateStoreError.InvalidSchema, databasePath,
+                        "The CfSharp schema marker did not advance to the required recovery protocol version.");
+                }
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception)
         {

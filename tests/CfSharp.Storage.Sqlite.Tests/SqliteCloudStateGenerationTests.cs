@@ -78,7 +78,7 @@ public sealed partial class SqliteCloudStateStoreTests
         await using ICloudStateTransaction verify = await reopened.BeginTransactionAsync();
         Assert.Equal(successorId, (await verify.Items.GetByRelativePathAsync("Docs\\Ä.txt"))!.ItemId);
         Assert.True((await verify.Items.GetByItemIdAsync(originalId))!.IsTombstone);
-        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath, "SELECT version FROM cfsharp_schema;"));
+        Assert.Equal((long)SqliteSchema.CurrentVersion, await ExecuteScalarInt64Async(_databasePath, "SELECT version FROM cfsharp_schema;"));
         Assert.Equal(0L, await ExecuteScalarInt64Async(_databasePath, "SELECT count(*) FROM pragma_foreign_key_check;"));
     }
 

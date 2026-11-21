@@ -148,9 +148,10 @@ to settle a move after later edits instead of clearing or overwriting them.
 
 ### Compatibility and limits
 
-The official SQLite provider upgrades schemas 0–8 in place to **schema 9**, retaining existing
-repositories and enforcing foreign keys. Older providers reject that version before ignoring
-pending file-move evidence. Use matching core/provider packages; never downgrade the schema marker.
+The official SQLite provider upgrades schemas 0–9 in place to **schema 10**, retaining existing
+repositories and enforcing foreign keys. Schema 9 introduced retained generations at the same path.
+The version check prevents older providers from opening incompatible recovery state. Use matching
+core and provider packages.
 Custom stores use the existing public repositories and must atomically isolate transactions across
 all repositories, preserve opaque checkpoints and their ordinal prefix listing, and fence older
 runtimes themselves. Stores lacking those contracts cannot support this protocol. Only metadata

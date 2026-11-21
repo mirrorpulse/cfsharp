@@ -120,7 +120,8 @@ outcome commit throws after persisting, replay can report `AlreadyApplied`, whil
 requires reconciliation for that entry. If only the confirmation write fails, the known apply
 outcome stays successful and any unconfirmed receipt remains conservative. A legacy passthrough
 receipt without durable evidence of a successful native write requires reconciliation.
-Earlier preview builds cannot read receipts written with the new native-write flag.
+The official SQLite store upgrades to schema 10 before writing remote metadata receipts. Preview.15
+and other older SQLite providers reject the upgraded database before opening it for application work.
 
 A new file-system owner does not recover the former caller's promise about external writers.
 Unreconciled attribution evidence fences the feed on restart, even if the original call used
@@ -139,5 +140,7 @@ tickets are ignored. Calling `SuppressProviderEchoAsync` with `MetadataUpdate` n
 Custom stores continue to use the existing transactional checkpoint and journal capabilities.
 They must preserve the new versioned metadata checkpoints exactly, atomically publish completion
 with the remote outcome, and retain the existing journal association-update capability required
-by metadata recovery. There is no new database schema, provider callback or native component.
+by metadata recovery. Custom stores must fence older runtimes from the new receipts. The official
+SQLite upgrade changes the schema marker and retains the existing tables. There is no new provider
+callback or native component.
 The supported Windows and CPU architecture boundaries are unchanged.

@@ -478,13 +478,16 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
         await using ICloudStateStore reopened = await factory.OpenAsync(CreateContext());
     }
 
-    [Fact]
-    public async Task DatabaseCannotBeReusedForAnotherSyncRoot()
+    [Theory]
+    [InlineData(9)]
+    [InlineData(10)]
+    public async Task DatabaseCannotBeReusedForAnotherSyncRoot(int version)
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
         }
 
+        await ExecuteSqlAsync(_databasePath, $"UPDATE cfsharp_schema SET version = {version} WHERE singleton = 1;");
         string otherRoot = Path.Combine(_temporaryDirectory, "other-sync-root");
         Directory.CreateDirectory(otherRoot);
         SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<
@@ -492,6 +495,8 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
                 await CreateFactory().OpenAsync(new CloudStateStoreContext(otherRoot)));
 
         Assert.Equal(SqliteCloudStateStoreError.SyncRootMismatch, exception.Error);
+        Assert.Equal((long)version, await ExecuteScalarInt64Async(_databasePath,
+            "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
     [Fact]
@@ -536,7 +541,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
         }
 
         Assert.Equal(
-            9L,
+            (long)SqliteSchema.CurrentVersion,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -548,7 +553,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task VersionOneRemoteBatchSchemaMigratesToVersionEight()
+    public async Task VersionOneRemoteBatchSchemaMigratesToCurrentVersion()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -563,7 +568,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
         }
 
         Assert.Equal(
-            9L,
+            (long)SqliteSchema.CurrentVersion,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -576,7 +581,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task VersionTwoEchoSuppressionSchemaMigratesToVersionEight()
+    public async Task VersionTwoEchoSuppressionSchemaMigratesToCurrentVersion()
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         {
@@ -591,7 +596,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
         }
 
         Assert.Equal(
-            9L,
+            (long)SqliteSchema.CurrentVersion,
             await ExecuteScalarInt64Async(
                 _databasePath,
                 "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
@@ -620,7 +625,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
             Assert.Equal(new byte[] { 7 }, (await transaction.Checkpoints.GetAsync("existing/checkpoint"))!.Value.ToArray());
         }
 
-        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal((long)SqliteSchema.CurrentVersion, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
@@ -629,6 +634,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
     [InlineData(6)]
     [InlineData(7)]
     [InlineData(8)]
+    [InlineData(9)]
     public async Task PreviousProtocolUpgradePreservesCoordinationRowsAndSequenceAllocation(int previousVersion)
     {
         Guid itemId = Guid.NewGuid();
@@ -687,12 +693,14 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
             await verify.CommitAsync();
         }
 
-        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal((long)SqliteSchema.CurrentVersion, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
-    [Fact]
-    public async Task VersionNineFenceSurvivesProcessExitBeforeApplicationCommit()
+    [Theory]
+    [InlineData(5)]
+    [InlineData(9)]
+    public async Task VersionTenFenceSurvivesProcessExitBeforeApplicationCommit(int previousVersion)
     {
         await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
@@ -701,16 +709,42 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
             await seed.CommitAsync();
         }
 
-        await ExecuteSqlAsync(_databasePath, "UPDATE cfsharp_schema SET version = 5 WHERE singleton = 1;");
+        await ExecuteSqlAsync(_databasePath, $"UPDATE cfsharp_schema SET version = {previousVersion} WHERE singleton = 1;");
         (int exitCode, _) = await RunCrashHarnessAsync("before-commit", _databasePath, _syncRootPath);
         Assert.NotEqual(0, exitCode);
         Assert.True(File.Exists(_databasePath + ".before-commit.started"));
-        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath,
+        Assert.Equal(10L, await ExecuteScalarInt64Async(_databasePath,
             "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
         await using ICloudStateStore recovered = await CreateFactory().OpenAsync(CreateContext());
         await using ICloudStateTransaction verify = await recovered.BeginTransactionAsync();
         Assert.Equal(new byte[] { 12 }, (await verify.Checkpoints.GetAsync("retained/before-crash"))!.Value.ToArray());
         Assert.Null(await verify.Items.GetByRelativePathAsync("crash-recovery.txt"));
+    }
+
+    [Fact]
+    public async Task VersionNineStoreCannotOpenIfItsSchemaMarkerDoesNotAdvance()
+    {
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        {
+        }
+
+        await ExecuteSqlAsync(_databasePath, """
+            UPDATE cfsharp_schema SET version = 9 WHERE singleton = 1;
+            CREATE TRIGGER retain_old_marker BEFORE UPDATE OF version ON cfsharp_schema
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END;
+            """);
+        SqliteCloudStateStoreException error = await Assert.ThrowsAsync<SqliteCloudStateStoreException>(
+            () => CreateFactory().OpenAsync(CreateContext()).AsTask());
+        Assert.Equal(SqliteCloudStateStoreError.InvalidSchema, error.Error);
+        Assert.Equal(9L, await ExecuteScalarInt64Async(_databasePath, "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
+
+        await ExecuteSqlAsync(_databasePath, "DROP TRIGGER retain_old_marker;");
+        await using (ICloudStateStore store = await CreateFactory().OpenAsync(CreateContext()))
+        {
+        }
+        Assert.Equal(10L, await ExecuteScalarInt64Async(_databasePath, "SELECT version FROM cfsharp_schema WHERE singleton = 1;"));
     }
 
     [Fact]
@@ -723,7 +757,7 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
                 singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             );
-            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 10);
+            INSERT INTO cfsharp_schema(singleton, version) VALUES(1, 11);
             """);
 
         SqliteCloudStateStoreException exception = await Assert.ThrowsAsync<
