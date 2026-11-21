@@ -189,7 +189,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
                 .ConfigureAwait(false);
-            bool creation = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
+            bool recovery = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false) ||
+                await RequiresMetadataReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
             int validatedCount = await ValidatedMetadataPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
@@ -198,9 +199,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
             // the durable boundary before reading so loss already pending at entry is also
             // retained across that handoff, rather than mistaken for part of this snapshot.
-            bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
+            bool rescan = recovery || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
                 generation != Volatile.Read(ref _lossGeneration);
-            if (rescan && (creation || operations.Count != 0 ||
+            if (rescan && (recovery || operations.Count != 0 ||
                 Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0))
             {
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
@@ -884,9 +885,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                         (intent.Binding is null && intent.Covers(path.RelativePath))
                     : intent.Covers(path.RelativePath) || intent.ItemId == current?.ItemId).ToArray()
             : [];
-        metadataIntents = EffectiveMetadataIntents(metadataIntents);
-        bool pendingMetadata = metadataIntents.Length != 0 &&
-            !metadataIntents.Any(intent => OwnsMetadataObservation(intent, securityObservation, current?.ItemId));
+        bool pendingMetadata = metadataIntents.Length != 0 && (metadataIntents.Any(NeedsMetadataReconciliation) ||
+            !metadataIntents.Any(intent => intent.IsConfirmedPassthrough ||
+                OwnsMetadataObservation(intent, securityObservation, current?.ItemId)));
         // A delayed observation may arrive after a remote Delete's terminal commit consumed
         // its preparation. Never resurrect that historical identity for a replacement at the
         // same path. Retain the observation without assigning an identity until reconciliation.

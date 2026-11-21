@@ -46,7 +46,7 @@ public sealed partial class CloudLocalChangeFeedTests
         byte[] payload = new LocalChangePayload(intent.RelativePath, null, false, DateTimeOffset.UtcNow).Encode();
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
         {
-            await seed.Checkpoints.UpsertAsync(new(intent.Name, evidence.Value.Span[..^1], evidence.UpdatedAt));
+            await seed.Checkpoints.UpsertAsync(new(intent.Name, evidence.Value.Span[..^2], evidence.UpdatedAt));
             await seed.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null, payload, DateTimeOffset.UtcNow));
             await seed.CommitAsync();
         }
@@ -56,5 +56,25 @@ public sealed partial class CloudLocalChangeFeedTests
         await using ICloudStateTransaction retained = await store.BeginTransactionAsync();
         Assert.NotNull(await retained.Checkpoints.GetAsync(intent.Name));
         Assert.NotNull(await retained.Operations.GetAsync(operationId));
+    }
+
+    [Fact]
+    public async Task LegacyCompletedPassthroughWithoutConfirmationRequiresReconciliation()
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        RemoteMetadataIntent intent = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "directory", null,
+            Coordinated: false, Completed: true)
+        { Passthrough = true };
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            // Older receipts end at the passthrough flag, before the confirmation byte.
+            await seed.Checkpoints.UpsertAsync(new(intent.Name, intent.Encode().AsSpan()[..^1], DateTimeOffset.UtcNow));
+            await seed.CommitAsync();
+        }
+        await using CloudLocalChangeFeed feed = CreateFeed(store, new FakeSource());
+        await feed.StartAsync();
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync();
+        Assert.False((await feed.BeginScanAsync()).RequiresFullRescan);
     }
 }

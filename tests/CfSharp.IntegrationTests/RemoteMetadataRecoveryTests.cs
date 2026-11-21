@@ -77,11 +77,22 @@ public sealed partial class CloudContentConfirmationTests
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
         await feed.StartAsync();
         factory!.Armed = true;
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         if (boundary == "preparation-after")
         {
-            CloudRemoteApplyResult failed = await fixture.System.ApplyRemoteChangesAsync(batch, options);
+            CloudLocalChangeScan before = await feed.BeginScanAsync(deadline.Token);
+            Assert.False(before.RequiresFullRescan);
+            Task<CloudLocalChangeBatch> waiting = feed.ReadBatchAsync(deadline.Token).AsTask();
+            Assert.False(waiting.IsCompleted);
+            CloudRemoteApplyResult failed = await fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token);
             Assert.True(failed.RequiresRetry);
             Assert.IsType<IOException>(Assert.Single(failed.Entries).Error);
+            // The native update never ran, so no watcher event can unblock the live readers.
+            Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            Assert.True((await feed.ReadPageAsync(before, 0, 10, deadline.Token)).RequiresFullRescan);
+            Assert.True((await waiting).RequiresFullRescan);
+            await using ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token);
+            Assert.Empty(await state.Operations.ListAsync(10, cancellationToken: deadline.Token));
         }
         else if (boundary == "staging-after")
         {
@@ -92,7 +103,6 @@ public sealed partial class CloudContentConfirmationTests
             await Assert.ThrowsAsync<IOException>(() => fixture.System.ApplyRemoteChangesAsync(batch, options).AsTask());
         }
 
-        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         if (boundary == "staging-after")
         {
             Guid interrupted = await factory.Staged.Task.WaitAsync(deadline.Token);
@@ -153,6 +163,48 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(0, fixture.Provider.Fetches);
     }
 
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(null)]
+    [InlineData("outcome-after")]
+    [InlineData("passthrough-confirmation-before")]
+    public async Task PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes(string? boundary)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary ?? "outcome-after"));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-passthrough-outcome");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CloudRemoteChange change = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, "Documents", identity.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+        CloudRemoteChangeBatch batch = new("metadata-fault", Array.Empty<byte>(), [change], new byte[] { 1 });
+        CloudRemoteApplyOptions options = new() { SuppressLocalEcho = false };
+        factory!.Armed = boundary is not null;
+        if (boundary == "outcome-after")
+        { await Assert.ThrowsAsync<IOException>(() => fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token).AsTask()); }
+        else
+        { Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token)).Status); }
+
+        // A fresh feed has no captured watcher events and must read the outcome evidence itself.
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync(deadline.Token);
+        bool requiresReconciliation = boundary is not null;
+        Assert.Equal(requiresReconciliation, (await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        CloudRemoteApplyResult replay = await fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, Assert.Single(replay.Entries).Status);
+        Assert.Equal(requiresReconciliation, (await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        Assert.Equal("remote-r1", (await fixture.System.GetDirectory("Documents").InspectAsync(deadline.Token)).RemoteRevision);
+        if (requiresReconciliation)
+        {
+            await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+            Assert.False((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        }
+    }
+
     private sealed class MetadataFaultFactory(string path, string boundary) : ICloudStateStoreFactory
     {
         private readonly string _boundary = boundary;
@@ -195,6 +247,7 @@ public sealed partial class CloudContentConfirmationTests
                     {
                         "preparation-after" => intents.Any(intent => !intent.Completed),
                         "staging-after" => staged is not null,
+                        "passthrough-confirmation-before" => intents.Any(intent => intent.PassthroughConfirmed),
                         _ => intents.Any(intent => intent.Completed) &&
                             (await RemoteBatches.GetAsync("metadata-fault", cancellationToken))?.Status == CloudRemoteBatchStatus.Applied,
                     };
@@ -208,7 +261,8 @@ public sealed partial class CloudContentConfirmationTests
                     await inner.CommitAsync(cancellationToken);
                     return;
                 }
-                if (owner._boundary != "outcome-before") { await inner.CommitAsync(cancellationToken); }
+                if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before"))
+                { await inner.CommitAsync(cancellationToken); }
                 if (staged is not null)
                 { owner.Staged.TrySetResult(Guid.ParseExact(staged.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N")); }
                 throw new IOException("Injected metadata attribution boundary: " + owner._boundary);

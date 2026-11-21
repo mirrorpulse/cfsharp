@@ -74,6 +74,17 @@ not activate automatic suppression. The retained preparation requires reconcilia
 consume a later genuine write. A different native generation cannot inherit authorization at
 the same name. Completed observations staged before a crash recover through the existing
 metadata-validation receipt protocol with the same original operation IDs and sequences.
+The running feed also reads retained preparations directly, so a failed preparation can signal
+reconciliation even when it produced no native notification. A protected file or directory upsert
+checks this same evidence before updating an existing placeholder, including when the journaled
+observation is unbound. Reconciliation authorizes later protected upserts. The retained originals
+still need their individual acknowledgements.
+
+Passthrough becomes effective after the successful batch outcome is confirmed separately. If the
+outcome commit throws after persisting, replay can report `AlreadyApplied`, while the feed still
+requires reconciliation. If only the confirmation write fails, the known apply outcome stays
+successful and any unconfirmed receipt remains conservative. Older passthrough receipts without
+confirmation also require reconciliation.
 
 A new file-system owner does not recover the former caller's promise about external writers.
 Unreconciled attribution evidence fences the feed on restart, even if the original call used

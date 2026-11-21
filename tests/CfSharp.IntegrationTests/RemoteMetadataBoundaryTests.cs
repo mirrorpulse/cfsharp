@@ -5,6 +5,63 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(CloudItemKind.Directory)]
+    [InlineData(CloudItemKind.File)]
+    public async Task ProtectedUpsertCannotOverwriteAnUnreconciledAttributeEdit(CloudItemKind kind)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-protected-upsert");
+        bool directory = kind == CloudItemKind.Directory;
+        string relative = directory ? "Documents" : fixture.File.RelativePath;
+        string path = Path.Combine(fixture.Root, relative);
+        if (directory)
+        {
+            await fixture.System.Root.CreatePlaceholdersAsync([
+                CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+            ]);
+        }
+        else
+        {
+            await File.WriteAllBytesAsync(path, "original resident content"u8.ToArray());
+            await fixture.File.ConvertToPlaceholderAsync(identity);
+            await fixture.File.SetInSyncAsync(true);
+        }
+        CloudItem item = directory ? fixture.System.GetDirectory(relative) : fixture.System.GetFile(relative);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, kind), cancellationToken: deadline.Token)).Status);
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count >= (directory ? 3 : 2));
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        Assert.All(originals, row => Assert.Null(row.ItemId));
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        CloudRemoteChange update = new("upsert", directory ? CloudRemoteChangeKind.DirectoryUpsert : CloudRemoteChangeKind.FileUpsert,
+            identity.RemoteId, "remote-r2", kind, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            length: directory ? null : 0, metadata: (directory ? CloudPlaceholderMetadata.CreateDirectoryBuilder()
+                : CloudPlaceholderMetadata.CreateFileBuilder()).WithAttributes(directory ? FileAttributes.Directory : FileAttributes.Normal).Build());
+        CloudRemoteApplyResult result = await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-upsert", Array.Empty<byte>(), [update], new byte[] { 2 }), cancellationToken: deadline.Token);
+        CloudRemoteApplyEntryResult entry = Assert.Single(result.Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, entry.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, entry.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        Assert.Equal("remote-r1", (await item.InspectAsync(deadline.Token)).RemoteRevision);
+        AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
+
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
+        CloudRemoteApplyResult afterReconciliation = await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-upsert-reconciled", Array.Empty<byte>(), [update], new byte[] { 3 }), cancellationToken: deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(afterReconciliation.Entries).Status);
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task ExpiredMetadataCoordinationCannotConsumeTheNextRealAttributeWrite()
     {

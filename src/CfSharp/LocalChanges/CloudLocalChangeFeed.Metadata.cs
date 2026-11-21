@@ -13,6 +13,15 @@ public sealed partial class CloudLocalChangeFeed
         observation is { Action: LocalChangeSourceAction.AttributesModified, SecurityIdentity: { } identity } &&
         intent.Matches(identity, itemId);
 
+    private async ValueTask<bool> RequiresMetadataReconciliationAsync(ICloudStateTransaction transaction,
+        CancellationToken cancellationToken) => (await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
+            .Any(NeedsMetadataReconciliation);
+
+    private bool NeedsMetadataReconciliation(RemoteMetadataIntent intent) => !intent.Reconciled &&
+        (intent.RequiresReconciliation || (intent.HasUnconfirmedOutcome && _metadataEchoAuthority?.IsApplying(intent.CallId) != true));
+
+    internal void NotifyRemoteMetadataCallEnded() => SignalAvailable();
+
     private async ValueTask<(bool Changed, bool RequiresReconciliation)> RecoverMetadataIntentsAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken)
     {
@@ -20,7 +29,7 @@ public sealed partial class CloudLocalChangeFeed
         bool changed = false;
         foreach (RemoteMetadataIntent intent in await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
         {
-            if (IsMetadataPassthrough(intent)) { continue; }
+            if (intent.IsConfirmedPassthrough) { continue; }
             if (intent.Reconciled && !intent.RequiresReconciliation)
             {
                 continue;
@@ -45,8 +54,11 @@ public sealed partial class CloudLocalChangeFeed
         RemoteMetadataIntent[] candidates = (await ReadMetadataIntentsAsync(transaction, cancellationToken, entry.ItemId).ConfigureAwait(false))
             .Where(intent => intent.Matches(identity, intent.ItemId) ||
                 ((intent.Binding is null || intent.RequiresReconciliation) && intent.Covers(payload.RelativePath))).ToArray();
-        if (candidates.Any(IsMetadataPassthrough)) { return false; }
-        if (candidates.Any(intent => OwnsMetadataObservation(intent, observation, entry.ItemId))) { return true; }
+        if (!candidates.Any(NeedsMetadataReconciliation))
+        {
+            if (candidates.Any(intent => intent.IsConfirmedPassthrough)) { return false; }
+            if (candidates.Any(intent => OwnsMetadataObservation(intent, observation, entry.ItemId))) { return true; }
+        }
         if (candidates.Length != 0)
         {
             // Authority can expire or be invalidated after staging. Keep the same original
@@ -55,12 +67,6 @@ public sealed partial class CloudLocalChangeFeed
         }
         return false;
     }
-
-    private static RemoteMetadataIntent[] EffectiveMetadataIntents(RemoteMetadataIntent[] intents) =>
-        intents.Any(IsMetadataPassthrough) ? [] : intents.Where(intent => !intent.Passthrough || !intent.Completed || intent.RequiresReconciliation).ToArray();
-
-    private static bool IsMetadataPassthrough(RemoteMetadataIntent intent) =>
-        intent.Passthrough && intent.Completed && !intent.Superseded && !intent.RequiresReconciliation;
 
     private async ValueTask ClearReconciledMetadataIntentsAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken)
