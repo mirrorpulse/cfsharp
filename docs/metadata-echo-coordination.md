@@ -75,11 +75,12 @@ already contains the outcome. The retained preparation requires reconciliation a
 genuine writes. A different native generation cannot inherit authorization at the same name.
 Completed observations staged before a crash recover through the existing metadata-validation
 receipt protocol with the same original operation IDs and sequences.
-The running feed also reads retained preparations directly, so a failed preparation can signal
-reconciliation even when it produced no native notification. A protected file or directory upsert
-checks this same evidence before updating an existing placeholder, including when the journaled
-observation is unbound. Reconciliation authorizes later protected upserts. The retained originals
-still need their individual acknowledgements.
+The running feed reads retained preparations directly. A failed preparation or an unreconciled
+default-policy result requires reconciliation before any corresponding watcher notification arrives.
+A protected file or directory upsert or metadata update checks this same evidence and reports a
+metadata conflict before writing to the affected placeholder. This applies with an empty journal
+and with unbound observations. Reconciling the object and acknowledging the full rescan allows a
+later protected update. The retained originals still need their individual acknowledgements.
 
 Passthrough becomes effective for each confirmed entry, including entries applied in a partial
 call limited by `MaximumEntries`. A later failure leaves those confirmed entries intact. If an

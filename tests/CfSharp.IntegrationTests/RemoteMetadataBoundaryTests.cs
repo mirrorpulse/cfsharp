@@ -6,9 +6,11 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(CloudItemKind.Directory)]
-    [InlineData(CloudItemKind.File)]
-    public async Task ProtectedUpsertCannotOverwriteAnUnreconciledAttributeEdit(CloudItemKind kind)
+    [InlineData(CloudItemKind.Directory, false)]
+    [InlineData(CloudItemKind.File, false)]
+    [InlineData(CloudItemKind.Directory, true)]
+    [InlineData(CloudItemKind.File, true)]
+    public async Task ProtectedUpsertCannotOverwriteAnUnreconciledAttributeEdit(CloudItemKind kind, bool delayDelivery)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -29,15 +31,31 @@ public sealed partial class CloudContentConfirmationTests
             await fixture.File.SetInSyncAsync(true);
         }
         CloudItem item = directory ? fixture.System.GetDirectory(relative) : fixture.System.GetFile(relative);
-        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        DelayedMetadataSource? source = delayDelivery ? new(fixture.Root) : null;
+        await using CloudLocalChangeFeed feed = source is null
+            ? fixture.System.CreateLocalChangeFeed() : new(fixture.Root, factory!.Store!, new(), source);
         await feed.StartAsync();
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
             MetadataBoundaryBatch(identity, relative, kind), cancellationToken: deadline.Token)).Status);
+        int notificationCount = directory ? 3 : 2;
+        List<LocalChangeSourceEvent> withheld = [];
+        if (source is not null)
+        {
+            for (int i = 1; i < notificationCount; i++) { withheld.Add(await source.NextAsync(deadline.Token)); }
+        }
         File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
-        await WaitForAccessRowsAsync(factory!, rows => rows.Count >= (directory ? 3 : 2));
-        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
-        Assert.All(originals, row => Assert.Null(row.ItemId));
+        if (source is not null)
+        {
+            withheld.Add(await source.NextAsync(deadline.Token));
+            Assert.All(withheld, change => Assert.Equal(relative, change.RelativePath));
+            Assert.Empty(await AccessRowsAsync(factory!));
+        }
+        else
+        {
+            await WaitForAccessRowsAsync(factory!, rows => rows.Count >= notificationCount);
+        }
+        IReadOnlyList<CloudOperationJournalEntry> beforeUpsert = await AccessRowsAsync(factory!);
         Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
 
         CloudRemoteChange update = new("upsert", directory ? CloudRemoteChangeKind.DirectoryUpsert : CloudRemoteChangeKind.FileUpsert,
@@ -51,7 +69,15 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudRemoteConflictReason.Metadata, entry.Conflict!.Reason);
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
         Assert.Equal("remote-r1", (await item.InspectAsync(deadline.Token)).RemoteRevision);
-        AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
+        AssertOriginalAccessRows(beforeUpsert, await AccessRowsAsync(factory!));
+        if (source is not null)
+        {
+            foreach (LocalChangeSourceEvent change in withheld) { await source.DeliverAsync(change); }
+            await WaitForAccessRowsAsync(factory!, rows => rows.Count >= notificationCount);
+        }
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        AssertOriginalAccessRows(beforeUpsert, originals);
+        Assert.All(originals, row => Assert.Null(row.ItemId));
 
         await feed.AcknowledgeFullRescanAsync(deadline.Token);
         await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);

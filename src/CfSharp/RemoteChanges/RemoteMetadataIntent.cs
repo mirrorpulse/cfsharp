@@ -13,6 +13,7 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal bool OutcomeConfirmed { get; init; }
     internal bool IsConfirmedPassthrough => Passthrough && !HasUnconfirmedOutcome && !Superseded && !RequiresReconciliation;
     internal bool HasUnconfirmedOutcome => !Completed || !OutcomeConfirmed;
+    internal bool UsesReconciliationPolicy => !Coordinated && !Passthrough;
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal static string ItemPrefix(Guid itemId) => Prefix + itemId.ToString("N") + "/";
     internal string Name => ItemPrefix(ItemId) + Id.ToString("N");

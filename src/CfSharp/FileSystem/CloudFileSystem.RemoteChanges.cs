@@ -724,8 +724,8 @@ public sealed partial class CloudFileSystem
                     CloudRemoteConflictReason.Content));
             }
 
-            // All update variants can write attributes. Unbound observations have no
-            // ItemId in the journal, so consult the original object's reconciliation evidence.
+            // All update variants can write attributes. Consult the durable attribution
+            // evidence even if the watcher has not published an observation yet.
             if (options.PreserveUnsynchronizedLocalContent && await HasUnreconciledRemoteMetadataAsync(
                 context.LocalState.ItemId, change.RelativePath, snapshot.LocalBinding, cancellationToken).ConfigureAwait(false))
             {
@@ -786,8 +786,8 @@ public sealed partial class CloudFileSystem
                     // A new policy cannot inherit an older call's live permission. Completed
                     // history for this exact generation is represented by the new marker;
                     // incomplete work and other generations remain available for reconciliation.
-                    bool replaceable = previous.Reconciled || previous.CallId == metadataIntent.CallId ||
-                        (!previous.HasUnconfirmedOutcome && !previous.RequiresReconciliation);
+                    bool replaceable = previous.Reconciled || (!previous.UsesReconciliationPolicy &&
+                        !previous.RequiresReconciliation && (!previous.HasUnconfirmedOutcome || previous.CallId == metadataIntent.CallId));
                     if (previous.Completed && replaceable && previous.ItemId == itemId && previous.Binding == metadataBinding &&
                         previous.Covers(change.RelativePath))
                     { await preparation.Checkpoints.RemoveAsync(checkpoint.Name, cancellationToken).ConfigureAwait(false); }
@@ -1155,7 +1155,8 @@ public sealed partial class CloudFileSystem
             RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
         return checkpoints.Select(RemoteMetadataIntent.Decode).Any(intent => !intent.Reconciled &&
             (intent.Covers(path) || (binding is not null && intent.Binding == binding)) &&
-            (intent.RequiresReconciliation || (intent.HasUnconfirmedOutcome && intent.CallId != _metadataEchoCall?.Id)));
+            (intent.RequiresReconciliation || intent.UsesReconciliationPolicy ||
+                (intent.HasUnconfirmedOutcome && intent.CallId != _metadataEchoCall?.Id)));
     }
 
     private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,

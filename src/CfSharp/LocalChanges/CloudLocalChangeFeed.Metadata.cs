@@ -19,7 +19,8 @@ public sealed partial class CloudLocalChangeFeed
             .Any(NeedsMetadataReconciliation);
 
     private bool NeedsMetadataReconciliation(RemoteMetadataIntent intent) => !intent.Reconciled &&
-        (intent.RequiresReconciliation || (intent.HasUnconfirmedOutcome && _metadataEchoAuthority?.IsApplying(intent.CallId) != true));
+        (intent.RequiresReconciliation || ((intent.HasUnconfirmedOutcome || intent.UsesReconciliationPolicy) &&
+            _metadataEchoAuthority?.IsApplying(intent.CallId) != true));
 
     internal void NotifyRemoteMetadataCallEnded() => SignalAvailable();
 
