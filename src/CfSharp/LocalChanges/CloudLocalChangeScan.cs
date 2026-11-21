@@ -2,6 +2,31 @@ using System.Collections.ObjectModel;
 
 namespace CfSharp;
 
+/// <summary>Identifies the start of one application-led full reconciliation of a sync root.</summary>
+/// <remarks>
+/// This immutable boundary owns no resources and can be read concurrently. Use it only with
+/// the running feed that created it. After a restart or a rejected acknowledgement, capture
+/// a fresh boundary before reconciling again.
+/// </remarks>
+public sealed class CloudLocalChangeRescan
+{
+    internal CloudLocalChangeRescan(Guid storeScope, long lossGeneration, long acknowledgementGeneration,
+        long? metadataGeneration, Func<RemoteMetadataIntent, bool>? retainReceipt)
+    {
+        StoreScope = storeScope;
+        LossGeneration = lossGeneration;
+        AcknowledgementGeneration = acknowledgementGeneration;
+        MetadataGeneration = metadataGeneration;
+        RetainReceipt = retainReceipt;
+    }
+
+    internal Guid StoreScope { get; }
+    internal long LossGeneration { get; }
+    internal long AcknowledgementGeneration { get; }
+    internal long? MetadataGeneration { get; }
+    internal Func<RemoteMetadataIntent, bool>? RetainReceipt { get; }
+}
+
 /// <summary>Retains a finite journal boundary belonging to one running local-change feed.</summary>
 /// <remarks>
 /// This immutable, concurrently readable value owns no transaction, reader, watcher, or native

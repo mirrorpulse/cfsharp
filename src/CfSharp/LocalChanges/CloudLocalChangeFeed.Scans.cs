@@ -6,6 +6,46 @@ public sealed partial class CloudLocalChangeFeed
     private long _lossGeneration;
     private long _persistedLossGeneration;
     private long _rescanAcknowledgementGeneration;
+    private CloudLocalChangeRescan? _observedRescan;
+
+    /// <summary>Captures the boundary immediately before the application starts a full rescan.</summary>
+    /// <returns>A boundary to pass back when acknowledging the completed reconciliation.</returns>
+    /// <remarks>
+    /// This operation reads in-memory state. It does not scan the filesystem, wait for watcher
+    /// notifications or require the optional paging capability. Use the returned boundary with
+    /// <see cref="AcknowledgeFullRescanAsync(CloudLocalChangeRescan, CancellationToken)"/>.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The feed is not started or its worker failed.</exception>
+    /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    public CloudLocalChangeRescan BeginFullRescan()
+    {
+        EnsureStarted();
+        ThrowIfFailed();
+        return CaptureRescanBoundary();
+    }
+
+    private CloudLocalChangeRescan CaptureRescanBoundary()
+    {
+        long lossGeneration = Volatile.Read(ref _lossGeneration);
+        long acknowledgementGeneration = Volatile.Read(ref _rescanAcknowledgementGeneration);
+        var metadata = _metadataEchoAuthority?.CaptureReconciliationRetention();
+        return new CloudLocalChangeRescan(_scanScope, lossGeneration, acknowledgementGeneration,
+            metadata?.ReconciliationGeneration, metadata?.RetainReceipt);
+    }
+
+    private void RememberObservedRescan(long acknowledgementGeneration)
+    {
+        // Legacy clients start a reconciliation on the first full-rescan result. A later
+        // probe must not advance the boundary for the reconciliation already in progress.
+        if (_metadataEchoAuthority is not null && Volatile.Read(ref _observedRescan) is null)
+        {
+            lock (_gate)
+            {
+                if (_observedRescan is null && acknowledgementGeneration == _rescanAcknowledgementGeneration)
+                { Volatile.Write(ref _observedRescan, CaptureRescanBoundary()); }
+            }
+        }
+    }
 
     /// <summary>Captures a finite boundary for non-waiting, bounded reads of pending local changes.</summary>
     /// <param name="cancellationToken">Token that cancels the read without changing durable state.</param>
@@ -39,6 +79,7 @@ public sealed partial class CloudLocalChangeFeed
         ThrowIfFailed();
         rescan |= HasUnpersistedLoss || generation != Volatile.Read(ref _lossGeneration) ||
             acknowledgementGeneration != Volatile.Read(ref _rescanAcknowledgementGeneration);
+        if (rescan) { RememberObservedRescan(acknowledgementGeneration); }
         return new CloudLocalChangeScan(_scanScope, through, rescan, generation, acknowledgementGeneration);
     }
 
@@ -97,6 +138,7 @@ public sealed partial class CloudLocalChangeFeed
         if (rescan)
         {
             changes = [];
+            RememberObservedRescan(scan.AcknowledgementGeneration);
         }
 
         return new CloudLocalChangePage(changes, rescan ? afterSequence : lastScanned,

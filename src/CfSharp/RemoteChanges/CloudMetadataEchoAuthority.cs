@@ -14,9 +14,15 @@ internal sealed class CloudMetadataEchoAuthority
     private readonly HashSet<Guid> _applying = [];
     private readonly Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> _authorized = [];
     private readonly PriorityQueue<Guid, long> _expirations = new();
-    private long _preparationGeneration;
+    private long _reconciliationGeneration;
 
-    internal long PreparationGeneration => Volatile.Read(ref _preparationGeneration);
+    internal long ReconciliationGeneration => Volatile.Read(ref _reconciliationGeneration);
+
+    // Called while the publication lease orders the metadata change against acknowledgement.
+    internal void TrackReconciliationChange()
+    {
+        lock (_gate) { Interlocked.Increment(ref _reconciliationGeneration); }
+    }
 
     internal Call Begin()
     {
@@ -61,7 +67,7 @@ internal sealed class CloudMetadataEchoAuthority
         }
     }
 
-    internal (long PreparationGeneration, Func<RemoteMetadataIntent, bool> RetainReceipt) CaptureReconciliationRetention()
+    internal (long ReconciliationGeneration, Func<RemoteMetadataIntent, bool> RetainReceipt) CaptureReconciliationRetention()
     {
         lock (_gate)
         {
@@ -70,7 +76,7 @@ internal sealed class CloudMetadataEchoAuthority
             Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> grants = new(_authorized);
             // A call can publish an outcome while the acknowledgement waits for publication.
             HashSet<Guid> applying = new(_applying);
-            return (_preparationGeneration, intent => applying.Contains(intent.CallId) || CanAuthorize(intent) && Covers(grants, intent));
+            return (_reconciliationGeneration, intent => applying.Contains(intent.CallId) || CanAuthorize(intent) && Covers(grants, intent));
         }
     }
 
@@ -111,7 +117,7 @@ internal sealed class CloudMetadataEchoAuthority
         internal void TrackPreparation()
         {
             HasMetadataPreparation = true;
-            lock (owner._gate) { Interlocked.Increment(ref owner._preparationGeneration); }
+            owner.TrackReconciliationChange();
         }
 
         internal void RecordCommittedOutcome(RemoteMetadataIntent? intent)

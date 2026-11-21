@@ -141,8 +141,9 @@ await feed.StartAsync(cancellationToken);
 CloudLocalChangeBatch batch = await feed.ReadBatchAsync(cancellationToken);
 if (batch.RequiresFullRescan)
 {
+    CloudLocalChangeRescan rescan = feed.BeginFullRescan();
     await ReconcileEntireSyncRootAsync(fileSystem, cancellationToken);
-    await feed.AcknowledgeFullRescanAsync(cancellationToken);
+    await feed.AcknowledgeFullRescanAsync(rescan, cancellationToken);
 }
 else
 {
@@ -228,9 +229,15 @@ the read, even when the worker commits the rescan marker before the reading tran
 The original journal remains pending until explicitly acknowledged after reconciliation.
 
 An overflow/error or a full-rescan acknowledgement invalidates previously captured scans even
-after the durable marker is cleared. Begin a new scan after recovery. If a new loss races
-`AcknowledgeFullRescanAsync`, it either rejects acknowledgement with `InvalidOperationException`
-or remains observable as a new rescan condition; finish reconciliation before retrying.
+after the durable marker is cleared. Capture a full-rescan boundary immediately before reconciling
+and pass it to `AcknowledgeFullRescanAsync`. New metadata evidence or a loss signal can
+invalidate the boundary, requiring a new boundary and reconciliation before retrying. Receipts
+from metadata calls still in flight when reconciliation starts remain pending.
+
+For remote metadata, the overload without a boundary uses the first rescan requirement delivered
+by a read since the previous acknowledgement. Later reads do not move that boundary. After a
+stale acknowledgement, read a fresh rescan requirement before rescanning. Use an explicit
+boundary when starting your own full rescan.
 
 ## Directory rename projection
 

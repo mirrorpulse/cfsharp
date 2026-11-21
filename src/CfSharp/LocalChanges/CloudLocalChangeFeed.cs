@@ -188,6 +188,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // prunes the grant during this read, we still wake by its deadline.
             long? metadataExpiration = _metadataEchoAuthority?.GetNextExpirationTimestamp();
             long generation = Volatile.Read(ref _persistedLossGeneration);
+            long acknowledgementGeneration = Volatile.Read(ref _rescanAcknowledgementGeneration);
             await using ICloudStateTransaction transaction = await _stateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -207,6 +208,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             if (rescan && (recovery || operations.Count != 0 ||
                 Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0))
             {
+                RememberObservedRescan(acknowledgementGeneration);
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
             }
 
@@ -324,29 +326,77 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
     /// <remarks>
-    /// Preserves valid caller-coordinated metadata receipts, including when their windows
-    /// expire while acknowledgement waits for storage. An expired receipt can still require
-    /// reconciliation before a subsequent protected remote update. Receipts from an in-flight
-    /// remote call also remain pending if the call finishes while acknowledgement waits.
+    /// For remote metadata this overload uses the first rescan requirement delivered since the
+    /// last acknowledgement. After a stale acknowledgement, read a fresh rescan requirement
+    /// before rescanning. For a caller-initiated rescan, call <see cref="BeginFullRescan"/>
+    /// before scanning and acknowledge its returned boundary.
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// The feed has not started or has stopped with a failure, a remote creation, file move or Delete
-    /// remains pending, a loss signal is not yet durable, or new loss or a new remote metadata
-    /// preparation raced this acknowledgement.
+    /// remains pending, a loss signal is not yet durable, or new loss or metadata evidence
+    /// invalidated the reconciliation boundary.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
-    public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
+    public ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default) =>
+        AcknowledgeFullRescanCoreAsync(Volatile.Read(ref _observedRescan), validateRescanLoss: false, cancellationToken);
+
+    /// <summary>Acknowledges a full rescan completed from the supplied reconciliation boundary.</summary>
+    /// <param name="rescan">The boundary captured by <see cref="BeginFullRescan"/> before reconciliation.</param>
+    /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
+    /// <remarks>
+    /// Only the feed that created the boundary can accept it. A new loss signal, another
+    /// acknowledgement, or new metadata evidence can invalidate it. Receipts from calls
+    /// in flight and grants still valid when reconciliation started remain protected.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The boundary is null.</exception>
+    /// <exception cref="ArgumentException">The boundary belongs to another feed lifetime.</exception>
+    /// <exception cref="InvalidOperationException">The boundary is stale, recovery is pending, or the feed is not running.</exception>
+    /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    public ValueTask AcknowledgeFullRescanAsync(CloudLocalChangeRescan rescan, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(rescan);
+        if (rescan.StoreScope != _scanScope)
+        {
+            throw new ArgumentException("The rescan belongs to another feed lifetime.", nameof(rescan));
+        }
+        return AcknowledgeFullRescanCoreAsync(rescan, validateRescanLoss: true, cancellationToken);
+    }
+
+    private async ValueTask AcknowledgeFullRescanCoreAsync(CloudLocalChangeRescan? rescan, bool validateRescanLoss,
+        CancellationToken cancellationToken)
     {
         EnsureStarted();
-        long generation = Volatile.Read(ref _lossGeneration);
-        var retention = _metadataEchoAuthority?.CaptureReconciliationRetention();
+        // Legacy readers can report an overflow before its marker becomes durable.
+        // The metadata generation below separately protects changes to receipts.
+        long generation = validateRescanLoss ? rescan!.LossGeneration : Volatile.Read(ref _lossGeneration);
+        CloudLocalChangeRescan boundary = rescan ?? CaptureRescanBoundary();
         using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
-        if (retention?.PreparationGeneration != _metadataEchoAuthority?.PreparationGeneration)
+        if (boundary.MetadataGeneration != _metadataEchoAuthority?.ReconciliationGeneration)
         {
-            throw new InvalidOperationException("A remote metadata update was prepared during acknowledgement. Repeat reconciliation before acknowledging the rescan.");
+            if (!validateRescanLoss && rescan is not null)
+            {
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_observedRescan, rescan))
+                    {
+                        Volatile.Write(ref _observedRescan, null);
+                        Volatile.Write(ref _rescanNoticeDelivered, 0);
+                    }
+                }
+            }
+            throw new InvalidOperationException("Metadata reconciliation changed after the rescan boundary. Repeat reconciliation from a new boundary.");
+        }
+        if (rescan is not null && boundary.AcknowledgementGeneration != Volatile.Read(ref _rescanAcknowledgementGeneration))
+        {
+            throw new InvalidOperationException("Another acknowledgement ended this rescan boundary. Begin a new full rescan.");
         }
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        if (rescan is null && _metadataEchoAuthority is not null &&
+            (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix, cancellationToken).ConfigureAwait(false)).Count != 0)
+        {
+            throw new InvalidOperationException("Capture a boundary with BeginFullRescan before reconciling pending remote metadata.");
+        }
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         if (creations.Count != 0 ||
@@ -355,7 +405,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             throw new InvalidOperationException("Replay pending remote creations, moves and deletions before acknowledging reconciliation.");
         }
-        await ClearReconciledMetadataIntentsAsync(transaction, retention?.RetainReceipt, cancellationToken).ConfigureAwait(false);
+        await ClearReconciledMetadataIntentsAsync(transaction, boundary.RetainReceipt, cancellationToken).ConfigureAwait(false);
 
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.ObservationsPrefix, cancellationToken).ConfigureAwait(false))
@@ -389,7 +439,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         // Full reconciliation establishes a new consumer boundary even when pending creation
         // recovery cleared its records before this feed read them. Pre-reconciliation scans must
         // not resume after an acknowledgement makes the durable marker disappear.
-        Interlocked.Increment(ref _rescanAcknowledgementGeneration);
+        lock (_gate)
+        {
+            Interlocked.Increment(ref _rescanAcknowledgementGeneration);
+            Volatile.Write(ref _observedRescan, null);
+        }
         Volatile.Write(ref _rescanNoticeDelivered, 0);
     }
 
@@ -938,6 +992,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             }
             if (pendingMetadata)
             {
+                _metadataEchoAuthority?.TrackReconciliationChange();
                 foreach (RemoteMetadataIntent intent in metadataIntents)
                 {
                     RemoteMetadataIntent retained = intent with { RequiresReconciliation = true, Reconciled = false };

@@ -253,7 +253,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
         Assert.Equal(requiresReconciliation ? CloudRemoteConflictReason.Metadata : CloudRemoteConflictReason.Content, blocked.Conflict!.Reason);
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
-        if (requiresReconciliation) { await feed.AcknowledgeFullRescanAsync(deadline.Token); }
+        if (requiresReconciliation) { await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token); }
         CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
         CloudLocalChange delivered = Assert.Single(page.Changes);
         Assert.Equal((original.OperationId, original.Sequence), (delivered.OperationId, delivered.Sequence));
@@ -290,7 +290,7 @@ public sealed partial class CloudContentConfirmationTests
             if (beforeAuthorization) { await factory.OutcomePaused.Task.WaitAsync(deadline.Token); }
             else { await apply.WaitAsync(deadline.Token); }
             factory.PauseNextTransaction();
-            acknowledge = feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask();
+            acknowledge = feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token).AsTask();
         }
         finally { factory.ResumeOutcome.TrySetResult(); }
 
@@ -351,7 +351,7 @@ public sealed partial class CloudContentConfirmationTests
         try
         {
             await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
-            acknowledge = feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask();
+            acknowledge = feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token).AsTask();
             Assert.False(acknowledge.IsCompleted);
             if (!pauseBeforePreparation) { File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden); }
         }
@@ -360,7 +360,7 @@ public sealed partial class CloudContentConfirmationTests
         if (pauseBeforePreparation)
         {
             InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => acknowledge.WaitAsync(deadline.Token));
-            Assert.Contains("A remote metadata update was prepared", error.Message, StringComparison.Ordinal);
+            Assert.Contains("after the rescan boundary", error.Message, StringComparison.Ordinal);
         }
         else { await acknowledge.WaitAsync(deadline.Token); }
         Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
@@ -382,6 +382,99 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
         Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task RescanAcknowledgementCannotClearNewMetadataEvidence(bool explicitBoundary, bool deliverAnObservation)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        const string firstPath = "Documents";
+        const string secondPath = "Other";
+        CloudPlaceholderIdentity first = new(Guid.NewGuid(), "metadata-rescan-original");
+        CloudPlaceholderIdentity second = new(Guid.NewGuid(), "metadata-rescan-later");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(firstPath, first).WithInSyncState(true).Build(),
+            CloudDirectoryPlaceholderSpec.CreateBuilder(secondPath, second).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(first, firstPath, CloudItemKind.Directory), cancellationToken: deadline.Token)).Entries).Status);
+        CloudRemoteChange metadata = new("metadata", CloudRemoteChangeKind.MetadataUpdate, second.RemoteId,
+            "remote-r1", CloudItemKind.Directory, secondPath, second.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+        CloudRemoteChangeBatch laterBatch = new("metadata-rescan-later", Array.Empty<byte>(), [metadata], new byte[] { 2 });
+        if (deliverAnObservation)
+        {
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+                laterBatch, cancellationToken: deadline.Token)).Entries).Status);
+        }
+
+        CloudLocalChangeScan originalScan = await feed.BeginScanAsync(deadline.Token);
+        Assert.True(originalScan.RequiresFullRescan);
+        CloudLocalChangeRescan boundary = feed.BeginFullRescan();
+        string path = Path.Combine(fixture.Root, secondPath);
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        if (!deliverAnObservation)
+        {
+            // Finish scanning before the second write begins. Without a watcher event,
+            // only the newly prepared receipt protects the native edit that follows it.
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+                laterBatch, cancellationToken: deadline.Token)).Entries).Status);
+        }
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        if (deliverAnObservation)
+        {
+            // Reopen an existing receipt without preparing another remote update.
+            await source.EmitAsync(new(LocalChangeSourceAction.Modified, secondPath));
+            await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+            Assert.Null(Assert.Single(await AccessRowsAsync(factory!)).ItemId);
+        }
+        else { Assert.Empty(await AccessRowsAsync(factory!)); }
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => explicitBoundary
+            ? feed.AcknowledgeFullRescanAsync(boundary, deadline.Token).AsTask()
+            : feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask());
+
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, second.RemoteId, "remote-r2",
+            CloudItemKind.Directory, secondPath, second.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("protected-upsert", Array.Empty<byte>(), [upsert], new byte[] { 3 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+
+        if (!explicitBoundary)
+        {
+            // Repeating an ACK alone cannot open a new boundary for the old scan.
+            await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask());
+            Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        }
+        CloudLocalChangeRescan fresh = feed.BeginFullRescan();
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        if (explicitBoundary) { await feed.AcknowledgeFullRescanAsync(fresh, deadline.Token); }
+        else { await feed.AcknowledgeFullRescanAsync(deadline.Token); }
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeFullRescanAsync(fresh, deadline.Token).AsTask());
+
+        // A page from the previous epoch cannot reserve the next legacy boundary.
+        Assert.True((await feed.ReadPageAsync(originalScan, 0, 10, deadline.Token)).RequiresFullRescan);
+        CloudRemoteChange next = new("metadata", CloudRemoteChangeKind.MetadataUpdate, first.RemoteId,
+            "remote-r2", CloudItemKind.Directory, firstPath, first.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-next-rescan", Array.Empty<byte>(), [next], new byte[] { 4 }), cancellationToken: deadline.Token)).Entries).Status);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
     }
 
     [Trait("Category", "AccessJournal")]
@@ -830,7 +923,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(boundary is "outcome-after" or "staging-after" ? CloudRemoteApplyEntryStatus.AlreadyApplied :
             CloudRemoteApplyEntryStatus.Conflict, Assert.Single(replay.Entries).Status);
         Assert.False(replay.RequiresRetry);
-        await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+        await reopened.AcknowledgeFullRescanAsync(reopened.BeginFullRescan(), deadline.Token);
         CloudLocalChangeScan scan = await reopened.BeginScanAsync(deadline.Token);
         CloudLocalChangePage page = await reopened.ReadPageAsync(scan, 0, 100, deadline.Token);
         Assert.False(page.RequiresFullRescan);

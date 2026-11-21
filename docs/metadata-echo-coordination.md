@@ -13,7 +13,8 @@ remote `MetadataUpdate` retains a durable attribution preparation before native 
 Possible metadata echoes become unbound `MetadataUpdate` journal originals and set
 `RequiresFullRescan`. They are not delivered as dispatchable, bound local edits.
 
-Complete an application-level reconciliation before calling `AcknowledgeFullRescanAsync`.
+Capture `BeginFullRescan()` before starting an application-level reconciliation. Pass its boundary
+to `AcknowledgeFullRescanAsync` once reconciliation is complete.
 That call clears the fence; it does not erase observations, clear their operation IDs, assign an
 item, or acknowledge them. A new finite scan exposes the same IDs and sequences with `ItemId = null`.
 The application must decide and individually acknowledge those observations after reconciliation.
@@ -60,9 +61,9 @@ The observation count option for other remote operation kinds does not limit thi
 Authority expires using a monotonic clock, so a wall-clock adjustment cannot extend the promise.
 Once the window expires, the receipt requires reconciliation before the next protected write.
 A full-rescan acknowledgement preserves receipts with valid authorization or from a remote call
-still in flight when acknowledgement starts. This includes default-policy updates finishing
-while it waits. If a new metadata preparation races acknowledgement, the acknowledgement
-fails and the application must repeat reconciliation for the new state.
+still in flight at the start of reconciliation. If a metadata write was prepared or an observation
+reopened a receipt after that boundary, acknowledgement fails and the application must repeat
+reconciliation for the new state.
 An idle `ReadBatchAsync` also wakes to report this requirement without waiting for a new
 filesystem notification.
 An in-place write relying on a previous call's authorization checks it again just before the

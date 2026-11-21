@@ -80,7 +80,7 @@ public sealed partial class CloudContentConfirmationTests
         AssertOriginalAccessRows(beforeUpsert, originals);
         Assert.All(originals, row => Assert.Null(row.ItemId));
 
-        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
         await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
         CloudRemoteApplyResult afterReconciliation = await fixture.System.ApplyRemoteChangesAsync(
             new("metadata-upsert-reconciled", Array.Empty<byte>(), [update], new byte[] { 3 }), cancellationToken: deadline.Token);
@@ -145,7 +145,7 @@ public sealed partial class CloudContentConfirmationTests
                     }
                     await Task.Delay(20, deadline.Token);
                 }
-                await feed.AcknowledgeFullRescanAsync(deadline.Token);
+                await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
                 Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
             }
             while (options.EchoSuppressionLifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
@@ -187,7 +187,7 @@ public sealed partial class CloudContentConfirmationTests
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 3);
         IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
         Assert.All(originals, row => Assert.Null(row.ItemId));
-        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
         await AssertAccessPublicRowsAsync(factory!, feed);
         await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
         CloudRemoteApplyResult reconciled = await fixture.System.ApplyRemoteChangesAsync(
@@ -276,7 +276,7 @@ public sealed partial class CloudContentConfirmationTests
         await source.DeliverAsync(first);
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
         CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
-        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
         Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
         await source.DeliverAsync(second);
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 2);
@@ -288,7 +288,7 @@ public sealed partial class CloudContentConfirmationTests
         IReadOnlyList<CloudOperationJournalEntry> retained = await AccessRowsAsync(factory!);
         AssertOriginalAccessRows([original], retained);
         Assert.All(retained, row => Assert.Null(row.ItemId));
-        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
         await AssertAccessPublicRowsAsync(factory!, feed);
         AssertOriginalAccessRows(retained, await AccessRowsAsync(factory!));
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
