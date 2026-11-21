@@ -468,10 +468,10 @@ public sealed record CloudRemoteApplyOptions
 
     /// <summary>Gets whether provider echo handling is enabled.</summary>
     /// <remarks>
-    /// Remote metadata uses <see cref="AttributeEchoPolicy"/>: the default retains uncertain
-    /// observations behind reconciliation rather than claiming a native writer identity.
-    /// Other change kinds retain their operation-specific echo handling. Setting this to
-    /// <see langword="false"/> exposes ordinary observations and supersedes earlier metadata suppression.
+    /// Remote metadata uses <see cref="AttributeEchoPolicy"/>. The default retains uncertain
+    /// observations behind reconciliation. Setting this to <see langword="false"/> exposes ordinary
+    /// observations and supersedes earlier attribute suppression before a metadata update or an
+    /// in-place file or directory upsert. Earlier unresolved observations still require reconciliation.
     /// </remarks>
     public bool SuppressLocalEcho { get; init; } = true;
 
@@ -480,8 +480,10 @@ public sealed record CloudRemoteApplyOptions
     /// Defaults to <see cref="CloudRemoteAttributeEchoPolicy.RequireReconciliation"/>. Select
     /// <see cref="CloudRemoteAttributeEchoPolicy.CallerCoordinated"/> only when the caller can uphold its
     /// writer-coordination guarantee for the complete suppression lifetime. This does not acquire native
-    /// exclusion or suppress security, data or name changes. With <see cref="SuppressLocalEcho"/> disabled,
-    /// observations retain their ordinary public metadata classification without this attribution protocol.
+    /// exclusion or suppress security, data or name changes. Metadata updates use this policy whenever
+    /// echo handling is enabled. In-place upserts use it when coordinated attribution is selected or
+    /// relevant attribution evidence already exists. With <see cref="SuppressLocalEcho"/> disabled,
+    /// confirmed writes expose ordinary metadata observations.
     /// </remarks>
     public CloudRemoteAttributeEchoPolicy AttributeEchoPolicy { get; init; } = CloudRemoteAttributeEchoPolicy.RequireReconciliation;
 

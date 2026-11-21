@@ -58,13 +58,15 @@ and durable observation staging. No attribute or ancestor handle is retained acr
 Generic data/name notifications and independent DACL notifications never redeem this authorization.
 The observation count option for other remote operation kinds does not limit this declared window.
 Authority expires using a monotonic clock, so a wall-clock adjustment cannot extend the promise.
-A subsequent metadata operation supersedes earlier permission at the same path; selecting the
-default policy cannot accidentally inherit a previous call's coordinated window.
+A subsequent metadata operation or in-place upsert supersedes earlier permission for the affected
+object before writing attributes. An upsert with attribution history under the default policy
+retains uncertain observations for reconciliation. Default upserts without attribution history
+continue to use their usual echo handling.
 
-Setting `SuppressLocalEcho = false` installs an explicit passthrough policy, superseding prior
-discard permission for the affected object. Provider-generated and genuine observations use the
-ordinary bound metadata path, useful as an explicit diagnostic. A failed or incomplete operation
-still retains uncertainty; disabling suppression does not acknowledge earlier lost observations.
+Setting `SuppressLocalEcho = false` installs an explicit passthrough policy for remote metadata
+updates and in-place file and directory upserts. Provider-generated and genuine observations use
+the ordinary bound metadata path after confirmation. A failed or incomplete operation still
+retains uncertainty. Earlier unresolved observations still require reconciliation.
 
 ## Failure, restart and reconciliation
 

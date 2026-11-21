@@ -226,8 +226,11 @@ public sealed partial class CloudContentConfirmationTests
                 ? CloudPlaceholderMetadata.CreateDirectoryBuilder() : CloudPlaceholderMetadata.CreateFileBuilder()).Build())], new byte[] { 1 });
 
     [Trait("Category", "AccessJournal")]
-    [Fact]
-    public async Task DisabledMetadataSuppressionRevokesTheEarlierCoordinatedPolicy()
+    [Theory]
+    [InlineData(CloudRemoteChangeKind.MetadataUpdate, false)]
+    [InlineData(CloudRemoteChangeKind.DirectoryUpsert, false)]
+    [InlineData(CloudRemoteChangeKind.DirectoryUpsert, true)]
+    public async Task InPlaceMetadataWriteReplacesTheEarlierCoordinatedPolicy(CloudRemoteChangeKind kind, bool suppressEcho)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -253,22 +256,30 @@ public sealed partial class CloudContentConfirmationTests
             if (drained) { break; }
             await Task.Delay(20, deadline.Token);
         }
-        CloudRemoteChange next = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+        Assert.Empty(await AccessRowsAsync(factory!));
+        CloudRemoteChange next = new("metadata", kind, identity.RemoteId,
             "remote-r2", CloudItemKind.Directory, "Documents", identity.ItemId,
-            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build());
         Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
             new("metadata-passthrough", Array.Empty<byte>(), [next], new byte[] { 2 }),
-            new() { SuppressLocalEcho = false }, deadline.Token)).Status);
+            new() { SuppressLocalEcho = suppressEcho }, deadline.Token)).Status);
         string path = Path.Combine(fixture.Root, "Documents");
-        // The later explicit policy has revoked the earlier permission for this generation.
-        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
-        await WaitForAccessRowsAsync(factory!, rows => rows.Count >= 3);
-        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
-        await feed.DisposeAsync();
-        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
-        Assert.Equal(3, originals.Count);
-        Assert.All(originals, row => Assert.Equal(identity.ItemId, row.ItemId));
         Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count >= 2);
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        Assert.Equal(2, originals.Count);
+        Assert.All(originals, row =>
+        {
+            Assert.Equal(CloudStateOperationKind.MetadataUpdate, row.Kind);
+            Assert.Equal(suppressEcho ? null : (Guid?)identity.ItemId, row.ItemId);
+            Assert.Equal("Documents", LocalChangePayload.Decode(row.Payload).RelativePath);
+        });
+        Assert.Equal(suppressEcho, (await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        if (suppressEcho) { await feed.AcknowledgeFullRescanAsync(deadline.Token); }
+        await AssertAccessPublicRowsAsync(factory!, feed);
+        await feed.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
+        Assert.Empty(await AccessRowsAsync(factory!));
+        Assert.Equal("remote-r2", (await fixture.System.GetDirectory("Documents").InspectAsync(deadline.Token)).RemoteRevision);
     }
 
     [Trait("Category", "AccessJournal")]

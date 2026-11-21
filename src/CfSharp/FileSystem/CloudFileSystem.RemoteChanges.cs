@@ -744,11 +744,6 @@ public sealed partial class CloudFileSystem
             }
         }
 
-        CloudStateOperationKind suppressionKind = context.LocalState is null || !localExists
-            ? CloudStateOperationKind.Create
-            : change.Kind is CloudRemoteChangeKind.MetadataUpdate
-                ? CloudStateOperationKind.MetadataUpdate
-                : CloudStateOperationKind.ContentUpdate;
         if (!upsert && (context.LocalState is null || !localExists))
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(
@@ -770,45 +765,14 @@ public sealed partial class CloudFileSystem
         RemoteMetadataIntent? metadataIntent = null;
         try
         {
-            if (change.Kind == CloudRemoteChangeKind.MetadataUpdate)
-            {
-                metadataIntent = new(Guid.NewGuid(), _metadataEchoCall?.Id ?? Guid.NewGuid(), itemId, change.RelativePath,
-                    metadataBinding, options.SuppressLocalEcho && options.AttributeEchoPolicy == CloudRemoteAttributeEchoPolicy.CallerCoordinated,
-                    Completed: false)
-                { Passthrough = !options.SuppressLocalEcho };
-                await using ICloudStateTransaction preparation = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-                foreach (CloudStateCheckpoint checkpoint in await preparation.Checkpoints.ListAsync(RemoteMetadataIntent.ItemPrefix(itemId),
-                    cancellationToken).ConfigureAwait(false))
-                {
-                    RemoteMetadataIntent previous = RemoteMetadataIntent.Decode(checkpoint);
-                    bool sameGeneration = metadataBinding is not null && previous.Binding == metadataBinding && previous.ItemId == itemId;
-                    if (!previous.Covers(change.RelativePath) && !sameGeneration) { continue; }
-                    // A new policy cannot inherit an older call's live permission. Completed
-                    // history for this exact generation is represented by the new marker;
-                    // incomplete work and other generations remain available for reconciliation.
-                    bool replaceable = previous.Reconciled || (!previous.UsesReconciliationPolicy &&
-                        !previous.RequiresReconciliation && (!previous.HasUnconfirmedOutcome || previous.CallId == metadataIntent.CallId));
-                    if (previous.Completed && replaceable && previous.ItemId == itemId && previous.Binding == metadataBinding &&
-                        previous.Covers(change.RelativePath))
-                    { await preparation.Checkpoints.RemoveAsync(checkpoint.Name, cancellationToken).ConfigureAwait(false); }
-                    else
-                    {
-                        RemoteMetadataIntent superseded = previous with { Superseded = true };
-                        await preparation.Checkpoints.UpsertAsync(new(superseded.Name, superseded.Encode(), DateTimeOffset.UtcNow),
-                            cancellationToken).ConfigureAwait(false);
-                    }
-                }
-                _metadataEchoCall?.TrackPreparation();
-                await preparation.Checkpoints.UpsertAsync(new(metadataIntent.Name, metadataIntent.Encode(), DateTimeOffset.UtcNow),
-                    cancellationToken).ConfigureAwait(false);
-                await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            else if (options.SuppressLocalEcho)
+            metadataIntent = await PrepareRemoteMetadataIntentAsync(change, itemId, metadataBinding, options, cancellationToken)
+                .ConfigureAwait(false);
+            if (upsert && options.SuppressLocalEcho)
             {
                 suppressionId = await RegisterRemoteEchoSuppressionAsync(
                         change,
                         itemId,
-                        suppressionKind,
+                        CloudStateOperationKind.ContentUpdate,
                         options,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -1132,6 +1096,49 @@ public sealed partial class CloudFileSystem
 
         CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
         return await item.UpdatePlaceholderAsync(builder.Build(), cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<RemoteMetadataIntent?> PrepareRemoteMetadataIntentAsync(CloudRemoteChange change,
+        Guid itemId, CloudLocalFileBinding? binding, CloudRemoteApplyOptions options, CancellationToken cancellationToken)
+    {
+        bool passthrough = !options.SuppressLocalEcho;
+        bool coordinated = !passthrough && options.AttributeEchoPolicy == CloudRemoteAttributeEchoPolicy.CallerCoordinated;
+        await using ICloudStateTransaction preparation = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CloudStateCheckpoint> checkpoints = await preparation.Checkpoints.ListAsync(
+            RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
+        RemoteMetadataIntent[] previousIntents = checkpoints.Select(RemoteMetadataIntent.Decode)
+            .Where(intent => intent.Covers(change.RelativePath) || (binding is not null && intent.Binding == binding))
+            .ToArray();
+        // Unrelated default upserts keep their existing echo handling. An upsert with
+        // attribution history must establish its own policy before writing attributes.
+        if (change.Kind != CloudRemoteChangeKind.MetadataUpdate && !passthrough && !coordinated && previousIntents.Length == 0)
+        { return null; }
+
+        RemoteMetadataIntent intent = new(Guid.NewGuid(), _metadataEchoCall?.Id ?? Guid.NewGuid(), itemId,
+            change.RelativePath, binding, coordinated, Completed: false)
+        { Passthrough = passthrough };
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        foreach (RemoteMetadataIntent previous in previousIntents)
+        {
+            // Keep unresolved observations and other generations for reconciliation,
+            // while revoking any earlier permission before the native write.
+            bool replaceable = previous.Reconciled || (!previous.UsesReconciliationPolicy &&
+                !previous.RequiresReconciliation && (!previous.HasUnconfirmedOutcome || previous.CallId == intent.CallId));
+            if (previous.Completed && replaceable && previous.Binding == binding && previous.Covers(change.RelativePath))
+            {
+                await preparation.Checkpoints.RemoveAsync(previous.Name, cancellationToken).ConfigureAwait(false);
+            }
+            else if (!previous.Superseded)
+            {
+                RemoteMetadataIntent superseded = previous with { Superseded = true };
+                await preparation.Checkpoints.UpsertAsync(new(superseded.Name, superseded.Encode(), now), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        _metadataEchoCall?.TrackPreparation();
+        await preparation.Checkpoints.UpsertAsync(new(intent.Name, intent.Encode(), now), cancellationToken).ConfigureAwait(false);
+        await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return intent;
     }
 
     private static async ValueTask CompleteRemoteMetadataIntentAsync(ICloudStateTransaction transaction,
