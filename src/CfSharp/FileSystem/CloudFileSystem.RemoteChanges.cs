@@ -1209,13 +1209,21 @@ public sealed partial class CloudFileSystem
                 _metadataEchoAuthority.IsAuthorized(previous) ||
                 (previous.CallId == intent.CallId && !previous.UsesReconciliationPolicy &&
                     !previous.RequiresReconciliation && !previous.Superseded);
-            if (previous.Completed && replaceable && previous.Binding == binding && previous.Covers(change.RelativePath))
+            bool replacesPriorReceipt = previous.Completed && replaceable && !previous.RequiresReconciliation && previous.Binding == binding;
+            if (replacesPriorReceipt && previous.Covers(change.RelativePath))
             {
                 await preparation.Checkpoints.RemoveAsync(previous.Name, cancellationToken).ConfigureAwait(false);
             }
             else if (!previous.Superseded)
             {
-                RemoteMetadataIntent superseded = previous with { Superseded = true };
+                // After a move, retire replaceable evidence but keep its historical path.
+                // The new preparation protects the same binding and the native guard still
+                // checks the original grant's expiry before attempting the write.
+                RemoteMetadataIntent superseded = previous with
+                {
+                    Superseded = true,
+                    Reconciled = previous.Reconciled || replacesPriorReceipt,
+                };
                 await preparation.Checkpoints.UpsertAsync(new(superseded.Name, superseded.Encode(), now), cancellationToken)
                     .ConfigureAwait(false);
             }

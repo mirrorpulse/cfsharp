@@ -67,6 +67,8 @@ An idle `ReadBatchAsync` also wakes to report this requirement without waiting f
 filesystem notification.
 An in-place write relying on a previous call's authorization checks it again just before the
 native update, after durable preparation and handle acquisition.
+Moving the same native object does not invalidate that check. A subsequent preparation retires
+replaceable evidence at the old path while keeping the path available for delayed observations.
 Entries confirmed in a call stopped by `MaximumEntries` also require reconciliation. Such a
 partial call never activates coordinated authority, even for entries that were applied successfully.
 A subsequent metadata operation or in-place upsert supersedes earlier permission for the affected
