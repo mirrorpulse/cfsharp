@@ -105,6 +105,76 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FullRescanAcknowledgementPreservesCoordinationThatExpiresWhileWaiting(bool beforeAuthorization)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "rescan-awaiting-authorization"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-rescan-expiry");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        TimeSpan lifetime = TimeSpan.FromSeconds(3);
+        await source.EmitAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
+        while (true)
+        {
+            await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
+                if (checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).RequiresFullRescan) { break; }
+            }
+            await Task.Delay(20, deadline.Token);
+        }
+
+        factory!.Armed = beforeAuthorization;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), new()
+            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated, EchoSuppressionLifetime = lifetime }, deadline.Token).AsTask();
+        Task acknowledge;
+        try
+        {
+            if (beforeAuthorization) { await factory.OutcomePaused.Task.WaitAsync(deadline.Token); }
+            else { await apply.WaitAsync(deadline.Token); }
+            factory.PauseNextTransaction();
+            acknowledge = feed.AcknowledgeFullRescanAsync(deadline.Token).AsTask();
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        string path = Path.Combine(fixture.Root, relative);
+        try
+        {
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
+            long appliedAt = Stopwatch.GetTimestamp();
+            await factory.TransactionPaused.Task.WaitAsync(deadline.Token);
+            Assert.True(Stopwatch.GetElapsedTime(appliedAt) < lifetime);
+            while (lifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
+            { await Task.Delay(remaining + TimeSpan.FromMilliseconds(1), deadline.Token); }
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        }
+        finally { factory.ResumeTransaction.TrySetResult(); }
+        await acknowledge.WaitAsync(deadline.Token);
+
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token))
+        { Assert.Empty(await state.Operations.ListAsync(10, deadline.Token)); }
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("protected-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task RemoteMetadataWriteRejectsAReplacementAfterPreparation()
     {
@@ -584,11 +654,15 @@ public sealed partial class CloudContentConfirmationTests
     {
         private readonly string _boundary = boundary;
         private int _failed;
+        private int _pauseNextTransaction;
         internal bool Armed { get; set; }
         internal ICloudStateStore? Store { get; private set; }
         internal TaskCompletionSource<Guid> Staged { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource OutcomePaused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource ResumeOutcome { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource TransactionPaused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ResumeTransaction { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal void PauseNextTransaction() => Volatile.Write(ref _pauseNextTransaction, 1);
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context, CancellationToken cancellationToken = default)
         {
             Store = await new SqliteCloudStateStoreFactory(path).OpenAsync(context, cancellationToken);
@@ -596,8 +670,15 @@ public sealed partial class CloudContentConfirmationTests
         }
         private sealed class FaultStore(ICloudStateStore inner, MetadataFaultFactory owner) : ICloudStateStore
         {
-            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default) =>
-                new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), owner);
+            public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+            {
+                if (Interlocked.Exchange(ref owner._pauseNextTransaction, 0) != 0)
+                {
+                    owner.TransactionPaused.TrySetResult();
+                    await owner.ResumeTransaction.Task.WaitAsync(cancellationToken);
+                }
+                return new FaultTransaction(await inner.BeginTransactionAsync(cancellationToken), owner);
+            }
             public ValueTask DisposeAsync() => inner.DisposeAsync();
         }
         private sealed class FaultTransaction(ICloudStateTransaction inner, MetadataFaultFactory owner) : ICloudStateTransaction
@@ -625,6 +706,7 @@ public sealed partial class CloudContentConfirmationTests
                             (await Items.GetByRelativePathAsync("Documents", cancellationToken))?.RemoteRevision == "remote-r1",
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
+                        "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
                         "first-outcome-after" => intents.Any(intent => intent.Completed) &&
                             (await RemoteBatches.GetAsync("metadata-fault", cancellationToken))?.AppliedEntryCount == 1,
                         _ => intents.Any(intent => intent.Completed) &&
@@ -633,7 +715,7 @@ public sealed partial class CloudContentConfirmationTests
                 }
                 if (!cut || Interlocked.Exchange(ref owner._failed, 1) != 0)
                 { await inner.CommitAsync(cancellationToken); return; }
-                if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after")
+                if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or "rescan-awaiting-authorization")
                 {
                     await inner.CommitAsync(cancellationToken);
                     owner.OutcomePaused.TrySetResult();

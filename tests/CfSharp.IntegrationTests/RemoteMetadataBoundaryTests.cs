@@ -90,9 +90,10 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ProtectedUpsertRequiresLiveMetadataCoordinationBeforeNotificationDelivery(bool partialBatch)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task ProtectedUpsertRequiresLiveMetadataCoordinationBeforeNotificationDelivery(bool partialBatch, bool acknowledgeWhileAuthorized)
     {
         const string relative = "Documents";
         AccessJournalFactory? factory = null;
@@ -102,14 +103,15 @@ public sealed partial class CloudContentConfirmationTests
             CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
         ]);
         DelayedMetadataSource source = new(fixture.Root);
-        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         await feed.StartAsync(deadline.Token);
         CloudRemoteChangeBatch batch = MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory);
         CloudRemoteApplyOptions options = new()
         {
             AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
-            EchoSuppressionLifetime = partialBatch ? TimeSpan.FromMinutes(2) : TimeSpan.FromMilliseconds(250),
+            EchoSuppressionLifetime = partialBatch ? TimeSpan.FromMinutes(2) :
+                acknowledgeWhileAuthorized ? TimeSpan.FromSeconds(3) : TimeSpan.FromMilliseconds(250),
             MaximumEntries = 1,
         };
         if (partialBatch)
@@ -130,6 +132,22 @@ public sealed partial class CloudContentConfirmationTests
             // Windows timers can wake early. Verify the same monotonic time used by
             // the authority before allowing the native writes in this regression.
             long appliedAt = Stopwatch.GetTimestamp();
+            if (acknowledgeWhileAuthorized)
+            {
+                Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+                await source.DeliverAsync(new(LocalChangeSourceAction.Overflow, string.Empty));
+                while (true)
+                {
+                    await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+                    {
+                        CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
+                        if (checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).RequiresFullRescan) { break; }
+                    }
+                    await Task.Delay(20, deadline.Token);
+                }
+                await feed.AcknowledgeFullRescanAsync(deadline.Token);
+                Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            }
             while (options.EchoSuppressionLifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
             {
                 await Task.Delay(remaining + TimeSpan.FromMilliseconds(1), deadline.Token);

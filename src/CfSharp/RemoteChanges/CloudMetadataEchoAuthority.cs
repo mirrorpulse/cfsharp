@@ -49,19 +49,37 @@ internal sealed class CloudMetadataEchoAuthority : IDisposable
 
     internal bool IsAuthorized(RemoteMetadataIntent intent)
     {
-        if (intent.Binding is not { } binding || !intent.Coordinated || intent.Passthrough || intent.Superseded ||
-            intent.Reconciled || intent.RequiresReconciliation || intent.HasUnconfirmedOutcome)
-        {
-            return false;
-        }
-
+        if (!CanAuthorize(intent)) { return false; }
         lock (_gate)
         {
             Prune();
-            return _authorized.TryGetValue(intent.CallId, out HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>? objects) &&
-                objects.Contains((intent.ItemId, binding));
+            return Covers(_authorized, intent);
         }
     }
+
+    internal Func<RemoteMetadataIntent, bool> CaptureReconciliationRetention()
+    {
+        Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> grants;
+        HashSet<Guid> applying;
+        lock (_gate)
+        {
+            Prune();
+            // The sets are copied from the call on authorization and never subsequently changed.
+            grants = new(_authorized);
+            // A call can finish authorizing while the acknowledgement waits for publication.
+            applying = new(_applying);
+        }
+        return intent => CanAuthorize(intent) && (applying.Contains(intent.CallId) || Covers(grants, intent));
+    }
+
+    private static bool CanAuthorize(RemoteMetadataIntent intent) => intent.Binding is not null &&
+        intent.Coordinated && !intent.Passthrough && !intent.Superseded && !intent.Reconciled &&
+        !intent.RequiresReconciliation && !intent.HasUnconfirmedOutcome;
+
+    private static bool Covers(Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> grants,
+        RemoteMetadataIntent intent) =>
+        grants.TryGetValue(intent.CallId, out HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>? objects) &&
+        objects.Contains((intent.ItemId, intent.Binding!));
 
     private void Prune()
     {

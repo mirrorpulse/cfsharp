@@ -92,14 +92,18 @@ public sealed partial class CloudLocalChangeFeed
         return false;
     }
 
-    private async ValueTask ClearReconciledMetadataIntentsAsync(ICloudStateTransaction transaction,
+    private async ValueTask ClearReconciledMetadataIntentsAsync(ICloudStateTransaction transaction, Func<RemoteMetadataIntent, bool>? retainAuthorization,
         CancellationToken cancellationToken)
     {
         RemoteMetadataIntent[] intents = await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
         if (intents.Any(intent => _metadataEchoAuthority?.IsApplying(intent.CallId) == true))
         { throw new InvalidOperationException("Finish the active remote metadata call before acknowledging reconciliation."); }
+        // Keep grants that were live or being published at admission even if the
+        // acknowledgement had to wait past the end of the window.
+        IEnumerable<RemoteMetadataIntent> retired = intents.Where(intent => retainAuthorization?.Invoke(intent) != true &&
+            _metadataEchoAuthority?.IsAuthorized(intent) != true);
         foreach (IGrouping<(Guid ItemId, CloudLocalFileBinding? Binding), RemoteMetadataIntent> generation in
-            intents.GroupBy(intent => (intent.ItemId, intent.Binding)))
+            retired.GroupBy(intent => (intent.ItemId, intent.Binding)))
         {
             foreach (IGrouping<string, RemoteMetadataIntent> path in generation.GroupBy(intent => intent.RelativePath, StringComparer.OrdinalIgnoreCase))
             {

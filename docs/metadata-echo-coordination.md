@@ -59,6 +59,9 @@ Generic data/name notifications and independent DACL notifications never redeem 
 The observation count option for other remote operation kinds does not limit this declared window.
 Authority expires using a monotonic clock, so a wall-clock adjustment cannot extend the promise.
 Once the window expires, the receipt requires reconciliation before the next protected write.
+A full-rescan acknowledgement preserves receipts with valid authorization or an authorization
+still being published when it starts. Acknowledgement can clear an unrelated rescan marker
+while preserving the protection needed after the window expires.
 An idle `ReadBatchAsync` also wakes to report this requirement without waiting for a new
 filesystem notification.
 An in-place write relying on a previous call's authorization checks it again just before the
