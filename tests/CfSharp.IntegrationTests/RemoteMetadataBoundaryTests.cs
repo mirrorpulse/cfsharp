@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace CfSharp.IntegrationTests;
@@ -124,7 +125,16 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(1, first.AppliedEntryCount);
         Assert.Equal(CloudRemoteApplyEntryStatus.Applied, first.Entries[0].Status);
         if (partialBatch) { Assert.Equal(CloudRemoteApplyEntryStatus.NotProcessed, first.Entries[1].Status); }
-        if (!partialBatch) { await Task.Delay(options.EchoSuppressionLifetime, deadline.Token); }
+        if (!partialBatch)
+        {
+            // Windows timers can wake early. Verify the same monotonic time used by
+            // the authority before allowing the native writes in this regression.
+            long appliedAt = Stopwatch.GetTimestamp();
+            while (options.EchoSuppressionLifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
+            {
+                await Task.Delay(remaining + TimeSpan.FromMilliseconds(1), deadline.Token);
+            }
+        }
 
         LocalChangeSourceEvent remoteFirst = await source.NextAsync(deadline.Token);
         LocalChangeSourceEvent remoteSecond = await source.NextAsync(deadline.Token);
