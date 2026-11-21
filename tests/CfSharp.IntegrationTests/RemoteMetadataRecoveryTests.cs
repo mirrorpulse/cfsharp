@@ -451,10 +451,14 @@ public sealed partial class CloudContentConfirmationTests
             CloudLocalFileBinding? binding = (await item.InspectAsync(deadline.Token)).LocalBinding;
             await item.MoveToAsync(fixture.System.Root, "Moved", cancellationToken: deadline.Token);
             item = fixture.System.GetDirectory("Moved");
-            CloudItemSnapshot moved = await item.InspectAsync(deadline.Token);
+            // The provider has accepted the rename. Windows can clear InSync during
+            // the move, which is a separate reason to reject a protected update.
+            CloudItemSnapshot moved = (await item.SetInSyncAsync(true, cancellationToken: deadline.Token)).Snapshot;
             Assert.NotNull(binding);
             Assert.Equal(binding, moved.LocalBinding);
             Assert.Equal(identity.ItemId, moved.ItemId);
+            Assert.Equal("remote-r1", moved.RemoteRevision);
+            Assert.Equal(CloudSynchronizationState.InSync, moved.SynchronizationState);
         }
         CloudRemoteChange write = new("metadata", expireAfterPreparation ? CloudRemoteChangeKind.DirectoryUpsert : CloudRemoteChangeKind.MetadataUpdate,
             identity.RemoteId, "remote-r2", CloudItemKind.Directory, item.RelativePath, identity.ItemId, previousRemoteRevision: "remote-r1",
@@ -466,7 +470,12 @@ public sealed partial class CloudContentConfirmationTests
             expireAfterPreparation ? new() { SuppressLocalEcho = false } : coordinated, deadline.Token).AsTask();
         try
         {
-            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Task preparationPaused = factory.OutcomePaused.Task;
+            if (await Task.WhenAny(preparationPaused, apply).WaitAsync(deadline.Token) == apply)
+            {
+                CloudRemoteApplyEntryResult early = Assert.Single((await apply).Entries);
+                Assert.Fail($"The write finished before preparation was paused: {early.Status}, {early.Conflict?.Reason}, {early.Error}");
+            }
             if (expireAfterPreparation)
             {
                 while (coordinated.EchoSuppressionLifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
