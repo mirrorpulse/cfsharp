@@ -5,6 +5,56 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task NativeWriteDuringRemoteMetadataOutcomeRemainsAnOriginalAfterReconciliation()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "outcome-paused"));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-concurrent-directory");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        factory!.Armed = true;
+        CloudRemoteChange change = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, "Documents", identity.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-fault", Array.Empty<byte>(), [change], new byte[] { 1 }), cancellationToken: deadline.Token).AsTask();
+        string path = Path.Combine(fixture.Root, "Documents");
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Assert.False(apply.IsCompleted);
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+            Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await apply).Status);
+        CloudOperationJournalEntry[] originals;
+        while (true)
+        {
+            await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token))
+            { originals = (await state.Operations.ListAsync(100, cancellationToken: deadline.Token)).ToArray(); }
+            if (originals.Length >= 3) { break; }
+            await Task.Delay(20, deadline.Token);
+        }
+        await feed.DisposeAsync();
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync(deadline.Token);
+        Assert.True((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudLocalChangePage page = await reopened.ReadPageAsync(await reopened.BeginScanAsync(deadline.Token), 0, 100, deadline.Token);
+        Assert.Equal(originals.Select(row => (row.OperationId, row.Sequence)), page.Changes.Select(row => (row.OperationId, row.Sequence)));
+        Assert.All(page.Changes, observation => Assert.Null(observation.ItemId));
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await reopened.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData("preparation-after")]
     [InlineData("outcome-before")]
@@ -110,6 +160,8 @@ public sealed partial class CloudContentConfirmationTests
         internal bool Armed { get; set; }
         internal ICloudStateStore? Store { get; private set; }
         internal TaskCompletionSource<Guid> Staged { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource OutcomePaused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ResumeOutcome { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context, CancellationToken cancellationToken = default)
         {
             Store = await new SqliteCloudStateStoreFactory(path).OpenAsync(context, cancellationToken);
@@ -149,6 +201,13 @@ public sealed partial class CloudContentConfirmationTests
                 }
                 if (!cut || Interlocked.Exchange(ref owner._failed, 1) != 0)
                 { await inner.CommitAsync(cancellationToken); return; }
+                if (owner._boundary == "outcome-paused")
+                {
+                    owner.OutcomePaused.TrySetResult();
+                    await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
+                    await inner.CommitAsync(cancellationToken);
+                    return;
+                }
                 if (owner._boundary != "outcome-before") { await inner.CommitAsync(cancellationToken); }
                 if (staged is not null)
                 { owner.Staged.TrySetResult(Guid.ParseExact(staged.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N")); }

@@ -299,7 +299,10 @@ public sealed partial class CloudContentConfirmationTests
         await using (ICloudStateTransaction state = await factory.Inner!.BeginTransactionAsync(deadline.Token))
         { originals = await state.Operations.ListAsync(100, cancellationToken: deadline.Token); }
         Assert.Contains(originals, row => row.OperationId == original && row.ItemId is null);
-        Assert.All(originals.Where(row => row.Kind == CloudStateOperationKind.MetadataUpdate), row => Assert.Null(row.ItemId));
+        // The successor's real attribute edit may bind after its creation is processed.
+        // Neither that edit nor the original staged observation may publish the retired item at this path.
+        Assert.DoesNotContain(originals, row => row.Kind == CloudStateOperationKind.MetadataUpdate && row.ItemId == identity.ItemId &&
+            LocalChangePayload.Decode(row.Payload).RelativePath == relative);
         await fixture.RestartAsync();
         await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
         await reopened.StartAsync(deadline.Token);
