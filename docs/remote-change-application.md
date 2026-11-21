@@ -63,6 +63,8 @@ available for recovery. Native mutation and durable state are separate resources
 `r`n### Cached content during file upserts
 
 File upserts atomically invalidate hydrated ranges when replacing the placeholder identity and metadata. Subsequent reads obtain the new revision from the content provider. Metadata-only changes retain cached content. The default preservation policy also verifies in-sync state in the native update. If Windows rejects invalidation (for example, a pinned or always-full file), the entry fails with its native error and the durable revision does not advance; CfSharp does not silently change pin or root policies.
+
+For remote `MetadataUpdate`, the default feed policy retains uncertain attribute echoes and requests reconciliation. Applications that can coordinate all relevant writers can declare ownership of those notifications. See [metadata echo coordination](metadata-echo-coordination.md) for the policy, acknowledgement rules, and upgrade behavior.
 `r`n### Keeping local content and closing a conflict
 
 `KeepLocal` and `Defer` continue to leave the conflict unresolved. To explicitly close an individual persistent conflict without changing local content, call `DismissRemoteConflictAsync(conflictId)`. `Dismissed` means the unresolved record and a durable receipt were atomically updated. A retry, including after restart, returns `AlreadyDismissed`. `NotFound` means no active record or dismissal receipt exists; it is not proof of successful resolution by another action.

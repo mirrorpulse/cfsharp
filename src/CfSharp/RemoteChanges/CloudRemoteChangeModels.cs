@@ -466,8 +466,26 @@ public sealed record CloudRemoteApplyOptions
     /// </remarks>
     public bool PreserveUnsynchronizedLocalContent { get; init; } = true;
 
-    /// <summary>Gets whether provider-generated local echoes must be suppressed.</summary>
+    /// <summary>Gets whether provider echo handling is enabled.</summary>
+    /// <remarks>
+    /// Remote metadata uses <see cref="AttributeEchoPolicy"/>. The default retains uncertain
+    /// observations behind reconciliation. Setting this to <see langword="false"/> exposes ordinary
+    /// observations and supersedes earlier attribute suppression before a metadata update or an
+    /// in-place file or directory upsert. Earlier unresolved observations still require reconciliation.
+    /// </remarks>
     public bool SuppressLocalEcho { get; init; } = true;
+
+    /// <summary>Gets the provenance policy for independent attribute notifications after remote metadata.</summary>
+    /// <remarks>
+    /// Defaults to <see cref="CloudRemoteAttributeEchoPolicy.RequireReconciliation"/>. Select
+    /// <see cref="CloudRemoteAttributeEchoPolicy.CallerCoordinated"/> only when the caller can uphold its
+    /// writer-coordination guarantee for the complete suppression lifetime. This does not acquire native
+    /// exclusion or suppress security, data or name changes. Metadata updates use this policy whenever
+    /// echo handling is enabled. In-place upserts use it when coordinated attribution is selected or
+    /// relevant attribution evidence already exists. With <see cref="SuppressLocalEcho"/> disabled,
+    /// confirmed writes expose ordinary metadata observations.
+    /// </remarks>
+    public CloudRemoteAttributeEchoPolicy AttributeEchoPolicy { get; init; } = CloudRemoteAttributeEchoPolicy.RequireReconciliation;
 
     /// <summary>Gets how long an echo-suppression record remains active.</summary>
     public TimeSpan EchoSuppressionLifetime { get; init; } = TimeSpan.FromMinutes(2);
@@ -475,6 +493,10 @@ public sealed record CloudRemoteApplyOptions
     /// <summary>
     /// Gets the number of matching local watcher observations reserved for one remote mutation.
     /// </summary>
+    /// <remarks>
+    /// Applies to path/kind suppression for other remote operations. Caller-coordinated attribute
+    /// attribution uses the declared lifetime and exact native object binding, not a notification count.
+    /// </remarks>
     public int EchoSuppressionObservationCount { get; init; } = 4;
 
     /// <summary>Gets the maximum entries one call may attempt before returning a partial result.</summary>
@@ -485,6 +507,7 @@ public sealed record CloudRemoteApplyOptions
 
     internal void Validate()
     {
+        if (!Enum.IsDefined(AttributeEchoPolicy)) { throw new ArgumentOutOfRangeException(nameof(AttributeEchoPolicy)); }
         if (EchoSuppressionLifetime <= TimeSpan.Zero || EchoSuppressionLifetime > TimeSpan.FromHours(1))
         {
             throw new ArgumentOutOfRangeException(

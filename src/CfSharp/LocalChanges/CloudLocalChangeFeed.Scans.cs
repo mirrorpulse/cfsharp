@@ -156,10 +156,11 @@ public sealed partial class CloudLocalChangeFeed
         return Interlocked.Increment(ref _lossGeneration);
     }
 
-    private static async ValueTask<bool> RequiresScanReconciliationAsync(ICloudStateTransaction transaction,
+    private async ValueTask<bool> RequiresScanReconciliationAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken) =>
         (await ReadCheckpointAsync(transaction, cancellationToken).ConfigureAwait(false)).RequiresFullRescan ||
-        await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
+        await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false) ||
+        await RequiresMetadataReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
 
     private static async ValueTask<bool> RequiresCreationReconciliationAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken) =>
