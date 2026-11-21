@@ -109,12 +109,14 @@ and reports a metadata conflict before writing. This applies with an empty journ
 unbound observations. Reconciling the object and acknowledging the full rescan allows a later
 protected update. The retained originals still need their individual acknowledgements.
 
-Passthrough becomes effective for each confirmed entry, including entries applied in a partial
-call limited by `MaximumEntries`. A later failure leaves those confirmed entries intact. If an
+Passthrough becomes effective for each successfully applied and confirmed entry, including entries
+applied in a partial call limited by `MaximumEntries`. A rejected write retains no passthrough
+authority after reconciliation. A later failure leaves previously confirmed entries intact. If an
 outcome commit throws after persisting, replay can report `AlreadyApplied`, while the feed still
 requires reconciliation for that entry. If only the confirmation write fails, the known apply
-outcome stays successful and any unconfirmed receipt remains conservative. Older receipts without
-confirmation also require reconciliation.
+outcome stays successful and any unconfirmed receipt remains conservative. A legacy passthrough
+receipt without durable evidence of a successful native write requires reconciliation.
+Earlier preview builds cannot read receipts written with the new native-write flag.
 
 A new file-system owner does not recover the former caller's promise about external writers.
 Unreconciled attribution evidence fences the feed on restart, even if the original call used

@@ -46,7 +46,7 @@ public sealed partial class CloudLocalChangeFeedTests
         byte[] payload = new LocalChangePayload(intent.RelativePath, null, false, DateTimeOffset.UtcNow).Encode();
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
         {
-            await seed.Checkpoints.UpsertAsync(new(intent.Name, evidence.Value.Span[..^2], evidence.UpdatedAt));
+            await seed.Checkpoints.UpsertAsync(new(intent.Name, evidence.Value.Span[..^3], evidence.UpdatedAt));
             await seed.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null, payload, DateTimeOffset.UtcNow));
             await seed.CommitAsync();
         }
@@ -58,17 +58,19 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.NotNull(await retained.Operations.GetAsync(operationId));
     }
 
-    [Fact]
-    public async Task LegacyCompletedPassthroughWithoutConfirmationRequiresReconciliation()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyCompletedPassthroughWithoutNativeWriteEvidenceRequiresReconciliation(bool outcomeConfirmed)
     {
         await using ICloudStateStore store = await OpenStoreAsync();
         RemoteMetadataIntent intent = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "directory", null,
             Coordinated: false, Completed: true)
-        { Passthrough = true };
+        { Passthrough = true, OutcomeConfirmed = outcomeConfirmed };
         await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
         {
-            // Older receipts end at the passthrough flag, before the confirmation byte.
-            await seed.Checkpoints.UpsertAsync(new(intent.Name, intent.Encode().AsSpan()[..^1], DateTimeOffset.UtcNow));
+            int missingFlags = outcomeConfirmed ? 1 : 2;
+            await seed.Checkpoints.UpsertAsync(new(intent.Name, intent.Encode().AsSpan()[..^missingFlags], DateTimeOffset.UtcNow));
             await seed.CommitAsync();
         }
         await using CloudLocalChangeFeed feed = CreateFeed(store, new FakeSource());
@@ -76,5 +78,9 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
         await feed.AcknowledgeFullRescanAsync();
         Assert.False((await feed.BeginScanAsync()).RequiresFullRescan);
+        await using ICloudStateTransaction state = await store.BeginTransactionAsync();
+        RemoteMetadataIntent retained = RemoteMetadataIntent.Decode((await state.Checkpoints.GetAsync(intent.Name))!);
+        Assert.True(retained.Reconciled);
+        Assert.False(retained.IsConfirmedPassthrough);
     }
 }

@@ -11,8 +11,9 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal bool Superseded { get; init; }
     internal bool Passthrough { get; init; }
     internal bool OutcomeConfirmed { get; init; }
+    internal bool NativeWriteApplied { get; init; }
     internal bool IsConfirmedPassthrough => Passthrough && !HasUnconfirmedOutcome && !Superseded && !RequiresReconciliation;
-    internal bool HasUnconfirmedOutcome => !Completed || !OutcomeConfirmed;
+    internal bool HasUnconfirmedOutcome => !Completed || !OutcomeConfirmed || (Passthrough && !NativeWriteApplied);
     internal bool UsesReconciliationPolicy => !Coordinated && !Passthrough;
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal static string ItemPrefix(Guid itemId) => Prefix + itemId.ToString("N") + "/";
@@ -50,6 +51,7 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
         writer.Write(Superseded);
         writer.Write(Passthrough);
         writer.Write(OutcomeConfirmed);
+        writer.Write(NativeWriteApplied);
         return stream.ToArray();
     }
 
@@ -74,6 +76,8 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
             bool passthrough = ReadBoolean(reader);
             // Earlier receipts either omit confirmation or set it only for passthrough.
             bool outcomeConfirmed = stream.Position != stream.Length && ReadBoolean(reader);
+            // A legacy confirmation does not distinguish a successful write from a conflict.
+            bool nativeWriteApplied = stream.Position != stream.Length && ReadBoolean(reader);
             RemoteMetadataIntent intent = new(id, call, item, path, binding, coordinated, completed)
             {
                 RequiresReconciliation = reconcile,
@@ -81,9 +85,10 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
                 Superseded = superseded,
                 Passthrough = passthrough,
                 OutcomeConfirmed = outcomeConfirmed,
+                NativeWriteApplied = nativeWriteApplied,
             };
             if (id == Guid.Empty || call == Guid.Empty || item == Guid.Empty || checkpoint.Name != intent.Name ||
-                stream.Position != stream.Length || (outcomeConfirmed && !completed))
+                stream.Position != stream.Length || ((outcomeConfirmed || nativeWriteApplied) && !completed))
             { throw new InvalidDataException("Invalid remote metadata evidence."); }
             if (CloudStateModelValidation.CanonicalizeRelativePath(path, nameof(path)) != path)
             { throw new InvalidDataException("Invalid remote metadata path."); }

@@ -230,9 +230,11 @@ public sealed partial class CloudFileSystem
                     status,
                     cancellationToken)
                 .ConfigureAwait(false);
-            // Only the entries whose outcome transactions returned successfully can be
-            // confirmed. Resumed prefixes and commits that threw never enter this list.
-            _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
+            // Confirmation requires both a native write and a successful outcome commit.
+            if (outcome.Status == CloudRemoteApplyEntryStatus.Applied)
+            {
+                _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
+            }
             results.Add(new CloudRemoteApplyEntryResult(
                 change.ChangeId,
                 outcome.Status,
@@ -1248,6 +1250,7 @@ public sealed partial class CloudFileSystem
             RemoteMetadataIntent completed = retained with
             {
                 Completed = true,
+                NativeWriteApplied = outcome.Status == CloudRemoteApplyEntryStatus.Applied,
                 RequiresReconciliation = retained.RequiresReconciliation || intent.RequiresReconciliation,
             };
             await transaction.Checkpoints.UpsertAsync(new(completed.Name, completed.Encode(), DateTimeOffset.UtcNow),
@@ -1339,7 +1342,7 @@ public sealed partial class CloudFileSystem
                 CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(name, CancellationToken.None).ConfigureAwait(false);
                 if (checkpoint is null) { continue; }
                 RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
-                if (intent.CallId != call.Id || !intent.Completed) { continue; }
+                if (intent.CallId != call.Id || !intent.NativeWriteApplied) { continue; }
                 RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
                 await transaction.Checkpoints.UpsertAsync(new(name, confirmed.Encode(), DateTimeOffset.UtcNow), CancellationToken.None)
                     .ConfigureAwait(false);
