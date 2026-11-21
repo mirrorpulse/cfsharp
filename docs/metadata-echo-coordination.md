@@ -84,6 +84,11 @@ already contains the outcome. The retained preparation requires reconciliation a
 genuine writes. A different native generation cannot inherit authorization at the same name.
 If the feed requires reconciliation during the remote apply, the outcome transaction preserves
 that requirement alongside the completed receipt.
+A protected in-place update checks for newly journaled work and reconciliation evidence after
+preparation. The file system orders that check and the native update against its feed's journal
+publication, including with custom stores that allow overlapping transactions. It verifies the
+item identity and native binding on the actual update handle. A late conflict retains the
+original remote change for explicit resolution.
 An explicit item ID on a metadata update must match the resolved item before the update
 can write a receipt or change the placeholder.
 Completed observations staged before a crash recover through the existing metadata-validation

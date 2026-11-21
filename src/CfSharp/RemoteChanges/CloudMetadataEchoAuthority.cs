@@ -4,9 +4,10 @@ namespace CfSharp;
 
 // A durable receipt records what happened, not a recovered caller's promise about other writers.
 // Only a successful public call on this owner can activate that promise in memory.
-internal sealed class CloudMetadataEchoAuthority
+internal sealed class CloudMetadataEchoAuthority : IDisposable
 {
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _publicationGate = new(1, 1);
     private readonly HashSet<Guid> _applying = [];
     private readonly Dictionary<Guid, HashSet<(Guid ItemId, CloudLocalFileBinding Binding)>> _authorized = [];
     private readonly PriorityQueue<Guid, long> _expirations = new();
@@ -26,6 +27,16 @@ internal sealed class CloudMetadataEchoAuthority
     {
         lock (_gate) { return _applying.Contains(id); }
     }
+
+    // Custom stores may allow overlapping transactions. Order local journal
+    // publication with the final protected remote mutation on this owner.
+    internal async ValueTask<IDisposable> AcquirePublicationAsync(CancellationToken cancellationToken)
+    {
+        await _publicationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new PublicationLease(_publicationGate);
+    }
+
+    public void Dispose() => _publicationGate.Dispose();
 
     internal long? GetNextExpirationTimestamp()
     {
@@ -60,6 +71,13 @@ internal sealed class CloudMetadataEchoAuthority
             _expirations.Dequeue();
             _authorized.Remove(id);
         }
+    }
+
+    private sealed class PublicationLease(SemaphoreSlim gate) : IDisposable
+    {
+        private SemaphoreSlim? _gate = gate;
+
+        public void Dispose() => Interlocked.Exchange(ref _gate, null)?.Release();
     }
 
     internal sealed class Call(CloudMetadataEchoAuthority owner, Guid id) : IDisposable

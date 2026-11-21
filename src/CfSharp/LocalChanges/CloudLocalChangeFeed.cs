@@ -828,6 +828,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
         CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
     {
+        using IDisposable? publication = _metadataEchoAuthority is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         StagedSecurityObservation? staged = null;
         try
         {

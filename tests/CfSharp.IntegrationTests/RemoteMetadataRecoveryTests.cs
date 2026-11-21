@@ -8,12 +8,15 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task RemoteMetadataCompletionPreservesConcurrentReconciliation(bool suppressEcho)
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task RemoteMetadataWritePreservesConcurrentReconciliation(bool suppressEcho, bool beforeNativeUpdate)
     {
         MetadataFaultFactory? factory = null;
-        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "preparation-paused-after"));
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path,
+            beforeNativeUpdate ? "preparation-paused-after" : "native-projection-paused-after"));
         const string relative = "Documents";
         CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-concurrent-reconciliation");
         await fixture.System.Root.CreatePlaceholdersAsync([
@@ -21,22 +24,27 @@ public sealed partial class CloudContentConfirmationTests
         ]);
         CloudDirectory item = fixture.System.GetDirectory(relative);
         ControlledMetadataSource source = new();
-        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         await feed.StartAsync(deadline.Token);
 
-        factory.Armed = true;
+        DateTime localLastWrite = new(2020, 3, 4, 12, 0, 0, DateTimeKind.Utc);
+        DateTime remoteLastWrite = localLastWrite.AddDays(1);
+        CloudRemoteChange metadata = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, relative, identity.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(remoteLastWrite).Build());
+        factory!.Armed = true;
         Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
-            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), new()
+            new("metadata-concurrent", Array.Empty<byte>(), [metadata], new byte[] { 1 }), new()
             {
                 SuppressLocalEcho = suppressEcho,
                 AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
             }, deadline.Token).AsTask();
         CloudOperationJournalEntry original;
-        DateTime localLastWrite = new(2020, 3, 4, 12, 0, 0, DateTimeKind.Utc);
         try
         {
             await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            if (!beforeNativeUpdate) { Assert.Equal(remoteLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath)); }
             Directory.SetLastWriteTimeUtc(item.FullPath, localLastWrite);
             await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
             while (true)
@@ -57,20 +65,25 @@ public sealed partial class CloudContentConfirmationTests
         }
         finally { factory.ResumeOutcome.TrySetResult(); }
 
-        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
+        CloudRemoteApplyEntryResult entry = Assert.Single((await apply.WaitAsync(deadline.Token)).Entries);
+        Assert.Equal(beforeNativeUpdate ? CloudRemoteApplyEntryStatus.Conflict : CloudRemoteApplyEntryStatus.Applied, entry.Status);
+        if (beforeNativeUpdate) { Assert.Equal(CloudRemoteConflictReason.Metadata, entry.Conflict!.Reason); }
+        string? expectedRevision = beforeNativeUpdate ? null : "remote-r1";
+        Assert.Equal(localLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+        Assert.Equal(expectedRevision, (await item.InspectAsync(deadline.Token)).RemoteRevision);
         Assert.Equal(CloudStateOperationKind.MetadataUpdate, original.Kind);
         Assert.Null(original.ItemId);
         Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
 
         CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
-            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
-            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(localLastWrite.AddDays(1)).Build());
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: expectedRevision,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(remoteLastWrite).Build());
         CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
             new("metadata-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }), cancellationToken: deadline.Token)).Entries);
         Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
         Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
         Assert.Equal(localLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
-        Assert.Equal("remote-r1", (await item.InspectAsync(deadline.Token)).RemoteRevision);
+        Assert.Equal(expectedRevision, (await item.InspectAsync(deadline.Token)).RemoteRevision);
         await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token))
         {
             RemoteMetadataIntent completed = RemoteMetadataIntent.Decode(Assert.Single(await transaction.Checkpoints
@@ -88,7 +101,58 @@ public sealed partial class CloudContentConfirmationTests
         CloudRemoteApplyEntryResult reconciled = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
             new("metadata-upsert-reconciled", Array.Empty<byte>(), [upsert], new byte[] { 3 }), cancellationToken: deadline.Token)).Entries);
         Assert.Equal(CloudRemoteApplyEntryStatus.Applied, reconciled.Status);
-        Assert.Equal(localLastWrite.AddDays(1), Directory.GetLastWriteTimeUtc(item.FullPath));
+        Assert.Equal(remoteLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task RemoteMetadataWriteRejectsAReplacementAfterPreparation()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "preparation-paused-after"));
+        const string relative = "Documents";
+        const string otherPath = "Other";
+        CloudPlaceholderIdentity target = new(Guid.NewGuid(), "metadata-original", "r1");
+        CloudPlaceholderIdentity other = new(Guid.NewGuid(), "metadata-replacement", "r1");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, target).WithInSyncState(true).Build(),
+            CloudDirectoryPlaceholderSpec.CreateBuilder(otherPath, other).WithInSyncState(true).Build(),
+        ]);
+        CloudDirectory item = fixture.System.GetDirectory(relative);
+        CloudDirectory replacement = fixture.System.GetDirectory(otherPath);
+        CloudItemSnapshot original = await item.InspectAsync();
+        CloudItemSnapshot successor = await replacement.InspectAsync();
+        string retired = Path.Combine(fixture.Root, "Retired");
+        DateTime remoteLastWrite = new(2020, 3, 4, 12, 0, 0, DateTimeKind.Utc);
+        CloudRemoteChange metadata = new("metadata", CloudRemoteChangeKind.MetadataUpdate, target.RemoteId,
+            "r2", CloudItemKind.Directory, relative, target.ItemId, previousRemoteRevision: "r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(remoteLastWrite).Build());
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-replacement", Array.Empty<byte>(), [metadata], new byte[] { 1 }), cancellationToken: deadline.Token).AsTask();
+        DateTime replacementLastWrite;
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Directory.Move(item.FullPath, retired);
+            Directory.Move(replacement.FullPath, item.FullPath);
+            replacementLastWrite = Directory.GetLastWriteTimeUtc(item.FullPath);
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        CloudRemoteApplyEntryResult rejected = Assert.Single((await apply.WaitAsync(deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, rejected.Status);
+        Assert.Equal(CloudRemoteConflictReason.PathCollision, rejected.Conflict!.Reason);
+        CloudItemSnapshot untouched = await item.InspectAsync(deadline.Token);
+        Assert.Equal(successor.LocalBinding, untouched.LocalBinding);
+        Assert.Equal(successor.PlaceholderIdentity.ToArray(), untouched.PlaceholderIdentity.ToArray());
+        Assert.Equal(original.PlaceholderIdentity.ToArray(), (await fixture.System.GetDirectory("Retired").InspectAsync(deadline.Token))
+            .PlaceholderIdentity.ToArray());
+        Assert.Equal(replacementLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+        await using ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token);
+        Assert.Equal("r1", (await state.Items.GetByItemIdAsync(target.ItemId, deadline.Token))!.RemoteRevision);
+        Assert.Equal("r1", (await state.Items.GetByItemIdAsync(other.ItemId, deadline.Token))!.RemoteRevision);
     }
 
     [Trait("Category", "AccessJournal")]
@@ -557,6 +621,8 @@ public sealed partial class CloudContentConfirmationTests
                     cut = owner._boundary switch
                     {
                         "preparation-after" or "preparation-paused-after" => intents.Any(intent => !intent.Completed),
+                        "native-projection-paused-after" => intents.Any(intent => !intent.Completed) &&
+                            (await Items.GetByRelativePathAsync("Documents", cancellationToken))?.RemoteRevision == "remote-r1",
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "first-outcome-after" => intents.Any(intent => intent.Completed) &&
@@ -567,7 +633,7 @@ public sealed partial class CloudContentConfirmationTests
                 }
                 if (!cut || Interlocked.Exchange(ref owner._failed, 1) != 0)
                 { await inner.CommitAsync(cancellationToken); return; }
-                if (owner._boundary == "preparation-paused-after")
+                if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after")
                 {
                     await inner.CommitAsync(cancellationToken);
                     owner.OutcomePaused.TrySetResult();

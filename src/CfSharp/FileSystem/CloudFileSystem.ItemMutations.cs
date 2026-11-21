@@ -66,7 +66,8 @@ public sealed partial class CloudFileSystem
         CloudItem item,
         CloudPlaceholderPatch patch,
         CancellationToken cancellationToken,
-        Action? beforeNativeUpdate = null)
+        Func<CancellationToken, ValueTask<IDisposable>>? acquireUpdateGuard = null,
+        Action<nint>? verifyRemoteTarget = null)
     {
         ValidatePatch(item, patch);
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
@@ -80,11 +81,12 @@ public sealed partial class CloudFileSystem
             throw new FileNotFoundException("The cloud item does not exist.", item.FullPath);
         }
 
-        long operationUsn = CloudPlaceholderMutationPlatform.Update(
-            item.FullPath,
-            patch,
-            before.Length ?? 0,
-            beforeNativeUpdate);
+        long operationUsn;
+        using (IDisposable? guard = acquireUpdateGuard is null ? null : await acquireUpdateGuard(cancellationToken).ConfigureAwait(false))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            operationUsn = CloudPlaceholderMutationPlatform.Update(item.FullPath, patch, verifyRemoteTarget);
+        }
         bool durableStateUpdated = patch.IdentityChange is not
             CloudPlaceholderIdentityChange.Unchanged;
         if (durableStateUpdated)
@@ -95,6 +97,7 @@ public sealed partial class CloudFileSystem
                     operation.StateStore,
                     item,
                     patch,
+                    requireCurrentOwner: verifyRemoteTarget is not null,
                     CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception exception)
@@ -231,7 +234,8 @@ public sealed partial class CloudFileSystem
         Action? validateBeforeCommit = null,
         Action? onCommitted = null,
         bool preserveExistingState = false,
-        long? observedLocalFileId = null)
+        long? observedLocalFileId = null,
+        bool requireCurrentOwner = false)
     {
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
@@ -239,6 +243,10 @@ public sealed partial class CloudFileSystem
         CloudItemState? existing = await transaction.Items
             .GetByRelativePathAsync(item.RelativePath, cancellationToken)
             .ConfigureAwait(false);
+        if (requireCurrentOwner && (existing is null || existing.IsTombstone || existing.ItemId != identity.ItemId))
+        {
+            throw new InvalidOperationException("The remote placeholder no longer owns its durable path.");
+        }
         if (preserveExistingState)
         {
             await ValidateProtectedLocalIdentityAsync(transaction, item, identity, cancellationToken).ConfigureAwait(false);
@@ -272,6 +280,7 @@ public sealed partial class CloudFileSystem
         ICloudStateStore stateStore,
         CloudItem item,
         CloudPlaceholderPatch patch,
+        bool requireCurrentOwner,
         CancellationToken cancellationToken)
     {
         if (patch.IdentityChange is CloudPlaceholderIdentityChange.Replace)
@@ -280,7 +289,8 @@ public sealed partial class CloudFileSystem
                 stateStore,
                 item,
                 patch.ReplacementIdentity!,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                requireCurrentOwner: requireCurrentOwner).ConfigureAwait(false);
             return;
         }
 

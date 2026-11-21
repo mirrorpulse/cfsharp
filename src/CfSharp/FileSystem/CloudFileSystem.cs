@@ -107,7 +107,9 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// reconciliation of <see cref="SyncRootPath"/>.
     /// </remarks>
     public CloudLocalChangeFeed CreateLocalChangeFeed(
-        CloudLocalChangeFeedOptions? options = null)
+        CloudLocalChangeFeedOptions? options = null) => CreateLocalChangeFeed(options, source: null);
+
+    internal CloudLocalChangeFeed CreateLocalChangeFeed(CloudLocalChangeFeedOptions? options, ILocalChangeSource? source)
     {
         lock (_localChangeFeedGate)
         {
@@ -117,7 +119,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 _stateStore ?? throw new InvalidOperationException(
                     "The cloud file system has no open state store."),
                 options ?? CloudLocalChangeFeedOptions.Default,
-                new WindowsLocalChangeSource(
+                source ?? new WindowsLocalChangeSource(
                     SyncRootPath,
                     (options ?? CloudLocalChangeFeedOptions.Default).BufferCapacity),
                 disposedFeed =>
@@ -403,6 +405,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 if (failures.Count == 0)
                 {
                     _contentConfirmationStopping.Dispose();
+                    _metadataEchoAuthority.Dispose();
                     Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Disposed);
                     GC.SuppressFinalize(this);
                 }

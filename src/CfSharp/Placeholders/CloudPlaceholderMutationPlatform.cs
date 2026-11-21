@@ -53,8 +53,7 @@ internal static class CloudPlaceholderMutationPlatform
     internal static unsafe long Update(
         string path,
         CloudPlaceholderPatch patch,
-        long currentFileSize,
-        Action? beforeNativeUpdate = null)
+        Action<nint>? beforeNativeUpdate)
     {
         byte[] identity = patch.ReplacementIdentity?.Encode() ?? [];
         CfFileRange[] ranges = patch.DehydrateRanges
@@ -64,7 +63,6 @@ internal static class CloudPlaceholderMutationPlatform
                 Length = range.ExtendsToEnd ? CfApi.EndOfFile : range.Length,
             })
             .ToArray();
-        CfFsMetadata metadata = CreateMetadata(patch.Metadata, patch.FileSize ?? currentFileSize);
         bool dehydrates = patch.DehydrateWholeFile || ranges.Length != 0;
         CfOpenFileFlags openFlags = dehydrates
             ? CfOpenFileFlags.Exclusive | CfOpenFileFlags.WriteAccess
@@ -75,13 +73,16 @@ internal static class CloudPlaceholderMutationPlatform
             "CloudItem.UpdatePlaceholder.Open");
         using SafeCloudFilesProtectedHandle.CloudFilesHandleReference handle =
             protectedHandle.AcquireReference();
+        // CF_FS_METADATA carries a length even for an attribute-only file update.
+        // Take the implicit length from the object that will receive the update.
+        long fileSize = patch.FileSize ?? (patch.Metadata?.Kind == CloudItemKind.File
+            ? WindowsFileMetadata.ReadLength(handle.Win32Handle) : 0);
+        CfFsMetadata metadata = CreateMetadata(patch.Metadata, fileSize);
         fixed (byte* identityPointer = identity)
         fixed (CfFileRange* rangesPointer = ranges)
         {
             long operationUsn = patch.ExpectedUsn ?? 0;
-            // Check expiring metadata grants after opening the native handle and
-            // finishing managed preparation, immediately before the update call.
-            beforeNativeUpdate?.Invoke();
+            beforeNativeUpdate?.Invoke(handle.Win32Handle);
             int result = CfApi.CfUpdatePlaceholder(
                 handle.Win32Handle,
                 patch.Metadata is null ? null : &metadata,
