@@ -98,7 +98,8 @@ public sealed partial class CloudLocalChangeFeedTests
             for (int index = 0; index < historyCount; index++)
             {
                 RemoteMetadataIntent historical = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), $"history-{index}",
-                    new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: true, Completed: true) { Reconciled = true };
+                    new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: true, Completed: true)
+                { Reconciled = true };
                 await seed.Checkpoints.UpsertAsync(new(historical.Name, historical.Encode(), now));
             }
             await seed.Checkpoints.UpsertAsync(new(pending.Name, pending.Encode(), now));
