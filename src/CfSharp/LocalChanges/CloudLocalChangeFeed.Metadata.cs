@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
@@ -22,6 +24,28 @@ public sealed partial class CloudLocalChangeFeed
                 (intent.Coordinated && _metadataEchoAuthority?.IsAuthorized(intent) != true))));
 
     internal void NotifyRemoteMetadataCallEnded() => SignalAvailable();
+
+    private async ValueTask WaitForAvailabilityAsync(long? metadataExpiration, CancellationToken cancellationToken)
+    {
+        if (metadataExpiration is not long expires)
+        {
+            await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        TimeSpan remaining = Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), expires);
+        if (remaining <= TimeSpan.Zero) { return; }
+
+        // Cancel the channel read at expiry so it cannot consume a later signal
+        // after this reader has begun another durable scan.
+        using CancellationTokenSource wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        wait.CancelAfter(remaining + TimeSpan.FromMilliseconds(1));
+        try { await _availability.Reader.ReadAsync(wait.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (wait.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // The next iteration checks the actual monotonic deadline and receipts.
+        }
+    }
 
     private async ValueTask<(bool Changed, bool RequiresReconciliation)> RecoverMetadataIntentsAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken)

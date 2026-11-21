@@ -27,6 +27,15 @@ internal sealed class CloudMetadataEchoAuthority
         lock (_gate) { return _applying.Contains(id); }
     }
 
+    internal long? GetNextExpirationTimestamp()
+    {
+        lock (_gate)
+        {
+            Prune();
+            return _expirations.TryPeek(out _, out long expires) ? expires : null;
+        }
+    }
+
     internal bool IsAuthorized(RemoteMetadataIntent intent)
     {
         if (intent.Binding is not { } binding || !intent.Coordinated || intent.Passthrough || intent.Superseded ||

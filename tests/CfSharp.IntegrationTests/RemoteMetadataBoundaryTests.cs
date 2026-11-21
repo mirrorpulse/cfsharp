@@ -180,7 +180,7 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Fact]
-    public async Task ExpiredMetadataCoordinationCannotConsumeTheNextRealAttributeWrite()
+    public async Task ExpiredMetadataCoordinationWakesIdleReadAndRetainsNextRealAttributeWrite()
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -197,7 +197,6 @@ public sealed partial class CloudContentConfirmationTests
         };
         Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
             MetadataBoundaryBatch(identity, "Documents", CloudItemKind.Directory), options)).Status);
-        DateTimeOffset releaseAfter = DateTimeOffset.UtcNow + options.EchoSuppressionLifetime + TimeSpan.FromMilliseconds(100);
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         while (true)
         {
@@ -213,8 +212,13 @@ public sealed partial class CloudContentConfirmationTests
         }
         Assert.Empty(await AccessRowsAsync(factory!));
         Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
-        TimeSpan remaining = releaseAfter - DateTimeOffset.UtcNow;
-        if (remaining > TimeSpan.Zero) { await Task.Delay(remaining, deadline.Token); }
+        // Once the provider echoes have drained, expiry is the only change that
+        // can wake an already waiting legacy reader.
+        Task<CloudLocalChangeBatch> waiting = feed.ReadBatchAsync(deadline.Token).AsTask();
+        Assert.False(waiting.IsCompleted);
+        CloudLocalChangeBatch expired = await waiting;
+        Assert.True(expired.RequiresFullRescan);
+        Assert.Empty(expired.Changes);
         string path = Path.Combine(fixture.Root, "Documents");
         File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
         await WaitForAccessRowsAsync(factory!, rows => rows.Count != 0);

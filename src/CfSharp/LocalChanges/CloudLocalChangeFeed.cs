@@ -184,6 +184,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         while (true)
         {
             ThrowIfFailed();
+            // Capture the deadline before reading the receipts. If another reader
+            // prunes the grant during this read, we still wake by its deadline.
+            long? metadataExpiration = _metadataEchoAuthority?.GetNextExpirationTimestamp();
             long generation = Volatile.Read(ref _persistedLossGeneration);
             await using ICloudStateTransaction transaction = await _stateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -214,7 +217,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
             try
             {
-                await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                await WaitForAvailabilityAsync(metadataExpiration, cancellationToken).ConfigureAwait(false);
             }
             catch (ChannelClosedException)
             {
