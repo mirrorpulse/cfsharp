@@ -10,9 +10,9 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal bool Reconciled { get; init; }
     internal bool Superseded { get; init; }
     internal bool Passthrough { get; init; }
-    internal bool PassthroughConfirmed { get; init; }
-    internal bool IsConfirmedPassthrough => Passthrough && Completed && PassthroughConfirmed && !Superseded && !RequiresReconciliation;
-    internal bool HasUnconfirmedOutcome => !Completed || (Passthrough && !PassthroughConfirmed);
+    internal bool OutcomeConfirmed { get; init; }
+    internal bool IsConfirmedPassthrough => Passthrough && !HasUnconfirmedOutcome && !Superseded && !RequiresReconciliation;
+    internal bool HasUnconfirmedOutcome => !Completed || !OutcomeConfirmed;
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal static string ItemPrefix(Guid itemId) => Prefix + itemId.ToString("N") + "/";
     internal string Name => ItemPrefix(ItemId) + Id.ToString("N");
@@ -48,7 +48,7 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
         writer.Write(Reconciled);
         writer.Write(Superseded);
         writer.Write(Passthrough);
-        writer.Write(PassthroughConfirmed);
+        writer.Write(OutcomeConfirmed);
         return stream.ToArray();
     }
 
@@ -71,18 +71,18 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
             bool reconciled = ReadBoolean(reader);
             bool superseded = ReadBoolean(reader);
             bool passthrough = ReadBoolean(reader);
-            // Older receipts have no proof that the outcome commit returned to the caller.
-            bool passthroughConfirmed = stream.Position != stream.Length && ReadBoolean(reader);
+            // Earlier receipts either omit confirmation or set it only for passthrough.
+            bool outcomeConfirmed = stream.Position != stream.Length && ReadBoolean(reader);
             RemoteMetadataIntent intent = new(id, call, item, path, binding, coordinated, completed)
             {
                 RequiresReconciliation = reconcile,
                 Reconciled = reconciled,
                 Superseded = superseded,
                 Passthrough = passthrough,
-                PassthroughConfirmed = passthroughConfirmed,
+                OutcomeConfirmed = outcomeConfirmed,
             };
             if (id == Guid.Empty || call == Guid.Empty || item == Guid.Empty || checkpoint.Name != intent.Name ||
-                stream.Position != stream.Length || (passthroughConfirmed && (!passthrough || !completed)))
+                stream.Position != stream.Length || (outcomeConfirmed && !completed))
             { throw new InvalidDataException("Invalid remote metadata evidence."); }
             if (CloudStateModelValidation.CanonicalizeRelativePath(path, nameof(path)) != path)
             { throw new InvalidDataException("Invalid remote metadata path."); }

@@ -85,17 +85,17 @@ public sealed partial class CloudFileSystem
             operation.EstablishContext();
             CloudMetadataEchoAuthority.Call metadataCall = _metadataEchoAuthority.Begin();
             _metadataEchoCall = metadataCall;
+            CloudRemoteApplyOptions? coordinatedOptions = null;
             try
             {
                 CloudRemoteApplyResult result = await ApplyRemoteChangesCoreAsync(batch, options, cancellationToken).ConfigureAwait(false);
                 if (result.Status == CloudRemoteBatchStatus.Applied && !result.RequiresRetry)
                 {
-                    await ConfirmRemoteMetadataPassthroughAsync(operation.StateStore, metadataCall).ConfigureAwait(false);
-                    metadataCall.Authorize(options ?? CloudRemoteApplyOptions.Default);
+                    coordinatedOptions = options ?? CloudRemoteApplyOptions.Default;
                 }
                 return result;
             }
-            finally { EndRemoteMetadataCall(metadataCall); }
+            finally { await EndRemoteMetadataCallAsync(operation.StateStore, metadataCall, coordinatedOptions).ConfigureAwait(false); }
         }
         finally
         {
@@ -226,6 +226,9 @@ public sealed partial class CloudFileSystem
                     status,
                     cancellationToken)
                 .ConfigureAwait(false);
+            // Only the entries whose outcome transactions returned successfully can be
+            // confirmed. Resumed prefixes and commits that threw never enter this list.
+            _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
             results.Add(new CloudRemoteApplyEntryResult(
                 change.ChangeId,
                 outcome.Status,
@@ -282,7 +285,7 @@ public sealed partial class CloudFileSystem
             CloudMetadataEchoAuthority.Call metadataCall = _metadataEchoAuthority.Begin();
             _metadataEchoCall = metadataCall;
             try { return await ResolveRemoteConflictCoreAsync(conflictId, resolution, cancellationToken).ConfigureAwait(false); }
-            finally { EndRemoteMetadataCall(metadataCall); }
+            finally { await EndRemoteMetadataCallAsync(operation.StateStore, metadataCall).ConfigureAwait(false); }
         }
         finally
         {
@@ -355,32 +358,35 @@ public sealed partial class CloudFileSystem
                 outcome.Conflict);
         }
 
-        await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
+        await using (ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
-        using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
-            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
-            : null;
-        using RemoteCreationOutcomeLease? creation = retry.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
-            ? await HoldRemoteCreationOutcomeAsync(transaction, conflict.Change, cancellationToken).ConfigureAwait(false) : null;
-        if (deleteRequest is not null && deleteParents is not null)
+            .ConfigureAwait(false))
         {
-            await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+            using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
+                ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
+                : null;
+            using RemoteCreationOutcomeLease? creation = retry.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
+                ? await HoldRemoteCreationOutcomeAsync(transaction, conflict.Change, cancellationToken).ConfigureAwait(false) : null;
+            if (deleteRequest is not null && deleteParents is not null)
+            {
+                await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
                 .ConfigureAwait(false);
+            if (deleteRequest is not null)
+            {
+                await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
+            }
+            if (creation is not null)
+            {
+                await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(conflict.Change), cancellationToken).ConfigureAwait(false);
+                creation.Validate();
+            }
+            await CompleteRemoteMetadataIntentAsync(transaction, outcome, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
-        await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
-            .ConfigureAwait(false);
-        if (deleteRequest is not null)
-        {
-            await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
-        }
-        if (creation is not null)
-        {
-            await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(conflict.Change), cancellationToken).ConfigureAwait(false);
-            creation.Validate();
-        }
-        await CompleteRemoteMetadataIntentAsync(transaction, outcome, cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
         return new CloudRemoteApplyEntryResult(
             conflict.Change.ChangeId,
             CloudRemoteApplyEntryStatus.Applied);
@@ -792,7 +798,7 @@ public sealed partial class CloudFileSystem
                             cancellationToken).ConfigureAwait(false);
                     }
                 }
-                _metadataEchoCall?.TrackPreparation(metadataIntent);
+                _metadataEchoCall?.TrackPreparation();
                 await preparation.Checkpoints.UpsertAsync(new(metadataIntent.Name, metadataIntent.Encode(), DateTimeOffset.UtcNow),
                     cancellationToken).ConfigureAwait(false);
                 await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1152,29 +1158,37 @@ public sealed partial class CloudFileSystem
             (intent.RequiresReconciliation || (intent.HasUnconfirmedOutcome && intent.CallId != _metadataEchoCall?.Id)));
     }
 
-    private void EndRemoteMetadataCall(CloudMetadataEchoAuthority.Call call)
+    private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,
+        CloudRemoteApplyOptions? coordinatedOptions = null)
     {
-        _metadataEchoCall = null;
-        call.Dispose();
-        // A preparation commit can throw before any native call runs. Wake a legacy reader
-        // even when no watcher event will arrive. Readers check retained evidence directly.
-        if (call.HasMetadataPreparation) { Volatile.Read(ref _localChangeFeed)?.NotifyRemoteMetadataCallEnded(); }
+        try
+        {
+            await ConfirmRemoteMetadataOutcomesAsync(store, call).ConfigureAwait(false);
+            if (coordinatedOptions is not null) { call.Authorize(coordinatedOptions); }
+        }
+        finally
+        {
+            _metadataEchoCall = null;
+            call.Dispose();
+            // A preparation commit can throw before any native call runs. Wake a legacy reader
+            // even when no watcher event will arrive. Readers check retained evidence directly.
+            if (call.HasMetadataPreparation) { Volatile.Read(ref _localChangeFeed)?.NotifyRemoteMetadataCallEnded(); }
+        }
     }
 
-    private static async ValueTask ConfirmRemoteMetadataPassthroughAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call)
+    private static async ValueTask ConfirmRemoteMetadataOutcomesAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call)
     {
-        if (call.PassthroughPreparations.Count == 0) { return; }
+        if (call.CommittedOutcomes.Count == 0) { return; }
         try
         {
             await using ICloudStateTransaction transaction = await store.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
-            foreach (string name in call.PassthroughPreparations)
+            foreach (string name in call.CommittedOutcomes)
             {
                 CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(name, CancellationToken.None).ConfigureAwait(false);
                 if (checkpoint is null) { continue; }
                 RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
-                if (intent.CallId != call.Id || !intent.Passthrough || !intent.Completed || intent.RequiresReconciliation || intent.Superseded)
-                { continue; }
-                RemoteMetadataIntent confirmed = intent with { PassthroughConfirmed = true };
+                if (intent.CallId != call.Id || !intent.Completed) { continue; }
+                RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
                 await transaction.Checkpoints.UpsertAsync(new(name, confirmed.Encode(), DateTimeOffset.UtcNow), CancellationToken.None)
                     .ConfigureAwait(false);
             }
@@ -1185,7 +1199,7 @@ public sealed partial class CloudFileSystem
             // The apply outcome already returned successfully from its commit. Failure to
             // record that confirmation leaves the feed conservative, without failing the apply.
             System.Diagnostics.Activity? activity = CloudDiagnostics.StartActivity(
-                "cfsharp.remote-metadata.passthrough-confirmation", "remote-metadata.passthrough-confirmation");
+                "cfsharp.remote-metadata.outcome-confirmation", "remote-metadata.outcome-confirmation");
             CloudDiagnostics.RecordException(activity, exception);
             CloudDiagnostics.StopActivity(activity, "failed");
         }

@@ -31,14 +31,16 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
             'FullyQualifiedName~NativeMetadataSharingFailureCannotAuthorizeSuppression',
             'FullyQualifiedName~DefaultMetadataPolicyDoesNotInheritAnEarlierCoordinatedWindow',
             'FullyQualifiedName~ProtectedUpsertCannotOverwriteAnUnreconciledAttributeEdit',
-            'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes') -join '|'
+            'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes',
+            'FullyQualifiedName~AmbiguousMetadataCommitProtectsAnUnobservedNativeAttributeEdit',
+            'FullyQualifiedName~SegmentedPassthroughConfirmsOnlyAcknowledgedMetadataOutcomes') -join '|'
     }
     elseif ($Suite -eq 'OfflineReference') { 'FullyQualifiedName~OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess' }
     elseif ($Suite -eq 'DeleteReconciliation') { 'FullyQualifiedName~LocalDeleteReconciliationRetainsAnOriginalConflictWithoutNativeWork' }
     elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
-    elseif ($Suite -eq 'AccessJournal') { 19 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
+    elseif ($Suite -eq 'AccessJournal') { 23 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null

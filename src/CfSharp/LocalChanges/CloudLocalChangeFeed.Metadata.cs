@@ -8,7 +8,8 @@ public sealed partial class CloudLocalChangeFeed
             cancellationToken).ConfigureAwait(false)).Select(RemoteMetadataIntent.Decode).ToArray();
 
     private bool OwnsMetadataObservation(RemoteMetadataIntent intent, LocalChangeSourceEvent? observation, Guid? itemId) =>
-        !intent.RequiresReconciliation && !intent.Reconciled && !intent.Superseded && !intent.Passthrough && intent.Completed && intent.Coordinated &&
+        !intent.RequiresReconciliation && !intent.Reconciled && !intent.Superseded && !intent.Passthrough &&
+        !intent.HasUnconfirmedOutcome && intent.Coordinated &&
         _metadataEchoAuthority?.IsAuthorized(intent.CallId, intent.ItemId, intent.Binding) == true &&
         observation is { Action: LocalChangeSourceAction.AttributesModified, SecurityIdentity: { } identity } &&
         intent.Matches(identity, itemId);
@@ -35,7 +36,7 @@ public sealed partial class CloudLocalChangeFeed
                 continue;
             }
             if (_metadataEchoAuthority?.IsApplying(intent.CallId) == true) { continue; }
-            if (!intent.RequiresReconciliation && !intent.Superseded && intent.Completed && intent.Coordinated &&
+            if (!intent.RequiresReconciliation && !intent.Superseded && !intent.HasUnconfirmedOutcome && intent.Coordinated &&
                 _metadataEchoAuthority?.IsAuthorized(intent.CallId, intent.ItemId, intent.Binding) == true) { continue; }
             RemoteMetadataIntent retained = intent with { RequiresReconciliation = true };
             await transaction.Checkpoints.UpsertAsync(new(retained.Name, retained.Encode(), DateTimeOffset.UtcNow),

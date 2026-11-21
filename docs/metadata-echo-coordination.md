@@ -68,22 +68,24 @@ still retains uncertainty; disabling suppression does not acknowledge earlier lo
 
 ## Failure, restart and reconciliation
 
-Preparation is durable before mutation; completion shares the remote outcome transaction.
-Native failure, outcome-publication failure, incomplete calls and ambiguous commit outcomes do
-not activate automatic suppression. The retained preparation requires reconciliation and cannot
-consume a later genuine write. A different native generation cannot inherit authorization at
-the same name. Completed observations staged before a crash recover through the existing
-metadata-validation receipt protocol with the same original operation IDs and sequences.
+Preparation is durable before mutation. Completion shares the remote outcome transaction, and
+confirmation is written separately once that transaction has returned successfully. An exception
+from the outcome commit leaves the entry unconfirmed under every policy, even if the database
+already contains the outcome. The retained preparation requires reconciliation and protects
+genuine writes. A different native generation cannot inherit authorization at the same name.
+Completed observations staged before a crash recover through the existing metadata-validation
+receipt protocol with the same original operation IDs and sequences.
 The running feed also reads retained preparations directly, so a failed preparation can signal
 reconciliation even when it produced no native notification. A protected file or directory upsert
 checks this same evidence before updating an existing placeholder, including when the journaled
 observation is unbound. Reconciliation authorizes later protected upserts. The retained originals
 still need their individual acknowledgements.
 
-Passthrough becomes effective after the successful batch outcome is confirmed separately. If the
+Passthrough becomes effective for each confirmed entry, including entries applied in a partial
+call limited by `MaximumEntries`. A later failure leaves those confirmed entries intact. If an
 outcome commit throws after persisting, replay can report `AlreadyApplied`, while the feed still
-requires reconciliation. If only the confirmation write fails, the known apply outcome stays
-successful and any unconfirmed receipt remains conservative. Older passthrough receipts without
+requires reconciliation for that entry. If only the confirmation write fails, the known apply
+outcome stays successful and any unconfirmed receipt remains conservative. Older receipts without
 confirmation also require reconciliation.
 
 A new file-system owner does not recover the former caller's promise about external writers.
