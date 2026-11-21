@@ -9,7 +9,7 @@ public sealed partial class CloudLocalChangeFeedTests : IAsyncLifetime
     public Task InitializeAsync()
     {
         _temporaryDirectory = Path.Combine(
-            Path.GetTempPath(),
+            Environment.GetEnvironmentVariable("CFSHARP_TEST_TEMP_ROOT") ?? Path.GetTempPath(),
             "CfSharp-local-feed-tests",
             Guid.NewGuid().ToString("N"));
         _syncRootPath = Path.Combine(_temporaryDirectory, "sync-root");

@@ -138,8 +138,11 @@ public sealed partial class CloudLocalChangeFeed
                 }
                 // A timeout is not origin evidence. Keep one retired marker per native
                 // generation/path so late callbacks cannot regain a false local association.
-                RemoteMetadataIntent reconciled = keep with { Reconciled = true, RequiresReconciliation = false };
-                await reconciled.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+                if (!keep.Reconciled || keep.RequiresReconciliation)
+                {
+                    RemoteMetadataIntent reconciled = keep with { Reconciled = true, RequiresReconciliation = false };
+                    await reconciled.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
     }

@@ -89,6 +89,7 @@ public sealed partial class CloudLocalChangeFeedTests
     {
         await using ICloudStateStore store = await OpenStoreAsync();
         DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset originalCheckpointTime = now.AddDays(-1);
         Guid operationId = Guid.NewGuid();
         RemoteMetadataIntent pending = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "pending", null,
             Coordinated: false, Completed: false);
@@ -100,7 +101,7 @@ public sealed partial class CloudLocalChangeFeedTests
                 RemoteMetadataIntent historical = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), $"history-{index}",
                     new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: true, Completed: true)
                 { Reconciled = true };
-                await seed.Checkpoints.UpsertAsync(new(historical.Name, historical.Encode(), now));
+                await seed.Checkpoints.UpsertAsync(new(historical.Name, historical.Encode(), originalCheckpointTime));
             }
             await seed.Checkpoints.UpsertAsync(new(pending.Name, pending.Encode(), now));
             await seed.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
@@ -118,10 +119,14 @@ public sealed partial class CloudLocalChangeFeedTests
             Assert.Equal(pending.Id, RemoteMetadataIntent.DecodePending(indexed).Id);
         }
         await feed.AcknowledgeFullRescanAsync();
+        await feed.AcknowledgeFullRescanAsync();
         await using (ICloudStateTransaction state = await store.BeginTransactionAsync())
         {
             Assert.Empty(await state.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix));
-            Assert.Equal(historyCount + 1, (await state.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)).Count);
+            IReadOnlyList<CloudStateCheckpoint> receipts = await state.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix);
+            Assert.Equal(historyCount + 1, receipts.Count);
+            Assert.All(receipts.Where(receipt => receipt.Name != pending.Name),
+                receipt => Assert.Equal(originalCheckpointTime, receipt.UpdatedAt));
         }
 
         List<string> prefixes = [];
