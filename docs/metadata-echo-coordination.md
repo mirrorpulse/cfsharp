@@ -59,6 +59,8 @@ Generic data/name notifications and independent DACL notifications never redeem 
 The observation count option for other remote operation kinds does not limit this declared window.
 Authority expires using a monotonic clock, so a wall-clock adjustment cannot extend the promise.
 Once the window expires, the receipt requires reconciliation before the next protected write.
+An in-place write relying on a previous call's authorization checks it again just before the
+native update, after durable preparation and handle acquisition.
 Entries confirmed in a call stopped by `MaximumEntries` also require reconciliation. Such a
 partial call never activates coordinated authority, even for entries that were applied successfully.
 A subsequent metadata operation or in-place upsert supersedes earlier permission for the affected

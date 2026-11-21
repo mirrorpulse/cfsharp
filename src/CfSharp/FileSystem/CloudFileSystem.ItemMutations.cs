@@ -65,7 +65,8 @@ public sealed partial class CloudFileSystem
     internal async ValueTask<CloudPlaceholderMutationResult> UpdatePlaceholderAsync(
         CloudItem item,
         CloudPlaceholderPatch patch,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? beforeNativeUpdate = null)
     {
         ValidatePatch(item, patch);
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
@@ -82,7 +83,8 @@ public sealed partial class CloudFileSystem
         long operationUsn = CloudPlaceholderMutationPlatform.Update(
             item.FullPath,
             patch,
-            before.Length ?? 0);
+            before.Length ?? 0,
+            beforeNativeUpdate);
         bool durableStateUpdated = patch.IdentityChange is not
             CloudPlaceholderIdentityChange.Unchanged;
         if (durableStateUpdated)

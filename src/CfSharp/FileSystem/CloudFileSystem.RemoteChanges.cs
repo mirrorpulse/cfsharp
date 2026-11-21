@@ -710,6 +710,7 @@ public sealed partial class CloudFileSystem
             ? Directory.Exists(ToFullPath(change.RelativePath))
             : File.Exists(ToFullPath(change.RelativePath));
         CloudLocalFileBinding? metadataBinding = null;
+        IReadOnlyList<RemoteMetadataIntent> metadataGrants = [];
         if (context.LocalState is not null && localExists)
         {
             CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
@@ -726,10 +727,15 @@ public sealed partial class CloudFileSystem
 
             // All update variants can write attributes. Consult the durable attribution
             // evidence even if the watcher has not published an observation yet.
-            if (options.PreserveUnsynchronizedLocalContent && await HasUnreconciledRemoteMetadataAsync(
-                context.LocalState.ItemId, change.RelativePath, snapshot.LocalBinding, cancellationToken).ConfigureAwait(false))
+            if (options.PreserveUnsynchronizedLocalContent)
             {
-                return RemoteEntryOutcome.ConflictResult(CreateConflict(change, context.LocalState, CloudRemoteConflictReason.Metadata));
+                (bool requiresReconciliation, IReadOnlyList<RemoteMetadataIntent> grants) = await ReadRemoteMetadataProtectionAsync(
+                    context.LocalState.ItemId, change.RelativePath, snapshot.LocalBinding, cancellationToken).ConfigureAwait(false);
+                if (requiresReconciliation)
+                {
+                    return RemoteEntryOutcome.ConflictResult(CreateConflict(change, context.LocalState, CloudRemoteConflictReason.Metadata));
+                }
+                metadataGrants = grants;
             }
 
             if (options.PreserveUnsynchronizedLocalContent &&
@@ -785,7 +791,8 @@ public sealed partial class CloudFileSystem
             }
             else
             {
-                CloudPlaceholderMutationResult updated = await UpdateRemotePlaceholderAsync(change, context.LocalState!, options, cancellationToken)
+                CloudPlaceholderMutationResult updated = await UpdateRemotePlaceholderAsync(
+                    change, context.LocalState!, options, metadataGrants, cancellationToken)
                     .ConfigureAwait(false);
                 if (metadataIntent is not null && (metadataIntent.Binding is null || updated.Snapshot.LocalBinding != metadataIntent.Binding))
                 { metadataIntent = metadataIntent with { RequiresReconciliation = true }; }
@@ -793,13 +800,22 @@ public sealed partial class CloudFileSystem
                 { _metadataEchoCall?.Record(metadataIntent.ItemId, completedBinding); }
             }
         }
-        catch
+        catch (Exception exception)
         {
             if (suppressionId is Guid registeredSuppressionId)
             {
                 await RemoveRemoteEchoSuppressionAsync(registeredSuppressionId).ConfigureAwait(false);
             }
 
+            if (exception is RemoteMetadataAuthorizationExpiredException)
+            {
+                // Preparation may have retired the grant this write relied on. Preserve
+                // reconciliation evidence even though no native update was attempted.
+                return RemoteEntryOutcome.ConflictResult(CreateConflict(change, context.LocalState, CloudRemoteConflictReason.Metadata)) with
+                {
+                    MetadataIntent = metadataIntent is null ? null : metadataIntent with { RequiresReconciliation = true },
+                };
+            }
             throw;
         }
 
@@ -1060,6 +1076,7 @@ public sealed partial class CloudFileSystem
         CloudRemoteChange change,
         CloudItemState localState,
         CloudRemoteApplyOptions options,
+        IReadOnlyList<RemoteMetadataIntent> metadataGrants,
         CancellationToken cancellationToken)
     {
         CloudPlaceholderIdentity identity = new(
@@ -1095,7 +1112,14 @@ public sealed partial class CloudFileSystem
         }
 
         CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
-        return await item.UpdatePlaceholderAsync(builder.Build(), cancellationToken).ConfigureAwait(false);
+        Action? verifyCoordination = metadataGrants.Count == 0 ? null : () =>
+        {
+            if (metadataGrants.Any(grant => !_metadataEchoAuthority.IsAuthorized(grant)))
+            {
+                throw new RemoteMetadataAuthorizationExpiredException();
+            }
+        };
+        return await UpdatePlaceholderAsync(item, builder.Build(), cancellationToken, verifyCoordination).ConfigureAwait(false);
     }
 
     private async ValueTask<RemoteMetadataIntent?> PrepareRemoteMetadataIntentAsync(CloudRemoteChange change,
@@ -1156,12 +1180,13 @@ public sealed partial class CloudFileSystem
         }
     }
 
-    private async ValueTask<bool> HasUnreconciledRemoteMetadataAsync(Guid itemId, string path,
-        CloudLocalFileBinding? binding, CancellationToken cancellationToken)
+    private async ValueTask<(bool RequiresReconciliation, IReadOnlyList<RemoteMetadataIntent> Grants)> ReadRemoteMetadataProtectionAsync(
+        Guid itemId, string path, CloudLocalFileBinding? binding, CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> checkpoints = await transaction.Checkpoints.ListAsync(
             RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
+        List<RemoteMetadataIntent> grants = [];
         foreach (CloudStateCheckpoint checkpoint in checkpoints)
         {
             RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
@@ -1176,11 +1201,14 @@ public sealed partial class CloudFileSystem
             if (intent.RequiresReconciliation || intent.UsesReconciliationPolicy || lostCoordination ||
                 (intent.HasUnconfirmedOutcome && !currentCall))
             {
-                return true;
+                return (true, []);
             }
+            if (intent.Coordinated && !currentCall) { grants.Add(intent); }
         }
-        return false;
+        return (false, grants);
     }
+
+    private sealed class RemoteMetadataAuthorizationExpiredException : Exception { }
 
     private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,
         CloudRemoteApplyOptions? coordinatedOptions = null)

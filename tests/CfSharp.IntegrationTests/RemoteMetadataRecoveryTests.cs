@@ -1,9 +1,68 @@
+using System.Diagnostics;
+
 using CfSharp.Storage.Sqlite;
 
 namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task ProtectedUpsertRechecksMetadataCoordinationAfterPreparation()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "preparation-paused-after"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-expiry-during-upsert");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CloudRemoteApplyOptions coordinated = new()
+        {
+            AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
+            EchoSuppressionLifetime = TimeSpan.FromSeconds(2),
+        };
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), coordinated, deadline.Token)).Entries).Status);
+        long appliedAt = Stopwatch.GetTimestamp();
+
+        CloudDirectory item = fixture.System.GetDirectory(relative);
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-coordination-expired-during-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }),
+            new() { SuppressLocalEcho = false }, deadline.Token).AsTask();
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            while (coordinated.EchoSuppressionLifetime - Stopwatch.GetElapsedTime(appliedAt) is { Ticks: > 0 } remaining)
+            {
+                await Task.Delay(remaining + TimeSpan.FromMilliseconds(1), deadline.Token);
+            }
+            File.SetAttributes(item.FullPath, File.GetAttributes(item.FullPath) | FileAttributes.Hidden);
+            await using ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token);
+            Assert.Empty(await state.Operations.ListAsync(10, cancellationToken: deadline.Token));
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+        CloudRemoteApplyEntryResult outcome = Assert.Single((await apply.WaitAsync(deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, outcome.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, outcome.Conflict!.Reason);
+        Assert.True(File.GetAttributes(item.FullPath).HasFlag(FileAttributes.Hidden));
+        Assert.Equal("remote-r1", (await item.InspectAsync(deadline.Token)).RemoteRevision);
+
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync(deadline.Token);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudRemoteApplyResult reconciled = await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-after-expiry-reconciliation", Array.Empty<byte>(), [upsert], new byte[] { 3 }),
+            cancellationToken: deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(reconciled.Entries).Status);
+    }
+
     [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData(CloudRemoteAttributeEchoPolicy.RequireReconciliation)]
@@ -343,7 +402,7 @@ public sealed partial class CloudContentConfirmationTests
                     staged = receipts.Count == 0 ? null : receipts[0];
                     cut = owner._boundary switch
                     {
-                        "preparation-after" => intents.Any(intent => !intent.Completed),
+                        "preparation-after" or "preparation-paused-after" => intents.Any(intent => !intent.Completed),
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "first-outcome-after" => intents.Any(intent => intent.Completed) &&
@@ -354,6 +413,13 @@ public sealed partial class CloudContentConfirmationTests
                 }
                 if (!cut || Interlocked.Exchange(ref owner._failed, 1) != 0)
                 { await inner.CommitAsync(cancellationToken); return; }
+                if (owner._boundary == "preparation-paused-after")
+                {
+                    await inner.CommitAsync(cancellationToken);
+                    owner.OutcomePaused.TrySetResult();
+                    await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
+                    return;
+                }
                 if (owner._boundary == "outcome-paused")
                 {
                     owner.OutcomePaused.TrySetResult();

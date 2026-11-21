@@ -53,7 +53,8 @@ internal static class CloudPlaceholderMutationPlatform
     internal static unsafe long Update(
         string path,
         CloudPlaceholderPatch patch,
-        long currentFileSize)
+        long currentFileSize,
+        Action? beforeNativeUpdate = null)
     {
         byte[] identity = patch.ReplacementIdentity?.Encode() ?? [];
         CfFileRange[] ranges = patch.DehydrateRanges
@@ -78,6 +79,9 @@ internal static class CloudPlaceholderMutationPlatform
         fixed (CfFileRange* rangesPointer = ranges)
         {
             long operationUsn = patch.ExpectedUsn ?? 0;
+            // Check expiring metadata grants after opening the native handle and
+            // finishing managed preparation, immediately before the update call.
+            beforeNativeUpdate?.Invoke();
             int result = CfApi.CfUpdatePlaceholder(
                 handle.Win32Handle,
                 patch.Metadata is null ? null : &metadata,
