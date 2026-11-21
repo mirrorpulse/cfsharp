@@ -7,6 +7,91 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RemoteMetadataCompletionPreservesConcurrentReconciliation(bool suppressEcho)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "preparation-paused-after"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-concurrent-reconciliation");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        CloudDirectory item = fixture.System.GetDirectory(relative);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+
+        factory.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), new()
+            {
+                SuppressLocalEcho = suppressEcho,
+                AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
+            }, deadline.Token).AsTask();
+        CloudOperationJournalEntry original;
+        DateTime localLastWrite = new(2020, 3, 4, 12, 0, 0, DateTimeKind.Utc);
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Directory.SetLastWriteTimeUtc(item.FullPath, localLastWrite);
+            await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
+            while (true)
+            {
+                await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token);
+                IReadOnlyList<CloudOperationJournalEntry> rows = await transaction.Operations.ListAsync(10, cancellationToken: deadline.Token);
+                if (rows.Count != 0)
+                {
+                    original = Assert.Single(rows);
+                    RemoteMetadataIntent prepared = RemoteMetadataIntent.Decode(Assert.Single(await transaction.Checkpoints
+                        .ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+                    Assert.True(prepared is { RequiresReconciliation: true, Completed: false });
+                    break;
+                }
+                await transaction.RollbackAsync(deadline.Token);
+                await Task.Delay(10, deadline.Token);
+            }
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
+        Assert.Equal(CloudStateOperationKind.MetadataUpdate, original.Kind);
+        Assert.Null(original.ItemId);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(localLastWrite.AddDays(1)).Build());
+        CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
+        Assert.Equal(CloudRemoteConflictReason.Metadata, blocked.Conflict!.Reason);
+        Assert.Equal(localLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+        Assert.Equal("remote-r1", (await item.InspectAsync(deadline.Token)).RemoteRevision);
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token))
+        {
+            RemoteMetadataIntent completed = RemoteMetadataIntent.Decode(Assert.Single(await transaction.Checkpoints
+                .ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+            Assert.True(completed is { Completed: true, OutcomeConfirmed: true, RequiresReconciliation: true });
+        }
+
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        CloudLocalChange observation = Assert.Single(page.Changes);
+        Assert.Equal((original.OperationId, original.Sequence, relative),
+            (observation.OperationId, observation.Sequence, observation.RelativePath));
+        Assert.Null(observation.ItemId);
+        await feed.AcknowledgeAsync([original.OperationId], deadline.Token);
+        CloudRemoteApplyEntryResult reconciled = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-upsert-reconciled", Array.Empty<byte>(), [upsert], new byte[] { 3 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, reconciled.Status);
+        Assert.Equal(localLastWrite.AddDays(1), Directory.GetLastWriteTimeUtc(item.FullPath));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task ProtectedUpsertRechecksMetadataCoordinationAfterPreparation()
     {
@@ -360,6 +445,20 @@ public sealed partial class CloudContentConfirmationTests
             await reopened.AcknowledgeFullRescanAsync(deadline.Token);
             Assert.False((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
         }
+    }
+
+    private sealed class ControlledMetadataSource : ILocalChangeSource
+    {
+        private Func<LocalChangeSourceEvent, ValueTask>? _handler;
+
+        public Task StartAsync(Func<LocalChangeSourceEvent, ValueTask> eventHandler, CancellationToken cancellationToken)
+        {
+            _handler = eventHandler;
+            return Task.CompletedTask;
+        }
+
+        internal ValueTask EmitAsync(LocalChangeSourceEvent change) => _handler!(change);
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class MetadataFaultFactory(string path, string boundary) : ICloudStateStoreFactory

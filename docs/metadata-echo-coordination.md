@@ -82,6 +82,8 @@ confirmation is written separately once that transaction has returned successful
 from the outcome commit leaves the entry unconfirmed under every policy, even if the database
 already contains the outcome. The retained preparation requires reconciliation and protects
 genuine writes. A different native generation cannot inherit authorization at the same name.
+If the feed requires reconciliation during the remote apply, the outcome transaction preserves
+that requirement alongside the completed receipt.
 Completed observations staged before a crash recover through the existing metadata-validation
 receipt protocol with the same original operation IDs and sequences.
 The running feed reads retained preparations directly. A failed preparation, an unreconciled

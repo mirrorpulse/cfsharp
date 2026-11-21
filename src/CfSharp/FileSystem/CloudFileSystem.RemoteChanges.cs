@@ -1172,9 +1172,23 @@ public sealed partial class CloudFileSystem
     {
         if (outcome.MetadataIntent is { } intent)
         {
+            CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(intent.Name, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException("The prepared remote metadata receipt is missing.");
+            RemoteMetadataIntent retained = RemoteMetadataIntent.Decode(checkpoint);
+            if (retained.Name != intent.Name || retained.CallId != intent.CallId || retained.Completed)
+            {
+                throw new InvalidDataException("The prepared remote metadata receipt changed before completion.");
+            }
+
+            // The feed can record a local observation after preparation commits.
+            // Complete the retained receipt and merge any uncertainty found during the native update.
             // Completion shares the outcome commit. A failed/ambiguous commit cannot grant
             // authority: activation also requires this public call to return successfully.
-            RemoteMetadataIntent completed = intent with { Completed = true };
+            RemoteMetadataIntent completed = retained with
+            {
+                Completed = true,
+                RequiresReconciliation = retained.RequiresReconciliation || intent.RequiresReconciliation,
+            };
             await transaction.Checkpoints.UpsertAsync(new(completed.Name, completed.Encode(), DateTimeOffset.UtcNow),
                 cancellationToken).ConfigureAwait(false);
         }
