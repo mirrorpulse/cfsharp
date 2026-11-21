@@ -4,6 +4,10 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
+    private async ValueTask<IDisposable?> AcquirePublicationAsync(CancellationToken cancellationToken) =>
+        _metadataEchoAuthority is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+
     private static async ValueTask<RemoteMetadataIntent[]> ReadMetadataIntentsAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken, Guid? itemId = null) => (await transaction.Checkpoints.ListAsync(
             itemId is Guid id ? RemoteMetadataIntent.ItemPrefix(id) : RemoteMetadataIntent.Prefix,

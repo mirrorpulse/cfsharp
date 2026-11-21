@@ -86,7 +86,9 @@ from the outcome commit leaves the entry unconfirmed under every policy, even if
 already contains the outcome. The retained preparation requires reconciliation and protects
 genuine writes. A different native generation cannot inherit authorization at the same name.
 If the feed requires reconciliation during the remote apply, the outcome transaction preserves
-that requirement alongside the completed receipt.
+that requirement alongside the completed receipt. Preparation, result publication, and outcome
+confirmation are ordered against feed publication, including when the store supports overlapping
+transactions.
 A protected in-place update checks for newly journaled work and reconciliation evidence after
 preparation. The file system orders that check and the native update against its feed's journal
 publication, including with custom stores that allow overlapping transactions. It verifies the

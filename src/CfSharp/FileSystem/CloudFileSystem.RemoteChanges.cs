@@ -362,6 +362,8 @@ public sealed partial class CloudFileSystem
                 outcome.Conflict);
         }
 
+        using IDisposable? publication = outcome.MetadataIntent is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using (ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false))
@@ -1183,6 +1185,7 @@ public sealed partial class CloudFileSystem
     {
         bool passthrough = !options.SuppressLocalEcho;
         bool coordinated = !passthrough && options.AttributeEchoPolicy == CloudRemoteAttributeEchoPolicy.CallerCoordinated;
+        using IDisposable publication = await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction preparation = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> checkpoints = await preparation.Checkpoints.ListAsync(
             RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
@@ -1300,6 +1303,8 @@ public sealed partial class CloudFileSystem
     private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,
         CloudRemoteApplyOptions? coordinatedOptions = null)
     {
+        using IDisposable? publication = call.HasMetadataPreparation
+            ? await _metadataEchoAuthority.AcquirePublicationAsync(CancellationToken.None).ConfigureAwait(false) : null;
         try
         {
             await ConfirmRemoteMetadataOutcomesAsync(store, call).ConfigureAwait(false);
@@ -1438,6 +1443,8 @@ public sealed partial class CloudFileSystem
                 $"Remote batch '{batch.BatchId}' cannot publish an incomplete applied state.");
         }
 
+        using IDisposable? publication = outcome.MetadataIntent is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);

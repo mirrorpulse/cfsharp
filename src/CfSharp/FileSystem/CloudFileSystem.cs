@@ -405,7 +405,6 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 if (failures.Count == 0)
                 {
                     _contentConfirmationStopping.Dispose();
-                    _metadataEchoAuthority.Dispose();
                     Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Disposed);
                     GC.SuppressFinalize(this);
                 }

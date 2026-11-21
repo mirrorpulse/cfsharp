@@ -1,10 +1,13 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 
 namespace CfSharp;
 
 // A durable receipt records what happened, not a recovered caller's promise about other writers.
 // Only a successful public call on this owner can activate that promise in memory.
-internal sealed class CloudMetadataEchoAuthority : IDisposable
+[SuppressMessage("Design", "CA1001:Types that own disposable fields should be disposable",
+    Justification = "The async semaphore never creates a wait handle. Feed callers can still be releasing it when the owner shuts down.")]
+internal sealed class CloudMetadataEchoAuthority
 {
     private readonly object _gate = new();
     private readonly SemaphoreSlim _publicationGate = new(1, 1);
@@ -28,15 +31,13 @@ internal sealed class CloudMetadataEchoAuthority : IDisposable
         lock (_gate) { return _applying.Contains(id); }
     }
 
-    // Custom stores may allow overlapping transactions. Order local journal
-    // publication with the final protected remote mutation on this owner.
+    // Custom stores may allow overlapping transactions. Order journal publication
+    // with protected mutations and metadata receipt writes on this owner.
     internal async ValueTask<IDisposable> AcquirePublicationAsync(CancellationToken cancellationToken)
     {
         await _publicationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         return new PublicationLease(_publicationGate);
     }
-
-    public void Dispose() => _publicationGate.Dispose();
 
     internal long? GetNextExpirationTimestamp()
     {

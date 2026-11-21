@@ -338,6 +338,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         EnsureStarted();
         long generation = Volatile.Read(ref _lossGeneration);
         Func<RemoteMetadataIntent, bool>? retainAuthorization = _metadataEchoAuthority?.CaptureReconciliationRetention();
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
@@ -834,8 +835,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
         CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
     {
-        using IDisposable? publication = _metadataEchoAuthority is null ? null :
-            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         StagedSecurityObservation? staged = null;
         try
         {
@@ -1182,6 +1182,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private async ValueTask MarkRescanRequiredAsync(CancellationToken cancellationToken)
     {
         long generation = SignalLoss();
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -1246,6 +1247,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask LoadCheckpointAsync(CancellationToken cancellationToken)
     {
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         // Negotiate before recovery or source opening, and again on publication transactions.

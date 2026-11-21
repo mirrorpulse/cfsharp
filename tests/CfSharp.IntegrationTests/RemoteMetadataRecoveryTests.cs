@@ -24,7 +24,12 @@ public sealed partial class CloudContentConfirmationTests
         ]);
         CloudDirectory item = fixture.System.GetDirectory(relative);
         ControlledMetadataSource source = new();
-        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        // The preparation fault pauses inside CommitAsync after durability, before the owner
+        // releases its publication lease. Publish independently to model the durable input
+        // that can be present when the final guard acquires the lease.
+        await using CloudLocalChangeFeed feed = beforeNativeUpdate
+            ? new(fixture.Root, factory!.Store!, new(), source)
+            : fixture.System.CreateLocalChangeFeed(options: null, source);
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         await feed.StartAsync(deadline.Token);
 
@@ -102,6 +107,87 @@ public sealed partial class CloudContentConfirmationTests
             new("metadata-upsert-reconciled", Array.Empty<byte>(), [upsert], new byte[] { 3 }), cancellationToken: deadline.Token)).Entries);
         Assert.Equal(CloudRemoteApplyEntryStatus.Applied, reconciled.Status);
         Assert.Equal(remoteLastWrite, Directory.GetLastWriteTimeUtc(item.FullPath));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RemoteMetadataPublicationPreservesObservationsWithOverlappingTransactions(bool pauseConfirmation)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path,
+            pauseConfirmation ? "overlapping-confirmation" : "overlapping-outcome"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-overlapping-publication");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), new() { SuppressLocalEcho = false }, deadline.Token).AsTask();
+        string path = Path.Combine(fixture.Root, relative);
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            // The custom writer has an unpublished snapshot, but an independent store
+            // transaction can complete and still sees the previous committed version.
+            await using (ICloudStateTransaction concurrent = await factory.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                RemoteMetadataIntent published = RemoteMetadataIntent.Decode(Assert.Single(
+                    await concurrent.Checkpoints.ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+                Assert.Equal(pauseConfirmation, published.Completed);
+                Assert.False(published.OutcomeConfirmed);
+                await concurrent.CommitAsync(deadline.Token);
+            }
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+            await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
+            // Give an unguarded feed time to commit before the stale transaction resumes.
+            using CancellationTokenSource observationWindow = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
+            observationWindow.CancelAfter(TimeSpan.FromSeconds(1));
+            try { await factory.ObservationCommitted.Task.WaitAsync(observationWindow.Token); }
+            catch (OperationCanceledException) when (!deadline.IsCancellationRequested) { }
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply.WaitAsync(deadline.Token)).Entries).Status);
+        CloudOperationJournalEntry? original = null;
+        RemoteMetadataIntent receipt;
+        do
+        {
+            await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                original = (await state.Operations.ListAsync(10, deadline.Token)).SingleOrDefault();
+                receipt = RemoteMetadataIntent.Decode(Assert.Single(
+                    await state.Checkpoints.ListAsync(RemoteMetadataIntent.ItemPrefix(identity.ItemId), deadline.Token)));
+            }
+            if (original is null) { await Task.Delay(20, deadline.Token); }
+        }
+        while (original is null);
+
+        Assert.True(receipt.OutcomeConfirmed);
+        bool requiresReconciliation = original.ItemId is null;
+        Assert.Equal(requiresReconciliation, receipt.RequiresReconciliation);
+        Assert.Equal(requiresReconciliation, (await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        if (!requiresReconciliation) { Assert.Equal(identity.ItemId, original.ItemId); }
+        Assert.Equal(CloudStateOperationKind.MetadataUpdate, original.Kind);
+        Assert.Equal(relative, LocalChangePayload.Decode(original.Payload).RelativePath);
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.DirectoryUpsert, identity.RemoteId, "remote-r2",
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory).Build());
+        CloudRemoteApplyEntryResult blocked = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+            new("protected-upsert", Array.Empty<byte>(), [upsert], new byte[] { 2 }), cancellationToken: deadline.Token)).Entries);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, blocked.Status);
+        Assert.Equal(requiresReconciliation ? CloudRemoteConflictReason.Metadata : CloudRemoteConflictReason.Content, blocked.Conflict!.Reason);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        if (requiresReconciliation) { await feed.AcknowledgeFullRescanAsync(deadline.Token); }
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        CloudLocalChange delivered = Assert.Single(page.Changes);
+        Assert.Equal((original.OperationId, original.Sequence), (delivered.OperationId, delivered.Sequence));
     }
 
     [Trait("Category", "AccessJournal")]
@@ -662,6 +748,8 @@ public sealed partial class CloudContentConfirmationTests
         internal TaskCompletionSource ResumeOutcome { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource TransactionPaused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource ResumeTransaction { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ObservationCommitted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool OverlappingWrites => _boundary is "overlapping-outcome" or "overlapping-confirmation";
         internal void PauseNextTransaction() => Volatile.Write(ref _pauseNextTransaction, 1);
         public async ValueTask<ICloudStateStore> OpenAsync(CloudStateStoreContext context, CancellationToken cancellationToken = default)
         {
@@ -681,14 +769,47 @@ public sealed partial class CloudContentConfirmationTests
             }
             public ValueTask DisposeAsync() => inner.DisposeAsync();
         }
-        private sealed class FaultTransaction(ICloudStateTransaction inner, MetadataFaultFactory owner) : ICloudStateTransaction
+        private sealed class FaultTransaction(ICloudStateTransaction inner, MetadataFaultFactory owner) :
+            ICloudStateTransaction, ICloudCheckpointRepository, ICloudRemoteBatchRepository
         {
+            private readonly List<Func<ICloudStateTransaction, CancellationToken, ValueTask>> _writes = [];
+            private bool _writesReconciliation;
             public ICloudItemStateRepository Items => inner.Items;
-            public ICloudCheckpointRepository Checkpoints => inner.Checkpoints;
+            public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites ? this : inner.Checkpoints;
             public ICloudOperationJournal Operations => inner.Operations;
             public ICloudConflictRepository Conflicts => inner.Conflicts;
-            public ICloudRemoteBatchRepository RemoteBatches => inner.RemoteBatches;
+            public ICloudRemoteBatchRepository RemoteBatches => owner.OverlappingWrites ? this : inner.RemoteBatches;
             public ICloudEchoSuppressionRepository EchoSuppressions => inner.EchoSuppressions;
+
+            ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken) =>
+                inner.Checkpoints.GetAsync(name, cancellationToken);
+            ValueTask<IReadOnlyList<CloudStateCheckpoint>> ICloudCheckpointRepository.ListAsync(string namePrefix, CancellationToken cancellationToken) =>
+                inner.Checkpoints.ListAsync(namePrefix, cancellationToken);
+            ValueTask ICloudCheckpointRepository.UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken)
+            {
+                _writes.Add((transaction, token) => transaction.Checkpoints.UpsertAsync(checkpoint, token));
+                _writesReconciliation |= checkpoint.Name.StartsWith(RemoteMetadataIntent.Prefix, StringComparison.Ordinal) &&
+                    RemoteMetadataIntent.Decode(checkpoint).RequiresReconciliation;
+                return inner.Checkpoints.UpsertAsync(checkpoint, cancellationToken);
+            }
+            ValueTask ICloudCheckpointRepository.RemoveAsync(string name, CancellationToken cancellationToken)
+            {
+                _writes.Add((transaction, token) => transaction.Checkpoints.RemoveAsync(name, token));
+                return inner.Checkpoints.RemoveAsync(name, cancellationToken);
+            }
+            ValueTask<CloudRemoteBatchState?> ICloudRemoteBatchRepository.GetAsync(string batchId, CancellationToken cancellationToken) =>
+                inner.RemoteBatches.GetAsync(batchId, cancellationToken);
+            ValueTask ICloudRemoteBatchRepository.UpsertAsync(CloudRemoteBatchState batch, CancellationToken cancellationToken)
+            {
+                _writes.Add((transaction, token) => transaction.RemoteBatches.UpsertAsync(batch, token));
+                return inner.RemoteBatches.UpsertAsync(batch, cancellationToken);
+            }
+            ValueTask ICloudRemoteBatchRepository.RemoveAsync(string batchId, CancellationToken cancellationToken)
+            {
+                _writes.Add((transaction, token) => transaction.RemoteBatches.RemoveAsync(batchId, token));
+                return inner.RemoteBatches.RemoveAsync(batchId, cancellationToken);
+            }
+
             public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
             {
                 CloudStateCheckpoint? staged = null;
@@ -707,6 +828,8 @@ public sealed partial class CloudContentConfirmationTests
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
+                        "overlapping-outcome" => intents.Any(intent => intent.Completed && !intent.OutcomeConfirmed),
+                        "overlapping-confirmation" => intents.Any(intent => intent.OutcomeConfirmed),
                         "first-outcome-after" => intents.Any(intent => intent.Completed) &&
                             (await RemoteBatches.GetAsync("metadata-fault", cancellationToken))?.AppliedEntryCount == 1,
                         _ => intents.Any(intent => intent.Completed) &&
@@ -714,7 +837,24 @@ public sealed partial class CloudContentConfirmationTests
                     };
                 }
                 if (!cut || Interlocked.Exchange(ref owner._failed, 1) != 0)
-                { await inner.CommitAsync(cancellationToken); return; }
+                {
+                    await inner.CommitAsync(cancellationToken);
+                    if (_writesReconciliation) { owner.ObservationCommitted.TrySetResult(); }
+                    return;
+                }
+                if (owner.OverlappingWrites)
+                {
+                    // Retain the values written from the old snapshot while allowing
+                    // another transaction to commit. Replay only this writer's write set.
+                    await inner.RollbackAsync(cancellationToken);
+                    owner.OutcomePaused.TrySetResult();
+                    await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
+                    await using ICloudStateTransaction writer = await owner.Store!.BeginTransactionAsync(cancellationToken);
+                    foreach (Func<ICloudStateTransaction, CancellationToken, ValueTask> write in _writes)
+                    { await write(writer, cancellationToken); }
+                    await writer.CommitAsync(cancellationToken);
+                    return;
+                }
                 if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or "rescan-awaiting-authorization")
                 {
                     await inner.CommitAsync(cancellationToken);
