@@ -1,0 +1,396 @@
+using System.Threading.Channels;
+
+namespace CfSharp.IntegrationTests;
+
+public sealed partial class CloudContentConfirmationTests
+{
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task ExpiredMetadataCoordinationCannotConsumeTheNextRealAttributeWrite()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-expiry");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        CloudRemoteApplyOptions options = new()
+        {
+            AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated,
+            EchoSuppressionLifetime = TimeSpan.FromSeconds(5),
+        };
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, "Documents", CloudItemKind.Directory), options)).Status);
+        DateTimeOffset releaseAfter = DateTimeOffset.UtcNow + options.EchoSuppressionLifetime + TimeSpan.FromMilliseconds(100);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        while (true)
+        {
+            bool drained;
+            await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
+                drained = checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).Observation >= 2 &&
+                    (await state.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix, deadline.Token)).Count == 0;
+            }
+            if (drained) { break; }
+            await Task.Delay(20, deadline.Token);
+        }
+        Assert.Empty(await AccessRowsAsync(factory!));
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        TimeSpan remaining = releaseAfter - DateTimeOffset.UtcNow;
+        if (remaining > TimeSpan.Zero) { await Task.Delay(remaining, deadline.Token); }
+        string path = Path.Combine(fixture.Root, "Documents");
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count != 0);
+        await feed.DisposeAsync();
+        CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
+        Assert.Null(original.ItemId);
+        Assert.Equal(CloudStateOperationKind.MetadataUpdate, original.Kind);
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync();
+        Assert.True((await reopened.BeginScanAsync()).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync();
+        AssertOriginalAccessRows([original], await AccessRowsAsync(factory!));
+        await AssertAccessPublicRowsAsync(factory!, reopened);
+        await reopened.AcknowledgeAsync([original.OperationId]);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task MetadataReconciliationRetainsAProviderCallbackDeliveredAfterAcknowledgement()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-late-callback");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        DelayedMetadataSource source = new(fixture.Root);
+        await using CloudLocalChangeFeed feed = new(fixture.Root, factory!.Store!, new(), source);
+        await feed.StartAsync();
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, "Documents", CloudItemKind.Directory))).Status);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        LocalChangeSourceEvent first = await source.NextAsync(deadline.Token);
+        LocalChangeSourceEvent second = await source.NextAsync(deadline.Token);
+        await source.DeliverAsync(first);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+        CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await source.DeliverAsync(second);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 2);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        string path = Path.Combine(fixture.Root, "Documents");
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        await source.DeliverAsync(await source.NextAsync(deadline.Token));
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 3);
+        IReadOnlyList<CloudOperationJournalEntry> retained = await AccessRowsAsync(factory!);
+        AssertOriginalAccessRows([original], retained);
+        Assert.All(retained, row => Assert.Null(row.ItemId));
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        await AssertAccessPublicRowsAsync(factory!, feed);
+        AssertOriginalAccessRows(retained, await AccessRowsAsync(factory!));
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await feed.AcknowledgeAsync(retained.Select(row => row.OperationId), deadline.Token);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task NativeMetadataSharingFailureCannotAuthorizeSuppression()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        byte[] bytes = "resident metadata sharing control"u8.ToArray();
+        await File.WriteAllBytesAsync(fixture.File.FullPath, bytes);
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-native-failure");
+        await fixture.File.ConvertToPlaceholderAsync(identity);
+        await fixture.File.SetInSyncAsync(true);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        await using (FileStream reader = new(fixture.File.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            CloudRemoteApplyResult failed = await fixture.System.ApplyRemoteChangesAsync(
+                MetadataBoundaryBatch(identity, fixture.File.RelativePath, CloudItemKind.File),
+                new() { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated });
+            Assert.True(failed.RequiresRetry);
+            Assert.IsType<CloudFilesException>(Assert.Single(failed.Entries).Error);
+        }
+        File.SetAttributes(fixture.File.FullPath, File.GetAttributes(fixture.File.FullPath) | FileAttributes.Hidden);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count != 0);
+        await feed.DisposeAsync();
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        Assert.All(originals, row => Assert.Null(row.ItemId));
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync();
+        Assert.True((await reopened.BeginScanAsync()).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync();
+        AssertOriginalAccessRows(originals, await AccessRowsAsync(factory!));
+        await AssertAccessPublicRowsAsync(factory!, reopened);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(fixture.File.FullPath));
+        Assert.True(File.GetAttributes(fixture.File.FullPath).HasFlag(FileAttributes.Hidden));
+        Assert.Equal(0, fixture.Provider.Fetches);
+    }
+
+    private static CloudRemoteChangeBatch MetadataBoundaryBatch(CloudPlaceholderIdentity identity, string path, CloudItemKind kind) =>
+        new("metadata-boundary", Array.Empty<byte>(), [new("metadata", CloudRemoteChangeKind.MetadataUpdate,
+            identity.RemoteId, "remote-r1", kind, path, identity.ItemId, metadata: (kind == CloudItemKind.Directory
+                ? CloudPlaceholderMetadata.CreateDirectoryBuilder() : CloudPlaceholderMetadata.CreateFileBuilder()).Build())], new byte[] { 1 });
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task DisabledMetadataSuppressionRevokesTheEarlierCoordinatedPolicy()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-explicit-passthrough");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, "Documents", CloudItemKind.Directory), new()
+            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated })).Status);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        while (true)
+        {
+            bool drained;
+            await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+            {
+                CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
+                drained = checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).Observation >= 2 &&
+                    (await state.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix, deadline.Token)).Count == 0;
+            }
+            if (drained) { break; }
+            await Task.Delay(20, deadline.Token);
+        }
+        CloudRemoteChange next = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r2", CloudItemKind.Directory, "Documents", identity.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            new("metadata-passthrough", Array.Empty<byte>(), [next], new byte[] { 2 }),
+            new() { SuppressLocalEcho = false }, deadline.Token)).Status);
+        string path = Path.Combine(fixture.Root, "Documents");
+        // The later explicit policy has revoked the earlier permission for this generation.
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count >= 3);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.DisposeAsync();
+        IReadOnlyList<CloudOperationJournalEntry> originals = await AccessRowsAsync(factory!);
+        Assert.Equal(3, originals.Count);
+        Assert.All(originals, row => Assert.Equal(identity.ItemId, row.ItemId));
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task MetadataReceiptCannotExpandTheCallerDeclaredObjectSet()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity owned = new(Guid.NewGuid(), "metadata-owned-object");
+        CloudPlaceholderIdentity other = new(Guid.NewGuid(), "metadata-other-object");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Owned", owned).WithInSyncState(true).Build(),
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Other", other).WithInSyncState(true).Build(),
+        ]);
+        CloudLocalFileBinding otherBinding = Assert.IsType<CloudLocalFileBinding>((await fixture.System.GetDirectory("Other").InspectAsync()).LocalBinding);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(owned, "Owned", CloudItemKind.Directory), new()
+            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated })).Status);
+        await using (ICloudStateTransaction store = await factory!.Store!.BeginTransactionAsync())
+        {
+            RemoteMetadataIntent original = Assert.Single((await store.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)).Select(RemoteMetadataIntent.Decode));
+            RemoteMetadataIntent expanded = new(Guid.NewGuid(), original.CallId, other.ItemId, "Other", otherBinding,
+                Coordinated: true, Completed: true);
+            await store.Checkpoints.UpsertAsync(new(expanded.Name, expanded.Encode(), DateTimeOffset.UtcNow));
+            await store.CommitAsync();
+        }
+        // Even a structurally valid custom-store receipt cannot enlarge the in-memory
+        // native object set that the completed public call actually authorized.
+        string otherPath = Path.Combine(fixture.Root, "Other");
+        File.SetAttributes(otherPath, File.GetAttributes(otherPath) | FileAttributes.Hidden);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => LocalChangePayload.Decode(row.Payload).RelativePath == "Other"));
+        await feed.DisposeAsync();
+        CloudOperationJournalEntry retained = Assert.Single((await AccessRowsAsync(factory!))
+            .Where(row => LocalChangePayload.Decode(row.Payload).RelativePath == "Other"));
+        Assert.Null(retained.ItemId);
+        Assert.True(File.GetAttributes(otherPath).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CoordinatedMetadataReplacementRetainsTheStagedOriginalWithoutBlockingRename(bool directory)
+    {
+        AttributeCommitFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "staging"));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-replacement");
+        string relative = directory ? "Documents" : "original.bin";
+        string originalPath = Path.Combine(fixture.Root, relative);
+        CloudItem item;
+        if (directory)
+        {
+            await fixture.System.Root.CreatePlaceholdersAsync([
+                CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+            ]);
+            item = fixture.System.GetDirectory(relative);
+        }
+        else
+        {
+            await File.WriteAllTextAsync(originalPath, "original resident content");
+            item = fixture.System.GetFile(relative);
+            await item.ConvertToPlaceholderAsync(identity);
+            await item.SetInSyncAsync(true);
+        }
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>((await item.InspectAsync()).LocalBinding);
+        factory!.RelativePath = relative;
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, item.Kind), new()
+            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated }, deadline.Token)).Status);
+        Guid original = await factory.Paused.Task.WaitAsync(deadline.Token);
+        string retired = Path.Combine(fixture.Root, "retired");
+        try
+        {
+            // Deliberately invalidate the declared namespace guarantee to test the native
+            // generation check. Holding the journal transaction must not block this rename.
+            if (directory)
+            {
+                Directory.Move(originalPath, retired);
+                Directory.CreateDirectory(originalPath);
+            }
+            else
+            {
+                File.Move(originalPath, retired);
+                await File.WriteAllTextAsync(originalPath, "replacement content", deadline.Token);
+            }
+            File.SetAttributes(originalPath, File.GetAttributes(originalPath) | FileAttributes.Hidden);
+        }
+        finally { factory.Resume.TrySetResult(); }
+        while (true)
+        {
+            bool retained;
+            await using (ICloudStateTransaction state = await factory.Inner!.BeginTransactionAsync(deadline.Token))
+            {
+                CloudOperationJournalEntry? operation = await state.Operations.GetAsync(original, deadline.Token);
+                retained = operation is not null && operation.ItemId is null;
+            }
+            if (retained) { break; }
+            await Task.Delay(20, deadline.Token);
+        }
+        await feed.DisposeAsync();
+        CloudItem moved = directory ? fixture.System.GetDirectory("retired") : fixture.System.GetFile("retired");
+        CloudItem replacement = directory ? fixture.System.GetDirectory(relative) : fixture.System.GetFile(relative);
+        Assert.Equal(binding, (await moved.InspectAsync(deadline.Token)).LocalBinding);
+        Assert.NotEqual(binding, (await replacement.InspectAsync(deadline.Token)).LocalBinding);
+        IReadOnlyList<CloudOperationJournalEntry> originals;
+        await using (ICloudStateTransaction state = await factory.Inner!.BeginTransactionAsync(deadline.Token))
+        { originals = await state.Operations.ListAsync(100, cancellationToken: deadline.Token); }
+        Assert.Contains(originals, row => row.OperationId == original && row.ItemId is null);
+        Assert.All(originals.Where(row => row.Kind == CloudStateOperationKind.MetadataUpdate), row => Assert.Null(row.ItemId));
+        await fixture.RestartAsync();
+        await using CloudLocalChangeFeed reopened = fixture.System.CreateLocalChangeFeed();
+        await reopened.StartAsync(deadline.Token);
+        Assert.True((await reopened.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await reopened.AcknowledgeFullRescanAsync(deadline.Token);
+        await using (ICloudStateTransaction state = await factory.Inner!.BeginTransactionAsync(deadline.Token))
+        { AssertOriginalAccessRows(originals, await state.Operations.ListAsync(100, cancellationToken: deadline.Token)); }
+        await reopened.AcknowledgeAsync(originals.Select(row => row.OperationId), deadline.Token);
+        Assert.True(File.GetAttributes(originalPath).HasFlag(FileAttributes.Hidden));
+        Assert.Equal(0, fixture.Provider.Fetches);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task DefaultMetadataPolicyDoesNotInheritAnEarlierCoordinatedWindow()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-policy-transition");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Documents", identity).WithInSyncState(true).Build(),
+        ]);
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
+        await feed.StartAsync();
+        CloudRemoteApplyOptions coordinated = new() { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated };
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        for (int revision = 1; revision <= 3; revision++)
+        {
+            CloudRemoteChange change = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+                "remote-r" + revision, CloudItemKind.Directory, "Documents", identity.ItemId,
+                metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().Build());
+            CloudRemoteChangeBatch batch = new("metadata-transition-" + revision, Array.Empty<byte>(), [change], new byte[] { (byte)revision });
+            Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(batch,
+                revision == 2 ? CloudRemoteApplyOptions.Default : coordinated, deadline.Token)).Status);
+            while (true)
+            {
+                bool drained;
+                await using (ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+                {
+                    CloudStateCheckpoint? checkpoint = await state.Checkpoints.GetAsync(CloudLocalChangeFeed.CheckpointName, deadline.Token);
+                    drained = checkpoint is not null && LocalChangeCheckpoint.Decode(checkpoint.Value).Observation >= revision * 2 &&
+                        (await state.Checkpoints.ListAsync(CloudLocalChangeFeed.SecurityValidationPrefix, deadline.Token)).Count == 0;
+                }
+                if (drained) { break; }
+                await Task.Delay(20, deadline.Token);
+            }
+            IReadOnlyList<CloudOperationJournalEntry> rows = await AccessRowsAsync(factory!);
+            Assert.Equal(revision == 2, (await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            if (revision == 2)
+            {
+                Assert.Equal(2, rows.Count);
+                Assert.All(rows, row => Assert.Null(row.ItemId));
+                await feed.AcknowledgeFullRescanAsync(deadline.Token);
+                AssertOriginalAccessRows(rows, await AccessRowsAsync(factory!));
+                await feed.AcknowledgeAsync(rows.Select(row => row.OperationId), deadline.Token);
+            }
+            else { Assert.Empty(rows); }
+            Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied,
+                Assert.Single((await fixture.System.ApplyRemoteChangesAsync(batch, coordinated, deadline.Token)).Entries).Status);
+        }
+        CloudDirectory directory = fixture.System.GetDirectory("Documents");
+        await WriteSecurityObservationAsync(directory, await directory.InspectAsync(deadline.Token));
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count != 0);
+        CloudOperationJournalEntry security = Assert.Single(await AccessRowsAsync(factory!));
+        Assert.Equal(CloudStateOperationKind.MetadataUpdate, security.Kind);
+        Assert.Equal(identity.ItemId, security.ItemId);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+    }
+
+    private sealed class DelayedMetadataSource(string root) : ILocalChangeSource
+    {
+        private readonly WindowsLocalChangeSource _native = new(root, 4096);
+        private readonly Channel<LocalChangeSourceEvent> _attributes = Channel.CreateUnbounded<LocalChangeSourceEvent>();
+        private Func<LocalChangeSourceEvent, ValueTask>? _handler;
+        public Task StartAsync(Func<LocalChangeSourceEvent, ValueTask> eventHandler, CancellationToken cancellationToken)
+        {
+            _handler = eventHandler;
+            return _native.StartAsync(change =>
+            {
+                if (change.Action != LocalChangeSourceAction.AttributesModified) { return eventHandler(change); }
+                _attributes.Writer.TryWrite(change);
+                return ValueTask.CompletedTask;
+            }, cancellationToken);
+        }
+        internal ValueTask<LocalChangeSourceEvent> NextAsync(CancellationToken cancellationToken) => _attributes.Reader.ReadAsync(cancellationToken);
+        internal ValueTask DeliverAsync(LocalChangeSourceEvent change) => _handler!(change);
+        public async ValueTask DisposeAsync()
+        {
+            await _native.DisposeAsync();
+            while (_attributes.Reader.TryRead(out LocalChangeSourceEvent change)) { await _handler!(change); }
+            _attributes.Writer.TryComplete();
+        }
+    }
+}

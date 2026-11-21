@@ -11,7 +11,11 @@ Security notifications bypass provider echo suppression. The existing path and o
 cannot establish that a provider write caused an independently reported DACL change.
 
 Attribute notifications follow the same identity validation, staging and reconciliation rules as
-security observations and also bypass provider echo suppression. Windows can report an attribute
+security observations and bypass path/kind suppression. Remote `MetadataUpdate` now defaults to
+retaining possible echoes as unbound metadata observations behind a reconciliation fence. Automatic
+attribute suppression requires the explicit caller guarantee described in
+[metadata echo coordination](metadata-echo-coordination.md). Security and data notifications bypass
+that authorization as well. Windows can report an attribute
 change during a rename without changing resident bytes. That observation remains metadata; the
 independent size, last-write and creation-time subscription still reports conservative content
 candidates, including same-length writes before, between or after successive renames. No content

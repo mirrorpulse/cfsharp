@@ -33,14 +33,21 @@ public sealed partial class CloudContentConfirmationTests
                     ? FileAttributes.Directory | FileAttributes.Hidden : FileAttributes.Hidden).Build();
             CloudRemoteChange change = new("remote-metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "v2",
                 item.Kind, item.RelativePath, identity.ItemId, previousRemoteRevision: "v1", metadata: metadata);
-            CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(new("echo", Array.Empty<byte>(), [change], new byte[] { 1 }));
+            CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(new("echo", Array.Empty<byte>(), [change], new byte[] { 1 }),
+                new() { SuppressLocalEcho = false });
             Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
         }
         CloudItemSnapshot before = await item.InspectAsync();
         CloudEchoSuppressionState expected;
         await using (ICloudStateTransaction seed = await factory!.Store!.BeginTransactionAsync())
         {
-            if (!metadataEcho)
+            if (metadataEcho)
+            {
+                // An upgraded custom store can still contain a legacy path/kind ticket.
+                await seed.EchoSuppressions.UpsertAsync(new(Guid.NewGuid(), identity.ItemId, CloudStateOperationKind.MetadataUpdate,
+                    "before", Array.Empty<byte>(), DateTimeOffset.UtcNow.AddMinutes(10), remainingObservations: 2));
+            }
+            else
             {
                 await seed.EchoSuppressions.UpsertAsync(new(Guid.NewGuid(), identity.ItemId, CloudStateOperationKind.Create,
                     "before", RemoteCreationIntent.EchoPayload(identity), DateTimeOffset.UtcNow.AddMinutes(10), remainingObservations: 2));

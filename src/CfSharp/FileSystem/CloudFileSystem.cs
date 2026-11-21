@@ -134,7 +134,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                     scopes, allowLocalChangeDrain: true, cancellationToken: cancellationToken).ConfigureAwait(false),
                 acquireAttributeOperation: async (scopes, cancellationToken) => await AcquireOperationCoreAsync(
                     scopes, allowLocalChangeDrain: true, protectNamespace: false,
-                    cancellationToken: cancellationToken).ConfigureAwait(false));
+                    cancellationToken: cancellationToken).ConfigureAwait(false),
+                metadataEchoAuthority: _metadataEchoAuthority);
         }
     }
 

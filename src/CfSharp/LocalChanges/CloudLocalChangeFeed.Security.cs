@@ -15,7 +15,7 @@ public sealed partial class CloudLocalChangeFeed
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
     private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
-        SecurityFeedProjection projection, CancellationToken cancellationToken)
+        SecurityFeedProjection projection, LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {
         string receipt = SecurityValidationName(entry.OperationId);
         CloudOperationJournalEntry? published = null;
@@ -25,6 +25,13 @@ public sealed partial class CloudLocalChangeFeed
             if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
             {
                 if (projection.AllowsRename) { projection.Validate(); }
+                if (await TrySuppressCoordinatedMetadataAsync(transaction, entry, observation, cancellationToken).ConfigureAwait(false))
+                {
+                    // A crash before this completed decision recovers the staged original ID.
+                    await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return;
+                }
                 published = await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
                 // A snapshot can change during CommitAsync. Keep its receipt atomically with
                 // the journal row: readers and ACK must withhold it until post-commit validation.
@@ -133,7 +140,8 @@ public sealed partial class CloudLocalChangeFeed
         return receipts.Count != 0;
     }
 
-    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection) : IDisposable
+    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection,
+        LocalChangeSourceEvent Observation) : IDisposable
     {
         public void Dispose() => Projection.Dispose();
     }
