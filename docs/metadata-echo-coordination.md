@@ -109,6 +109,10 @@ and reports a metadata conflict before writing. This applies with an empty journ
 unbound observations. Reconciling the object and acknowledging the full rescan allows a later
 protected update. The retained originals still need their individual acknowledgements.
 
+Journal reads check a separate checkpoint range for receipts that can still require reconciliation.
+Reconciled history remains available to attribute delayed observations. Startup rebuilds the
+pending range from the retained receipts, and subsequent receipt changes update both atomically.
+
 Passthrough becomes effective for each successfully applied and confirmed entry, including entries
 applied in a partial call limited by `MaximumEntries`. A rejected write retains no passthrough
 authority after reconciliation. A later failure leaves previously confirmed entries intact. If an

@@ -372,6 +372,17 @@ public sealed partial class SqliteCloudStateStoreTests(ITestOutputHelper output)
             ["cfsharp.directory.\\root", "cfsharp.directory.\\root\\child"],
             checkpoints.Select(checkpoint => checkpoint.Name).ToArray());
         await read.RollbackAsync();
+
+        await using SqliteConnection connection = new($"Data Source={_databasePath};Pooling=False");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN " + SqliteCloudStateTransaction.CheckpointPrefixRangeSql;
+        command.Parameters.AddWithValue("$prefix", RemoteMetadataIntent.PendingPrefix);
+        command.Parameters.AddWithValue("$upper", "cfsharp/remote-metadata-pending/v10");
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Contains("SEARCH checkpoints USING INDEX", reader.GetString(3), StringComparison.Ordinal);
+        Assert.Contains("(name>? AND name<?)", reader.GetString(3), StringComparison.Ordinal);
     }
 
     [Fact]

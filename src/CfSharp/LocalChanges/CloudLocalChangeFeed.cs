@@ -941,7 +941,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 foreach (RemoteMetadataIntent intent in metadataIntents)
                 {
                     RemoteMetadataIntent retained = intent with { RequiresReconciliation = true, Reconciled = false };
-                    await transaction.Checkpoints.UpsertAsync(new(retained.Name, retained.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+                    await retained.PersistAsync(transaction.Checkpoints, observedAt, cancellationToken).ConfigureAwait(false);
                 }
             }
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
@@ -1268,7 +1268,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         }
-        if (recoveredObservations || metadataChanged)
+        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }

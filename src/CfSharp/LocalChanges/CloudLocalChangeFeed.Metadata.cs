@@ -19,8 +19,8 @@ public sealed partial class CloudLocalChangeFeed
         intent.Matches(identity, itemId);
 
     private async ValueTask<bool> RequiresMetadataReconciliationAsync(ICloudStateTransaction transaction,
-        CancellationToken cancellationToken) => (await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
-            .Any(NeedsMetadataReconciliation);
+        CancellationToken cancellationToken) => (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix,
+            cancellationToken).ConfigureAwait(false)).Select(RemoteMetadataIntent.DecodePending).Any(NeedsMetadataReconciliation);
 
     private bool NeedsMetadataReconciliation(RemoteMetadataIntent intent) => !intent.Reconciled &&
         (intent.RequiresReconciliation || (_metadataEchoAuthority?.IsApplying(intent.CallId) != true &&
@@ -56,19 +56,38 @@ public sealed partial class CloudLocalChangeFeed
     {
         bool reconcile = false;
         bool changed = false;
-        foreach (RemoteMetadataIntent intent in await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
+        ICloudCheckpointRepository checkpoints = transaction.Checkpoints;
+        // Rebuild from canonical receipts at startup to cover older stores and detect
+        // corrupt receipts before the feed begins serving pages from the pending index.
+        Dictionary<string, CloudStateCheckpoint> stale = (await checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix,
+            cancellationToken).ConfigureAwait(false)).ToDictionary(checkpoint => checkpoint.Name, StringComparer.Ordinal);
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        foreach (RemoteMetadataIntent original in await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
         {
-            if (intent.IsConfirmedPassthrough) { continue; }
-            if (intent.Reconciled && !intent.RequiresReconciliation)
+            RemoteMetadataIntent intent = original;
+            if (NeedsMetadataReconciliation(intent))
             {
-                continue;
+                reconcile = true;
+                if (!intent.RequiresReconciliation)
+                {
+                    intent = intent with { RequiresReconciliation = true };
+                    await intent.PersistAsync(checkpoints, now, cancellationToken).ConfigureAwait(false);
+                    stale.Remove(intent.PendingName);
+                    changed = true;
+                    continue;
+                }
             }
-            if (_metadataEchoAuthority?.IsApplying(intent.CallId) == true) { continue; }
-            if (_metadataEchoAuthority?.IsAuthorized(intent) == true) { continue; }
-            RemoteMetadataIntent retained = intent with { RequiresReconciliation = true };
-            await transaction.Checkpoints.UpsertAsync(new(retained.Name, retained.Encode(), DateTimeOffset.UtcNow),
-                cancellationToken).ConfigureAwait(false);
-            reconcile = true;
+            if (!intent.MayRequireReconciliation) { continue; }
+            byte[] encoded = intent.Encode();
+            if (!stale.Remove(intent.PendingName, out CloudStateCheckpoint? indexed) || !indexed.Value.Span.SequenceEqual(encoded))
+            {
+                await checkpoints.UpsertAsync(new(intent.PendingName, encoded, now), cancellationToken).ConfigureAwait(false);
+                changed = true;
+            }
+        }
+        foreach (string name in stale.Keys)
+        {
+            await checkpoints.RemoveAsync(name, cancellationToken).ConfigureAwait(false);
             changed = true;
         }
         return (changed, reconcile);
@@ -115,13 +134,12 @@ public sealed partial class CloudLocalChangeFeed
                 RemoteMetadataIntent keep = history.FirstOrDefault(intent => !intent.Superseded) ?? history[0];
                 foreach (RemoteMetadataIntent intent in history)
                 {
-                    if (intent.Id != keep.Id) { await transaction.Checkpoints.RemoveAsync(intent.Name, cancellationToken).ConfigureAwait(false); }
+                    if (intent.Id != keep.Id) { await intent.RemoveAsync(transaction.Checkpoints, cancellationToken).ConfigureAwait(false); }
                 }
                 // A timeout is not origin evidence. Keep one retired marker per native
                 // generation/path so late callbacks cannot regain a false local association.
                 RemoteMetadataIntent reconciled = keep with { Reconciled = true, RequiresReconciliation = false };
-                await transaction.Checkpoints.UpsertAsync(new(reconciled.Name, reconciled.Encode(), DateTimeOffset.UtcNow),
-                    cancellationToken).ConfigureAwait(false);
+                await reconciled.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
             }
         }
     }

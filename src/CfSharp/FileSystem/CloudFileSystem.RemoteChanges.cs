@@ -1214,7 +1214,7 @@ public sealed partial class CloudFileSystem
             bool replacesPriorReceipt = previous.Completed && replaceable && !previous.RequiresReconciliation && previous.Binding == binding;
             if (replacesPriorReceipt && previous.Covers(change.RelativePath))
             {
-                await preparation.Checkpoints.RemoveAsync(previous.Name, cancellationToken).ConfigureAwait(false);
+                await previous.RemoveAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
             }
             else if (!previous.Superseded)
             {
@@ -1226,12 +1226,11 @@ public sealed partial class CloudFileSystem
                     Superseded = true,
                     Reconciled = previous.Reconciled || replacesPriorReceipt,
                 };
-                await preparation.Checkpoints.UpsertAsync(new(superseded.Name, superseded.Encode(), now), cancellationToken)
-                    .ConfigureAwait(false);
+                await superseded.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
             }
         }
         _metadataEchoCall?.TrackPreparation();
-        await preparation.Checkpoints.UpsertAsync(new(intent.Name, intent.Encode(), now), cancellationToken).ConfigureAwait(false);
+        await intent.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
         await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
         return intent;
     }
@@ -1253,8 +1252,7 @@ public sealed partial class CloudFileSystem
                 NativeWriteApplied = outcome.Status == CloudRemoteApplyEntryStatus.Applied,
                 RequiresReconciliation = retained.RequiresReconciliation || intent.RequiresReconciliation,
             };
-            await transaction.Checkpoints.UpsertAsync(new(completed.Name, completed.Encode(), DateTimeOffset.UtcNow),
-                cancellationToken).ConfigureAwait(false);
+            await completed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -1344,8 +1342,7 @@ public sealed partial class CloudFileSystem
                 RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
                 if (intent.CallId != call.Id || !intent.NativeWriteApplied) { continue; }
                 RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
-                await transaction.Checkpoints.UpsertAsync(new(name, confirmed.Encode(), DateTimeOffset.UtcNow), CancellationToken.None)
-                    .ConfigureAwait(false);
+                await confirmed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None).ConfigureAwait(false);
             }
             await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         }

@@ -418,7 +418,7 @@ public sealed partial class CloudContentConfirmationTests
             RemoteMetadataIntent original = Assert.Single((await store.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)).Select(RemoteMetadataIntent.Decode));
             RemoteMetadataIntent expanded = new(Guid.NewGuid(), original.CallId, other.ItemId, "Other", otherBinding,
                 Coordinated: true, Completed: true);
-            await store.Checkpoints.UpsertAsync(new(expanded.Name, expanded.Encode(), DateTimeOffset.UtcNow));
+            await expanded.PersistAsync(store.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None);
             await store.CommitAsync();
         }
         // Even a structurally valid custom-store receipt cannot enlarge the in-memory

@@ -83,4 +83,60 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.True(retained.Reconciled);
         Assert.False(retained.IsConfirmedPassthrough);
     }
+
+    [Fact]
+    public async Task JournalPagesReadPendingMetadataWithoutLoadingReconciledHistory()
+    {
+        await using ICloudStateStore store = await OpenStoreAsync();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        Guid operationId = Guid.NewGuid();
+        RemoteMetadataIntent pending = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), "pending", null,
+            Coordinated: false, Completed: false);
+        const int historyCount = 64;
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            for (int index = 0; index < historyCount; index++)
+            {
+                RemoteMetadataIntent historical = new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), $"history-{index}",
+                    new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: true, Completed: true) { Reconciled = true };
+                await seed.Checkpoints.UpsertAsync(new(historical.Name, historical.Encode(), now));
+            }
+            await seed.Checkpoints.UpsertAsync(new(pending.Name, pending.Encode(), now));
+            await seed.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
+                new LocalChangePayload("journal.txt", null, false, now).Encode(), now));
+            await seed.CommitAsync();
+        }
+
+        RaceStore observed = new(store);
+        await using CloudLocalChangeFeed feed = CreateFeed(observed, new FakeSource());
+        await feed.StartAsync();
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        await using (ICloudStateTransaction state = await store.BeginTransactionAsync())
+        {
+            CloudStateCheckpoint indexed = Assert.Single(await state.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix));
+            Assert.Equal(pending.Id, RemoteMetadataIntent.DecodePending(indexed).Id);
+        }
+        await feed.AcknowledgeFullRescanAsync();
+        await using (ICloudStateTransaction state = await store.BeginTransactionAsync())
+        {
+            Assert.Empty(await state.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix));
+            Assert.Equal(historyCount + 1, (await state.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)).Count);
+        }
+
+        List<string> prefixes = [];
+        observed.CheckpointPrefixRead = prefixes.Add;
+        CloudLocalChangeScan scan = await feed.BeginScanAsync();
+        CloudLocalChangePage first = await feed.ReadPageAsync(scan, 0, 1);
+        Assert.False(first.RequiresFullRescan);
+        Assert.Equal(operationId, Assert.Single(first.Changes).OperationId);
+        Assert.Equal(operationId, Assert.Single((await feed.ReadBatchAsync()).Changes).OperationId);
+        await using (ICloudStateTransaction write = await store.BeginTransactionAsync())
+        {
+            await (pending with { Id = Guid.NewGuid() }).PersistAsync(write.Checkpoints, now, CancellationToken.None);
+            await write.CommitAsync();
+        }
+        Assert.True((await feed.ReadPageAsync(scan, 0, 1)).RequiresFullRescan);
+        Assert.Contains(RemoteMetadataIntent.PendingPrefix, prefixes);
+        Assert.DoesNotContain(RemoteMetadataIntent.Prefix, prefixes);
+    }
 }

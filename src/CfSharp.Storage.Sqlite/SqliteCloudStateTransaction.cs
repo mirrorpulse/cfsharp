@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Microsoft.Data.Sqlite;
 using SQLitePCL;
 
@@ -8,6 +9,13 @@ namespace CfSharp.Storage.Sqlite;
 
 internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
 {
+    internal const string CheckpointPrefixRangeSql = """
+        SELECT name, value, updated_at_ticks
+        FROM checkpoints
+        WHERE name >= $prefix AND name < $upper
+        ORDER BY name COLLATE BINARY;
+        """;
+
     private readonly SqliteConnection _connection;
     private readonly string _databasePath;
     private readonly Action<Exception?>? _completed;
@@ -438,18 +446,24 @@ internal sealed class SqliteCloudStateTransaction : ICloudStateTransaction
             CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(namePrefix);
+            // The BINARY key is ordered by UTF-8 bytes. ASCII protocol prefixes
+            // have a simple exclusive upper bound and can seek directly to their range.
+            string? upper = namePrefix.Length != 0 && Ascii.IsValid(namePrefix) && !namePrefix.Contains('\0')
+                ? string.Concat(namePrefix.AsSpan(0, namePrefix.Length - 1), ((char)(namePrefix[^1] + 1)).ToString())
+                : null;
             return await _owner.ExecuteAsync(
                 async token =>
                 {
                     await using SqliteCommand command = _owner.CreateCommand(
-                        """
+                        upper is null ? """
                         SELECT name, value, updated_at_ticks
                         FROM checkpoints
                         WHERE substr(name, 1, length($prefix)) = $prefix
                         ORDER BY name COLLATE BINARY;
-                        """,
+                        """ : CheckpointPrefixRangeSql,
                         token);
                     command.Parameters.AddWithValue("$prefix", namePrefix);
+                    if (upper is not null) { command.Parameters.AddWithValue("$upper", upper); }
                     await using SqliteDataReader reader = await command
                         .ExecuteReaderAsync(token)
                         .ConfigureAwait(false);
