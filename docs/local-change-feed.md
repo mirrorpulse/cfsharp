@@ -173,7 +173,7 @@ else
 
 The feed normalizes paths relative to the sync root, pairs renames, and persists the ordered
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
-only after the application has accepted the batch.
+for the operations the application has accepted.
 After acknowledging a full rescan, read again. The original journal still includes unbound
 observations and may include notifications caused by remote writes. In the example, the
 application saves the reconciliation result before clearing the rescan requirement.
