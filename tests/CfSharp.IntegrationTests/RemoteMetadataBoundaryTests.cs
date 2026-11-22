@@ -42,7 +42,10 @@ public sealed partial class CloudContentConfirmationTests
             Assert.Equal(creationTicket ? CloudStateOperationKind.Create : CloudStateOperationKind.ContentUpdate, ticket.Kind);
             Assert.Equal(8, ticket.RemainingObservations);
             originalTicket = ticket.SuppressionId;
-            await transaction.EchoSuppressions.UpsertAsync(new(unrelatedTicket, Guid.NewGuid(), CloudStateOperationKind.ContentUpdate,
+            Guid otherItem = Guid.NewGuid();
+            await transaction.Items.UpsertAsync(new(otherItem, "unrelated-ticket-owner", "other.txt", CloudItemKind.File,
+                "remote-r1", null, isTombstone: false, DateTimeOffset.UtcNow), deadline.Token);
+            await transaction.EchoSuppressions.UpsertAsync(new(unrelatedTicket, otherItem, CloudStateOperationKind.ContentUpdate,
                 "other.txt", ticket.Payload.Span, ticket.ExpiresAt), deadline.Token);
             await transaction.CommitAsync(deadline.Token);
         }
