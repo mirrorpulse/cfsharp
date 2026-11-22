@@ -173,6 +173,60 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FreshFeedRetiresHistoricalFileTimestampBeforeARealContentWrite(bool restartOwner)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        string relative = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "timestamp-feed-restart");
+        byte[] initial = "first bytes"u8.ToArray();
+        byte[] edited = "other bytes"u8.ToArray();
+        await File.WriteAllBytesAsync(path, initial);
+        await fixture.File.ConvertToPlaceholderAsync(identity);
+        await fixture.File.SetInSyncAsync(true);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await using (CloudLocalChangeFeed original = fixture.System.CreateLocalChangeFeed(null, new ControlledMetadataSource()))
+        {
+            await original.StartAsync(deadline.Token);
+            CloudRemoteChange timestamp = new("file-time", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "remote-r1",
+                CloudItemKind.File, relative, identity.ItemId, metadata: CloudPlaceholderMetadata.CreateFileBuilder()
+                    .WithLastWriteTime(new(2025, 4, 5, 6, 7, 8, TimeSpan.Zero)).Build());
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(
+                new("timestamp-before-restart", Array.Empty<byte>(), [timestamp], new byte[] { 1 }), cancellationToken: deadline.Token)).Entries).Status);
+        }
+
+        if (restartOwner) { await fixture.RestartAsync(); }
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(deadline.Token);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+
+        LocalChangeSourceEvent observed = await CaptureNativeModificationAsync(fixture.Root, relative, async () =>
+        {
+            await using FileStream stream = new(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+            await stream.WriteAsync(edited, deadline.Token);
+        }, deadline.Token);
+        await source.EmitAsync(observed);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+        CloudOperationJournalEntry originalRow = Assert.Single(await AccessRowsAsync(factory!));
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        Assert.False(page.RequiresFullRescan);
+        CloudLocalChange change = Assert.Single(page.Changes);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, change.Kind);
+        Assert.Equal(identity.ItemId, change.ItemId);
+        Assert.Equal((originalRow.OperationId, originalRow.Sequence), (change.OperationId, change.Sequence));
+        Assert.Equal(initial.Length, new FileInfo(path).Length);
+        Assert.Equal(edited, await File.ReadAllBytesAsync(path, deadline.Token));
+        await feed.AcknowledgeAsync([change.OperationId], deadline.Token);
+        Assert.Empty(await AccessRowsAsync(factory!));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
     [InlineData(CloudItemKind.Directory, false)]
     [InlineData(CloudItemKind.File, false)]
     [InlineData(CloudItemKind.Directory, true)]

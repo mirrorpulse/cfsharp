@@ -27,6 +27,23 @@ public sealed partial class CloudLocalChangeFeed
             (intent.HasUnconfirmedOutcome || intent.UsesReconciliationPolicy ||
                 (intent.Coordinated && _metadataEchoAuthority?.IsAuthorized(intent) != true))));
 
+    private async ValueTask<bool> RetireFileTimeObservationsBeforeStartingAsync(ICloudCheckpointRepository checkpoints,
+        CancellationToken cancellationToken)
+    {
+        if (_metadataEchoAuthority is not { } authority) { return false; }
+        bool retired = false;
+        // The owner admits one feed. A new feed has no queued notifications from a
+        // previous source. An active remote call can still write into the new source.
+        foreach (CloudStateCheckpoint marker in await checkpoints.ListAsync(
+            RemoteMetadataIntent.FileTimeObservationPrefix, cancellationToken).ConfigureAwait(false))
+        {
+            if (marker.Value.Length == 16 && authority.IsApplying(new Guid(marker.Value.Span))) { continue; }
+            await checkpoints.RemoveAsync(marker.Name, cancellationToken).ConfigureAwait(false);
+            retired = true;
+        }
+        return retired;
+    }
+
     internal void NotifyRemoteMetadataCallEnded() => SignalAvailable();
 
     private async ValueTask WaitForAvailabilityAsync(long? metadataExpiration, CancellationToken cancellationToken)

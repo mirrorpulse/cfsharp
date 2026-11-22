@@ -1365,12 +1365,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .ConfigureAwait(false);
         (bool metadataChanged, bool metadataRequiresReconciliation) =
             await RecoverMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        bool retiredFileTimeMarkers = await RetireFileTimeObservationsBeforeStartingAsync(transaction.Checkpoints,
+            cancellationToken).ConfigureAwait(false);
         bool recoveredObservations = await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false);
-        if (recoveredObservations || metadataRequiresReconciliation)
+        if (recoveredObservations || metadataRequiresReconciliation || retiredFileTimeMarkers)
         {
             await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         }
-        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation)
+        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation || retiredFileTimeMarkers)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }

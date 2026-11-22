@@ -25,10 +25,15 @@ When a remote file metadata update can write the creation or last-write time, th
 generic modification notifications also require reconciliation. Windows uses the same
 notification for timestamp changes and content writes. The feed retains each as an unbound
 `ContentUpdate` so reconciliation can detect genuine writes, including same-length edits.
-The path marker is retained for delayed callbacks, including after the path changes ownership.
+The path marker is retained while the current watcher can still deliver delayed callbacks,
+including after the path changes ownership.
 An unresolved observation protects the path and its current official owner from in-place
 remote writes until reconciliation is acknowledged. The journal row remains available for
 acknowledgement at its historical path.
+Before opening a replacement watcher, the feed retires markers whose remote calls have ended.
+The startup transaction also requests one full reconciliation and preserves journal originals.
+The new watcher can deliver genuine file writes through the normal incremental path after that
+reconciliation. Markers from in-flight remote mutations stay active for the replacement watcher.
 
 Reconciliation retains one attribution marker per native generation and historical path. A late
 attribute callback requires reconciliation again instead of becoming a purported new local edit.

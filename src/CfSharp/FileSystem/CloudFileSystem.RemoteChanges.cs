@@ -1289,13 +1289,10 @@ public sealed partial class CloudFileSystem
         if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && change.ItemKind == CloudItemKind.File && !passthrough &&
             (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
         {
-            // Generic file changes have no writer or file generation. Retain the path
-            // even if reconciliation compacts the receipt or the path gets a new occupant.
-            string fileTimeObservation = RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
-            if (await preparation.Checkpoints.GetAsync(fileTimeObservation, cancellationToken).ConfigureAwait(false) is null)
-            {
-                await preparation.Checkpoints.UpsertAsync(new(fileTimeObservation, [1], now), cancellationToken).ConfigureAwait(false);
-            }
+            // Old observers may still carry this path. Record the call so the next
+            // observer also keeps the marker if this mutation is still in flight.
+            await preparation.Checkpoints.UpsertAsync(new(RemoteMetadataIntent.FileTimeObservationName(change.RelativePath),
+                intent.CallId.ToByteArray(), now), cancellationToken).ConfigureAwait(false);
         }
         cancellationToken.ThrowIfCancellationRequested();
         _metadataEchoCall?.TrackPreparation();

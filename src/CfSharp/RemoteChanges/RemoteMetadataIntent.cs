@@ -20,7 +20,8 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal const string PendingPrefix = "cfsharp/remote-metadata-pending/v1/";
     internal const string PendingFileTimePrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
-    internal static string FileTimeObservationName(string path) => "cfsharp/remote-metadata-file-time/v1/" + FileTimePathKey(path);
+    internal const string FileTimeObservationPrefix = "cfsharp/remote-metadata-file-time/v1/";
+    internal static string FileTimeObservationName(string path) => FileTimeObservationPrefix + FileTimePathKey(path);
     internal static string PendingFileTimeName(string path) => PendingFileTimePrefix + "path/" + FileTimePathKey(path);
     internal static string PendingFileTimeItemName(Guid itemId) => PendingFileTimePrefix + "item/" + itemId.ToString("N");
     private static string FileTimePathKey(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path.ToUpperInvariant())));
