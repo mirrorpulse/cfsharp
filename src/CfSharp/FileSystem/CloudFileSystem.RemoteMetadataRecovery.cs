@@ -117,18 +117,18 @@ public sealed partial class CloudFileSystem
     }
 
     private async ValueTask<RemoteEntryOutcome?> RecoverRemoteMetadataAsync(CloudRemoteChange change,
-        RemoteChangeRequest request, CancellationToken cancellationToken)
+        string name, bool resolvingConflict, CancellationToken cancellationToken)
     {
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
-        string name = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
         CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false);
         if (checkpoint is null) { return null; }
 
         RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
         if (projection.ProjectedAtTicks == 0)
         {
-            throw MetadataProjectionUnresolved(change, "native completion is unproven; after acknowledging full reconciliation, call ReconcileRemoteMetadataAsync");
+            string reconciliation = resolvingConflict ? nameof(DismissRemoteConflictAsync) : nameof(ReconcileRemoteMetadataAsync);
+            throw MetadataProjectionUnresolved(change, $"native completion is unproven; after acknowledging full reconciliation, call {reconciliation}");
         }
         CloudStateCheckpoint receipt = await transaction.Checkpoints.GetAsync(projection.ReceiptName, cancellationToken)
             .ConfigureAwait(false) ?? throw MetadataProjectionUnresolved(change, "the attribution preparation is missing");
@@ -147,10 +147,9 @@ public sealed partial class CloudFileSystem
         };
     }
 
-    private async ValueTask RecordRemoteMetadataNativeWriteAsync(RemoteChangeRequest request, RemoteMetadataIntent intent)
+    private async ValueTask RecordRemoteMetadataNativeWriteAsync(string name, RemoteMetadataIntent intent)
     {
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
-        string name = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
         CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name).ConfigureAwait(false)
             ?? throw new InvalidDataException("The remote metadata projection preparation is missing.");
         RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
@@ -162,11 +161,10 @@ public sealed partial class CloudFileSystem
         await transaction.CommitAsync().ConfigureAwait(false);
     }
 
-    private async ValueTask<bool> RecordUnattemptedRemoteMetadataAsync(RemoteChangeRequest request)
+    private async ValueTask<bool> RecordUnattemptedRemoteMetadataAsync(string name)
     {
         using IDisposable publication = await _metadataEchoAuthority.AcquirePublicationAsync(CancellationToken.None).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
-        string name = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
         CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(name).ConfigureAwait(false);
         if (checkpoint is null) { return false; }
         RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
@@ -201,9 +199,8 @@ public sealed partial class CloudFileSystem
     }
 
     private static async ValueTask StageRemoteMetadataProjectionAsync(ICloudStateTransaction transaction,
-        RemoteChangeRequest request, RemoteMetadataIntent intent, DateTimeOffset projectedAt, CancellationToken cancellationToken)
+        string name, RemoteMetadataIntent intent, DateTimeOffset projectedAt, CancellationToken cancellationToken)
     {
-        string name = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
         CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("The remote metadata projection preparation is missing.");
         RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
@@ -211,6 +208,69 @@ public sealed partial class CloudFileSystem
         { throw new InvalidDataException("The remote metadata native completion receipt changed."); }
         await transaction.Checkpoints.UpsertAsync((projection with { ProjectedAtTicks = projectedAt.UtcTicks })
             .ToCheckpoint(name, projectedAt), cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IDisposable> HoldRemoteMetadataOutcomeAsync(ICloudStateTransaction transaction,
+        CloudRemoteChange change, string name, RemoteEntryOutcome outcome, CancellationToken cancellationToken)
+    {
+        CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false)
+            ?? throw MetadataProjectionUnresolved(change, "the original projection evidence is missing");
+        RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
+        RemoteMetadataIntent intent = await ReadPreparedRemoteMetadataIntentAsync(transaction, outcome.MetadataIntent!, cancellationToken)
+            .ConfigureAwait(false);
+        if (projection.ReceiptName != intent.Name ||
+            (outcome.RecoveredMetadataProjection is { } recovered ? recovered != projection : projection.ProjectedAtTicks <= 0))
+        { throw MetadataProjectionUnresolved(change, "the original projection evidence changed"); }
+        string path = ToFullPath(change.RelativePath);
+        CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(SyncRootPath, [path]);
+        SafeFileHandle? target = null;
+        try
+        {
+            target = WindowsFileMetadata.OpenNamespaceGuard(path);
+            await ValidateRemoteMetadataProjectionAsync(transaction, change, projection, intent, target, cancellationToken).ConfigureAwait(false);
+            if (projection.ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted)
+            {
+                // Repair the official row in the outcome transaction using the recorded
+                // native success, with no second write to the placeholder.
+                CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
+                CloudPlaceholderIdentity identity = new(projection.ItemId, change.RemoteId, change.RemoteRevision);
+                await WriteIdentityProjectionAsync(transaction, item, identity, change.RemoteRevision,
+                    localFileId: null, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+            }
+            return new RemoteMetadataOutcomeLease(parents, target);
+        }
+        catch
+        {
+            target?.Dispose();
+            parents.Dispose();
+            throw;
+        }
+    }
+
+    private static async ValueTask DismissRemoteMetadataEvidenceAsync(ICloudCheckpointRepository checkpoints,
+        Guid conflictId, CancellationToken cancellationToken)
+    {
+        string name = RemoteMetadataProjection.ConflictName(conflictId);
+        CloudStateCheckpoint? checkpoint = await checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false);
+        if (checkpoint is null) { return; }
+        RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
+        CloudStateCheckpoint receipt = await checkpoints.GetAsync(projection.ReceiptName, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("The remote metadata attribution preparation is missing.");
+        RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(receipt);
+        // Dismissal ends the original authorization. Keep attribution and any
+        // outstanding rescan so delayed observations still receive safe handling.
+        await (intent with { Completed = true, RequiresReconciliation = !intent.Reconciled })
+            .PersistAsync(checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        await checkpoints.RemoveAsync(name, cancellationToken).ConfigureAwait(false);
+    }
+
+    private sealed class RemoteMetadataOutcomeLease(CloudPathHandleLease parents, SafeFileHandle target) : IDisposable
+    {
+        public void Dispose()
+        {
+            target.Dispose();
+            parents.Dispose();
+        }
     }
 
     private async ValueTask ValidateRemoteMetadataProjectionAsync(ICloudStateTransaction transaction, CloudRemoteChange change,
@@ -279,5 +339,5 @@ public sealed partial class CloudFileSystem
         IOException { HResult: unchecked((int)0x80070020) or unchecked((int)0x80070021) };
 
     private static IOException MetadataProjectionUnresolved(CloudRemoteChange change, string reason) =>
-        new($"Remote metadata change '{change.ChangeId}' requires reconciliation because {reason}. Retain the original batch for retry.");
+        new($"Remote metadata change '{change.ChangeId}' requires reconciliation because {reason}. Retain the original request for retry.");
 }

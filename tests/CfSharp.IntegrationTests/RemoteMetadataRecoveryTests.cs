@@ -10,6 +10,131 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData("conflict-outcome-before")]
+    [InlineData("projection-before")]
+    [InlineData("native-completion-before")]
+    public async Task KeepRemoteMetadataRecoversTheSameConflictWithoutRewritingThePlaceholder(string boundary)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "conflict-metadata", "remote-r0");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        DateTimeOffset remoteWrite = new(2025, 4, 5, 6, 7, 8, TimeSpan.Zero);
+        CloudRemoteChange change = new("conflict-metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "stale",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithLastWriteTime(remoteWrite).Build());
+        CloudRemoteChangeBatch batch = new("metadata-resolution", new byte[] { 0 }, [change], new byte[] { 1 });
+        CloudRemoteApplyResult original = await fixture.System.ApplyRemoteChangesAsync(batch);
+        Assert.Equal(CloudRemoteConflictReason.StaleRemoteRevision, Assert.Single(original.Entries).Conflict!.Reason);
+        Guid conflictId = Assert.Single(original.ConflictIds);
+        CloudRemoteConflictResolution keepRemote = new(CloudRemoteConflictDecision.KeepRemote);
+        string projectionName = RemoteMetadataProjection.ConflictName(conflictId);
+
+        using CancellationTokenSource cancel = new();
+        factory!.Armed = true;
+        if (boundary == "conflict-outcome-before")
+        {
+            factory.CancelConflictOutcome = (conflictId, cancel);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote, cancel.Token).AsTask());
+        }
+        else
+        {
+            await Assert.ThrowsAsync<CloudItemCoordinationException>(() =>
+                fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote).AsTask());
+        }
+        Assert.Equal(remoteWrite.UtcDateTime, Directory.GetLastWriteTimeUtc(path));
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync())
+        {
+            Assert.Equal(conflictId, Assert.Single(await transaction.Conflicts.ListAsync()).ConflictId);
+            RemoteMetadataProjection projection = RemoteMetadataProjection.Decode((await transaction.Checkpoints.GetAsync(projectionName))!);
+            Assert.Equal(identity.ItemId, projection.ItemId);
+            Assert.Null(await transaction.Checkpoints.GetAsync(RemoteMetadataProjection.Name(batch, 0)));
+            if (boundary == "conflict-outcome-before") { Assert.True(projection.ProjectedAtTicks > 0); }
+            else { Assert.Equal(boundary == "projection-before" ? RemoteMetadataProjection.NativeWriteCompleted : 0, projection.ProjectedAtTicks); }
+        }
+
+        DateTime localWrite = new(2025, 6, 7, 8, 9, 10, DateTimeKind.Utc);
+        Directory.SetLastWriteTimeUtc(path, localWrite);
+        await fixture.RestartAsync();
+        if (boundary == "native-completion-before")
+        {
+            IOException failure = await Assert.ThrowsAsync<IOException>(() =>
+                fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote).AsTask());
+            Assert.Contains(nameof(CloudFileSystem.DismissRemoteConflictAsync), failure.Message, StringComparison.Ordinal);
+            await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, new ControlledMetadataSource());
+            await feed.StartAsync();
+            Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+            await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), CancellationToken.None);
+            Assert.Equal(CloudRemoteConflictDismissalStatus.Dismissed, await fixture.System.DismissRemoteConflictAsync(conflictId));
+        }
+        else
+        {
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied,
+                (await fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote)).Status);
+        }
+
+        Assert.Equal(localWrite, Directory.GetLastWriteTimeUtc(path));
+        await using ICloudStateTransaction final = await factory.Store!.BeginTransactionAsync();
+        Assert.Empty(await final.Conflicts.ListAsync());
+        Assert.Null(await final.Checkpoints.GetAsync(projectionName));
+        Assert.Equal(boundary == "native-completion-before" ? "remote-r0" : "remote-r1",
+            (await final.Items.GetByItemIdAsync(identity.ItemId))!.RemoteRevision);
+        Assert.Equal(original.SafeCursor.ToArray(), (await final.RemoteBatches.GetAsync(batch.BatchId))!.Cursor.ToArray());
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task KeepRemoteMetadataRetainsConflictWhenOriginalItemIsReplacedBeforeFinalization()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "native-projection-paused-after"));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        string originalPath = Path.Combine(fixture.Root, "Original");
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "conflict-metadata-replacement", "remote-r0");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        CloudRemoteChange change = new("conflict-metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "stale",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder()
+                .WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build());
+        CloudRemoteChangeBatch batch = new("metadata-resolution", Array.Empty<byte>(), [change], new byte[] { 1 });
+        Guid conflictId = Assert.Single((await fixture.System.ApplyRemoteChangesAsync(batch)).ConflictIds);
+        CloudRemoteConflictResolution keepRemote = new(CloudRemoteConflictDecision.KeepRemote);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        factory!.Armed = true;
+        Task<CloudRemoteApplyEntryResult> first = fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote, deadline.Token).AsTask();
+        string replacementFile = Path.Combine(path, "local.txt");
+        const string replacementData = "replacement remains local";
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+            Directory.Move(path, originalPath);
+            Directory.CreateDirectory(path);
+            await File.WriteAllTextAsync(replacementFile, replacementData, deadline.Token);
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        await Assert.ThrowsAsync<IOException>(() => first);
+        await fixture.RestartAsync();
+        await Assert.ThrowsAsync<IOException>(() => fixture.System.ResolveRemoteConflictAsync(conflictId, keepRemote, deadline.Token).AsTask());
+        Assert.Equal(replacementData, await File.ReadAllTextAsync(replacementFile, deadline.Token));
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        Assert.True(File.GetAttributes(originalPath).HasFlag(FileAttributes.Hidden));
+        await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token);
+        Assert.Equal(conflictId, Assert.Single(await transaction.Conflicts.ListAsync(cancellationToken: deadline.Token)).ConflictId);
+        Assert.NotNull(await transaction.Checkpoints.GetAsync(RemoteMetadataProjection.ConflictName(conflictId), deadline.Token));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task DirectoryPassthroughWithholdsAnObservationReplacedDuringPublication()
     {
@@ -1439,6 +1564,7 @@ public sealed partial class CloudContentConfirmationTests
         private int _itemMetadataReads;
         private int _pauseNextTransaction;
         internal bool Armed { get; set; }
+        internal (Guid ConflictId, CancellationTokenSource Cancellation)? CancelConflictOutcome { get; set; }
         internal ICloudStateStore? Store { get; private set; }
         internal TaskCompletionSource<Guid> Staged { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource OutcomePaused { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1542,6 +1668,8 @@ public sealed partial class CloudContentConfirmationTests
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks > 0),
                         "native-completion-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted),
+                        "conflict-outcome-before" => owner.CancelConflictOutcome is { } configured &&
+                            await Conflicts.GetAsync(configured.ConflictId, cancellationToken) is null,
                         "staging-after" or "staging-paused-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
@@ -1586,6 +1714,11 @@ public sealed partial class CloudContentConfirmationTests
                     await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
                     await inner.CommitAsync(cancellationToken);
                     return;
+                }
+                if (owner._boundary == "conflict-outcome-before" && owner.CancelConflictOutcome is { } conflict)
+                {
+                    conflict.Cancellation.Cancel();
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
                 if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before" or "projection-before" or "native-completion-before"))
                 { await inner.CommitAsync(cancellationToken); }

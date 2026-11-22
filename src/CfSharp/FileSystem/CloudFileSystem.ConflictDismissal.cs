@@ -19,6 +19,8 @@ public sealed partial class CloudFileSystem
     /// batch-cursor advance, or local-operation acknowledgement occurs. KeepLocal retains its
     /// existing unresolved semantics. A later remote change may create a new conflict. NotFound
     /// does not claim that an unknown identifier was successfully resolved by some other action.
+    /// Dismissing an interrupted metadata resolution closes its recovery evidence. Any pending
+    /// local observations and their full reconciliation requirements are preserved.
     /// </remarks>
     public async ValueTask<CloudRemoteConflictDismissalStatus> DismissRemoteConflictAsync(
         Guid conflictId,
@@ -34,6 +36,7 @@ public sealed partial class CloudFileSystem
         try
         {
             using CloudFileSystemOperationLease operation = await AcquireStateOperationAsync(cancellationToken).ConfigureAwait(false);
+            using IDisposable publication = await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
             await using ICloudStateTransaction transaction = await operation.StateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             string receiptName = ConflictDismissalPrefix + "/" + conflictId.ToString("N");
@@ -58,7 +61,11 @@ public sealed partial class CloudFileSystem
 
             // Only dismiss a valid remote envelope. Arbitrary custom/local conflict payloads
             // must not be silently removed by a remote-only API.
-            _ = await DecodeRemoteConflictAsync(conflict, transaction, cancellationToken).ConfigureAwait(false);
+            CloudRemoteConflict remote = await DecodeRemoteConflictAsync(conflict, transaction, cancellationToken).ConfigureAwait(false);
+            if (remote.Change.Kind == CloudRemoteChangeKind.MetadataUpdate)
+            {
+                await DismissRemoteMetadataEvidenceAsync(transaction.Checkpoints, conflictId, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.Checkpoints.UpsertAsync(
                 new CloudStateCheckpoint(receiptName, new byte[] { 1 }, DateTimeOffset.UtcNow), cancellationToken)
                 .ConfigureAwait(false);

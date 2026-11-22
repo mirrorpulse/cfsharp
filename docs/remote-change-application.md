@@ -82,6 +82,13 @@ The method preserves the native object, the official item revision and local jou
 conflict can be dismissed after application reconciliation. KeepRemote leaves it unresolved.
 If the call loses its return after committing, repeat with the same batch and ordinal to
 read the accepted prefix without creating another conflict.
+
+Explicit `KeepRemote` for a persisted `MetadataUpdate` conflict records native completion
+under that conflict ID. If finalization fails, retry `ResolveRemoteConflictAsync` with the same ID
+and decision. Verified recovery applies any missing official projection and closes the conflict
+without changing the native object's metadata again. If recovery cannot verify the outcome,
+reconcile the actual state and dismiss the conflict with `DismissRemoteConflictAsync`.
+Dismissal keeps the local journal and any outstanding full rescan requirement.
 `r`n### Keeping local content and closing a conflict
 
 `KeepLocal` and `Defer` continue to leave the conflict unresolved. To explicitly close an individual persistent conflict without changing local content, call `DismissRemoteConflictAsync(conflictId)`. `Dismissed` means the unresolved record and a durable receipt were atomically updated. A retry, including after restart, returns `AlreadyDismissed`. `NotFound` means no active record or dismissal receipt exists; it is not proof of successful resolution by another action.

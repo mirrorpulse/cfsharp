@@ -4,8 +4,8 @@ using System.Security.Cryptography;
 
 namespace CfSharp;
 
-// The checkpoint name binds the immutable batch and entry. Its payload links the
-// attribution preparation to the exact official projection committed after native success.
+// The checkpoint name binds the immutable batch entry or the durable conflict. Its payload
+// links the attribution preparation to the official projection committed after native success.
 internal readonly record struct RemoteMetadataProjection(Guid ItemId, Guid ReceiptId, long ProjectedAtTicks,
     string? OriginalRowFingerprint = null)
 {
@@ -15,6 +15,8 @@ internal readonly record struct RemoteMetadataProjection(Guid ItemId, Guid Recei
 
     internal static string Name(CloudRemoteChangeBatch batch, int index) =>
         Prefix + Convert.ToHexString(batch.Fingerprint.Span) + "/" + index.ToString(CultureInfo.InvariantCulture);
+
+    internal static string ConflictName(Guid conflictId) => Prefix + "conflict/" + conflictId.ToString("N");
 
     internal string ReceiptName => RemoteMetadataIntent.ItemPrefix(ItemId) + ReceiptId.ToString("N");
 
