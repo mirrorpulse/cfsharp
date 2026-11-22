@@ -109,10 +109,10 @@ internal sealed class CloudMetadataEchoAuthority
     internal sealed class Call(CloudMetadataEchoAuthority owner, Guid id) : IDisposable
     {
         private readonly HashSet<(Guid ItemId, CloudLocalFileBinding Binding)> _objects = [];
-        private readonly List<string> _committedOutcomes = [];
+        private readonly List<RemoteMetadataIntent> _committedOutcomes = [];
         internal Guid Id => id;
         internal bool HasMetadataPreparation { get; private set; }
-        internal IReadOnlyList<string> CommittedOutcomes => _committedOutcomes;
+        internal IReadOnlyList<RemoteMetadataIntent> CommittedOutcomes => _committedOutcomes;
 
         internal void TrackPreparation()
         {
@@ -122,7 +122,7 @@ internal sealed class CloudMetadataEchoAuthority
 
         internal void RecordCommittedOutcome(RemoteMetadataIntent? intent)
         {
-            if (intent is not null) { _committedOutcomes.Add(intent.Name); }
+            if (intent is not null) { _committedOutcomes.Add(intent); }
         }
 
         internal void Record(Guid itemId, CloudLocalFileBinding binding) => _objects.Add((itemId, binding));

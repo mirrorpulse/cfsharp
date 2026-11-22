@@ -1276,6 +1276,15 @@ public sealed partial class CloudFileSystem
             await RemoteMetadataProjection.ReadRetainedReceiptNamesAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
         if (passthrough && change.ItemKind == CloudItemKind.File)
         {
+            if (change.Kind == CloudRemoteChangeKind.MetadataUpdate &&
+                (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
+            {
+                // Only confirmation of this write can retire its marker. A later
+                // confirmed write cannot account for an earlier queued notification.
+                await preparation.Checkpoints.UpsertAsync(new(intent.ProvisionalFileTimeObservationName, callId.ToByteArray(), now),
+                    cancellationToken).ConfigureAwait(false);
+            }
+
             // These provider-issued upsert tickets can match file Modified events
             // without a native identity check. Revoke them in the same transaction
             // that switches policy, before the native write can queue a notification.
@@ -1438,14 +1447,25 @@ public sealed partial class CloudFileSystem
         try
         {
             await using ICloudStateTransaction transaction = await store.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
-            foreach (string name in call.CommittedOutcomes)
+            foreach (RemoteMetadataIntent outcome in call.CommittedOutcomes)
             {
-                CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(name, CancellationToken.None).ConfigureAwait(false);
-                if (checkpoint is null) { continue; }
-                RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
-                if (intent.CallId != call.Id || !intent.NativeWriteApplied) { continue; }
-                RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
-                await confirmed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None).ConfigureAwait(false);
+                if (outcome.CallId != call.Id) { continue; }
+                CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(outcome.Name, CancellationToken.None).ConfigureAwait(false);
+                if (checkpoint is not null)
+                {
+                    RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
+                    if (intent.CallId != call.Id || !intent.NativeWriteApplied) { continue; }
+                    RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
+                    await confirmed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None).ConfigureAwait(false);
+                }
+                // Another entry in this call can replace the canonical receipt.
+                // The committed outcome still confirms its own marker and records
+                // any native binding uncertainty separately from feed observations.
+                if (outcome.Passthrough && !outcome.RequiresReconciliation)
+                {
+                    await transaction.Checkpoints.RemoveAsync(outcome.ProvisionalFileTimeObservationName,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
             }
             await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         }

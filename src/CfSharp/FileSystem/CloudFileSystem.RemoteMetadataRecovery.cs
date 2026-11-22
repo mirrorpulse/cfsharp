@@ -177,6 +177,10 @@ public sealed partial class CloudFileSystem
         DateTimeOffset now = DateTimeOffset.UtcNow;
         RemoteMetadataIntent unattempted = intent with { Completed = true, RequiresReconciliation = true };
         await unattempted.PersistAsync(transaction.Checkpoints, now, CancellationToken.None).ConfigureAwait(false);
+        if (intent.Passthrough)
+        {
+            await transaction.Checkpoints.RemoveAsync(intent.ProvisionalFileTimeObservationName).ConfigureAwait(false);
+        }
         await transaction.Checkpoints.UpsertAsync((projection with { ProjectedAtTicks = RemoteMetadataProjection.NativeWriteNotAttempted })
             .ToCheckpoint(name, now)).ConfigureAwait(false);
         await transaction.CommitAsync().ConfigureAwait(false);

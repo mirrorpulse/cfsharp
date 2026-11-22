@@ -105,6 +105,10 @@ retains uncertainty. Earlier unresolved observations still require reconciliatio
 Switching an existing file to passthrough revokes that item's automatic content tickets from
 earlier remote upserts before native mutation. Its creation ticket may still handle the
 creation notification. Generic content notifications use the new passthrough policy.
+An explicit file timestamp `MetadataUpdate` retains ambiguous generic notifications as
+unbound observations until its outcome is confirmed. If confirmation is lost, a rescan or a later
+confirmed write cannot attribute queued notifications to the original item. The feed keeps
+this history for the lifetime of the watcher that could still deliver them.
 
 ## Failure, restart and reconciliation
 

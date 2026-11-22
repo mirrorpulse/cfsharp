@@ -906,8 +906,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         { return false; }
         await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
         {
-            if (await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
-                    cancellationToken).ConfigureAwait(false) is null &&
+            if ((await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
+                    cancellationToken).ConfigureAwait(false)).Count == 0 &&
                 await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
                     cancellationToken).ConfigureAwait(false) is null)
             { return false; }
@@ -976,8 +976,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             // The generic action describes a historical path. Read its watcher-lifetime
             // history before using the current native kind to classify the notification.
-            bool historicalFile = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
-                cancellationToken).ConfigureAwait(false) is not null;
+            bool historicalFile = (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
+                cancellationToken).ConfigureAwait(false)).Count != 0;
             bool historicalDirectory = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
                 cancellationToken).ConfigureAwait(false) is not null;
             if (!historicalFile && uncertainDirectory is null && Directory.Exists(path.FullPath))

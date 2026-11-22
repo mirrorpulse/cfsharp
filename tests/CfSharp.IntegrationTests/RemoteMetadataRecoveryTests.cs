@@ -1537,9 +1537,8 @@ public sealed partial class CloudContentConfirmationTests
                     cut = owner._boundary switch
                     {
                         "preparation-after" or "preparation-paused-after" => intents.Any(intent => !intent.Completed),
-                        "native-projection-paused-after" => intents.Any(intent => !intent.Completed) &&
-                            (await Items.GetByRelativePathAsync("Documents", cancellationToken))?.RemoteRevision == "remote-r1",
-                        "projection-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
+                        "native-projection-paused-after" or "projection-before" =>
+                            (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks > 0),
                         "native-completion-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted),

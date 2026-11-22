@@ -24,7 +24,10 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal const string PendingObservationPrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
     internal const string FileTimeObservationPrefix = "cfsharp/remote-metadata-file-time/v1/";
     internal const string DirectoryTimeObservationPrefix = FileTimeObservationPrefix + "directory/";
+    // The fixed-length path key addresses both the historical marker and each
+    // provisional passthrough marker for that path, regardless of the current item.
     internal static string FileTimeObservationName(string path) => FileTimeObservationPrefix + FileTimePathKey(path);
+    internal string ProvisionalFileTimeObservationName => FileTimeObservationName(RelativePath) + "/" + Id.ToString("N");
     internal static string DirectoryTimeObservationName(string path) => DirectoryTimeObservationPrefix + FileTimePathKey(path);
     internal static string PendingObservationPathName(string path) => PendingObservationPrefix + "path/" + FileTimePathKey(path);
     internal static string PendingObservationItemName(Guid itemId) => PendingObservationPrefix + "item/" + itemId.ToString("N");

@@ -9,7 +9,144 @@ public sealed partial class CloudContentConfirmationTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task FileMetadataPassthroughPreventsEarlierAutomaticTicketsFromConsumingContent(bool creationTicket)
+    public async Task UnconfirmedFileTimestampPassthroughRetainsItsDelayedNotification(bool laterConfirmedWrite)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "outcome-after"));
+        string relative = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "unconfirmed-file-timestamp", "remote-r0");
+        const string contents = "original file bytes";
+        await File.WriteAllTextAsync(path, contents);
+        await fixture.File.ConvertToPlaceholderAsync(identity);
+        await fixture.File.SetInSyncAsync(true);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+
+        DateTimeOffset timestamp = new(2025, 4, 6, 7, 8, 9, TimeSpan.Zero);
+        CloudRemoteChange change = new("timestamp", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "remote-r1",
+            CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r0",
+            metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp).Build());
+        CloudRemoteChangeBatch batch = new("metadata-fault", Array.Empty<byte>(), [change], new byte[] { 1 });
+        CloudRemoteApplyOptions options = new() { SuppressLocalEcho = false };
+        factory!.Armed = true;
+        LocalChangeSourceEvent delayed = await CaptureNativeModificationAsync(fixture.Root, relative, async () =>
+        {
+            await Assert.ThrowsAsync<IOException>(() => fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token).AsTask());
+        }, deadline.Token);
+        Assert.Equal(timestamp.UtcDateTime, File.GetLastWriteTimeUtc(path));
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, Assert.Single(
+            (await fixture.System.ApplyRemoteChangesAsync(batch, options, deadline.Token)).Entries).Status);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        if (laterConfirmedWrite)
+        {
+            CloudRemoteChange next = new("later-timestamp", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "remote-r2",
+                CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+                metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp.AddDays(1)).Build());
+            CloudRemoteApplyResult confirmed = await fixture.System.ApplyRemoteChangesAsync(
+                new("later-confirmed-file-timestamp", new byte[] { 1 }, [next], new byte[] { 2 }), options, deadline.Token);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(confirmed.Entries).Status);
+        }
+
+        await source.EmitAsync(delayed);
+        CloudOperationJournalEntry original = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, deadline.Token);
+        Assert.Null(original.ItemId);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChange retained = Assert.Single((await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token)).Changes);
+        Assert.Null(retained.ItemId);
+        Assert.Equal(relative, retained.RelativePath);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, retained.Kind);
+        Assert.Equal((original.OperationId, original.Sequence), (retained.OperationId, retained.Sequence));
+        Assert.Equal(contents, await File.ReadAllTextAsync(path, deadline.Token));
+        await feed.AcknowledgeAsync([retained.OperationId], deadline.Token);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task ConfirmedFileTimestampPassthroughDoesNotUnbindLaterContent()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "native-projection-paused-after"));
+        string relative = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "confirmed-file-timestamp", "remote-r0");
+        await File.WriteAllTextAsync(path, "abc");
+        await fixture.File.ConvertToPlaceholderAsync(identity);
+        await fixture.File.SetInSyncAsync(true);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+
+        DateTimeOffset timestamp = new(2025, 4, 6, 7, 8, 9, TimeSpan.Zero);
+        CloudRemoteChange change = new("timestamp", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "remote-r1",
+            CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r0",
+            metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp).Build());
+        CloudRemoteChangeBatch batch = new("confirmed-file-timestamp", Array.Empty<byte>(), [change], new byte[] { 1 });
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult>? apply = null;
+        try
+        {
+            LocalChangeSourceEvent early = await CaptureNativeModificationAsync(fixture.Root, relative, () =>
+            {
+                apply = fixture.System.ApplyRemoteChangesAsync(batch, new() { SuppressLocalEcho = false }, deadline.Token).AsTask();
+                return factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            }, deadline.Token);
+            Assert.Equal(timestamp.UtcDateTime, File.GetLastWriteTimeUtc(path));
+            await source.EmitAsync(early);
+            Assert.Null((await WaitForSingleMetadataJournalEntryAsync(factory.Store!, deadline.Token)).ItemId);
+        }
+        finally
+        {
+            factory.ResumeOutcome.TrySetResult();
+            if (apply is not null)
+            {
+                Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single((await apply).Entries).Status);
+            }
+        }
+
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChange original = Assert.Single((await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token)).Changes);
+        Assert.Null(original.ItemId);
+        await feed.AcknowledgeAsync([original.OperationId], deadline.Token);
+        await source.EmitAsync(await CaptureNativeModificationAsync(fixture.Root, relative,
+            () => File.WriteAllTextAsync(path, "xyz", deadline.Token), deadline.Token));
+        CloudOperationJournalEntry content = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, deadline.Token);
+        Assert.Equal(identity.ItemId, content.ItemId);
+        Assert.NotEqual(original.OperationId, content.OperationId);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        Assert.False(page.RequiresFullRescan);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, Assert.Single(page.Changes).Kind);
+        Assert.Equal("xyz", await File.ReadAllTextAsync(path, deadline.Token));
+    }
+
+    private static async Task<CloudOperationJournalEntry> WaitForSingleMetadataJournalEntryAsync(
+        ICloudStateStore store, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await using (ICloudStateTransaction transaction = await store.BeginTransactionAsync(cancellationToken))
+            {
+                IReadOnlyList<CloudOperationJournalEntry> rows = await transaction.Operations.ListAsync(10, cancellationToken);
+                if (rows.Count != 0) { return Assert.Single(rows); }
+            }
+            await Task.Delay(20, cancellationToken);
+        }
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task FileMetadataPassthroughPreventsEarlierAutomaticTicketsFromConsumingContent(bool creationTicket, bool additionalTimestamp)
     {
         AccessJournalFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
@@ -55,14 +192,22 @@ public sealed partial class CloudContentConfirmationTests
             creationTicket ? "remote-r1" : "remote-r2",
             CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
             metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp).Build());
+        CloudRemoteChange[] updates = [metadata];
+        if (additionalTimestamp)
+        {
+            updates = [metadata, new("second-timestamp", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId, "remote-r3",
+                CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r2",
+                metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp.AddDays(1)).Build())];
+        }
         LocalChangeSourceEvent remote = await CaptureNativeModificationAsync(fixture.Root, relative, async () =>
         {
             CloudRemoteApplyResult passthrough = await fixture.System.ApplyRemoteChangesAsync(
-                new("timestamp-ticket-passthrough", Array.Empty<byte>(), [metadata], new byte[] { 2 }),
+                new("timestamp-ticket-passthrough", Array.Empty<byte>(), updates, new byte[] { 2 }),
                 new() { SuppressLocalEcho = false }, deadline.Token);
-            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(passthrough.Entries).Status);
+            Assert.Equal(updates.Length, passthrough.Entries.Count);
+            Assert.All(passthrough.Entries, entry => Assert.Equal(CloudRemoteApplyEntryStatus.Applied, entry.Status));
         }, deadline.Token);
-        Assert.Equal(timestamp.UtcDateTime, File.GetLastWriteTimeUtc(path));
+        Assert.Equal((additionalTimestamp ? timestamp.AddDays(1) : timestamp).UtcDateTime, File.GetLastWriteTimeUtc(path));
         await source.EmitAsync(remote);
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
         const string genuine = "real local contents";
