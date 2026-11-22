@@ -11,6 +11,62 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Fact]
+    public async Task DirectoryPassthroughWithholdsAnObservationReplacedDuringPublication()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "staging-paused-after"));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "directory-passthrough-validation");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory), new() { SuppressLocalEcho = false }, deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+
+        factory!.Armed = true;
+        await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
+        Guid stagedId;
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Assert.Empty((await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token)).Changes);
+            await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token);
+            CloudStateCheckpoint staged = Assert.Single(await transaction.Checkpoints.ListAsync(
+                CloudLocalChangeFeed.SecurityValidationPrefix, deadline.Token));
+            stagedId = Guid.ParseExact(staged.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N");
+            Directory.Move(path, Path.Combine(fixture.Root, "Retired"));
+            Directory.CreateDirectory(path);
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        while (true)
+        {
+            await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token);
+            if (await transaction.Operations.GetAsync(stagedId, deadline.Token) is { ItemId: null })
+            {
+                Assert.NotNull(await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationPathName(relative), deadline.Token));
+                break;
+            }
+            await transaction.RollbackAsync(deadline.Token);
+            await Task.Delay(20, deadline.Token);
+        }
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChange retained = Assert.Single((await feed.ReadPageAsync(
+            await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token)).Changes);
+        Assert.Equal(stagedId, retained.OperationId);
+        Assert.Equal(CloudLocalChangeKind.MetadataUpdate, retained.Kind);
+        Assert.Null(retained.ItemId);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
     public async Task UnprovenMetadataCompletionCanBeClosedWithoutRewritingAndResumeTheOriginalBatch()
     {
         MetadataFaultFactory? factory = null;
@@ -1487,7 +1543,7 @@ public sealed partial class CloudContentConfirmationTests
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks > 0),
                         "native-completion-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted),
-                        "staging-after" => staged is not null,
+                        "staging-after" or "staging-paused-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
                         "overlapping-outcome" => intents.Any(intent => intent.Completed && !intent.OutcomeConfirmed),
@@ -1517,7 +1573,8 @@ public sealed partial class CloudContentConfirmationTests
                     await writer.CommitAsync(cancellationToken);
                     return;
                 }
-                if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or "rescan-awaiting-authorization")
+                if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or
+                    "rescan-awaiting-authorization" or "staging-paused-after")
                 {
                     await inner.CommitAsync(cancellationToken);
                     owner.OutcomePaused.TrySetResult();

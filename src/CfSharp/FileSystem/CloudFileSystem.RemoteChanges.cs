@@ -1286,13 +1286,16 @@ public sealed partial class CloudFileSystem
                 OriginalRowFingerprint: RemoteMetadataProjection.Fingerprint(original));
             await preparation.Checkpoints.UpsertAsync(projection.ToCheckpoint(projectionName, now), cancellationToken).ConfigureAwait(false);
         }
-        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && change.ItemKind == CloudItemKind.File && !passthrough &&
+        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && (change.ItemKind == CloudItemKind.Directory || !passthrough) &&
             (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
         {
             // Old observers may still carry this path. Record the call so the next
             // observer also keeps the marker if this mutation is still in flight.
-            await preparation.Checkpoints.UpsertAsync(new(RemoteMetadataIntent.FileTimeObservationName(change.RelativePath),
-                intent.CallId.ToByteArray(), now), cancellationToken).ConfigureAwait(false);
+            string timeObservation = change.ItemKind == CloudItemKind.Directory
+                ? RemoteMetadataIntent.DirectoryTimeObservationName(change.RelativePath)
+                : RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
+            await preparation.Checkpoints.UpsertAsync(new(timeObservation, intent.CallId.ToByteArray(), now),
+                cancellationToken).ConfigureAwait(false);
         }
         cancellationToken.ThrowIfCancellationRequested();
         _metadataEchoCall?.TrackPreparation();
@@ -1341,8 +1344,8 @@ public sealed partial class CloudFileSystem
         ICloudStateTransaction transaction, Guid itemId, string path, CloudLocalFileBinding? binding,
         RemoteMetadataIntent? preparation, CancellationToken cancellationToken)
     {
-        if (await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingFileTimeName(path), cancellationToken).ConfigureAwait(false) is not null ||
-            await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingFileTimeItemName(itemId), cancellationToken).ConfigureAwait(false) is not null)
+        if (await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationPathName(path), cancellationToken).ConfigureAwait(false) is not null ||
+            await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationItemName(itemId), cancellationToken).ConfigureAwait(false) is not null)
         { return (true, []); }
         if (preparation is not null)
         {

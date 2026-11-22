@@ -19,21 +19,27 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal bool MayRequireReconciliation => !Reconciled && (RequiresReconciliation || HasUnconfirmedOutcome || UsesReconciliationPolicy || Coordinated);
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal const string PendingPrefix = "cfsharp/remote-metadata-pending/v1/";
-    internal const string PendingFileTimePrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
+    internal const string PathIndexPrefix = "cfsharp/remote-metadata-path/v1/";
+    // The original file-time range now also protects ambiguous directory observations.
+    internal const string PendingObservationPrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
     internal const string FileTimeObservationPrefix = "cfsharp/remote-metadata-file-time/v1/";
     internal static string FileTimeObservationName(string path) => FileTimeObservationPrefix + FileTimePathKey(path);
-    internal static string PendingFileTimeName(string path) => PendingFileTimePrefix + "path/" + FileTimePathKey(path);
-    internal static string PendingFileTimeItemName(Guid itemId) => PendingFileTimePrefix + "item/" + itemId.ToString("N");
+    internal static string DirectoryTimeObservationName(string path) => FileTimeObservationPrefix + "directory/" + FileTimePathKey(path);
+    internal static string PendingObservationPathName(string path) => PendingObservationPrefix + "path/" + FileTimePathKey(path);
+    internal static string PendingObservationItemName(Guid itemId) => PendingObservationPrefix + "item/" + itemId.ToString("N");
     private static string FileTimePathKey(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path.ToUpperInvariant())));
+    internal static string PathPrefix(string path) => PathIndexPrefix + FileTimePathKey(path) + "/";
     internal static string ItemPrefix(Guid itemId) => Prefix + itemId.ToString("N") + "/";
     internal string Name => ItemPrefix(ItemId) + Id.ToString("N");
     internal string PendingName => PendingPrefix + Name[Prefix.Length..];
+    internal string PathIndexName => PathPrefix(RelativePath) + Name[Prefix.Length..];
     internal bool Covers(string path) => string.Equals(RelativePath, path, StringComparison.OrdinalIgnoreCase);
 
     internal async ValueTask PersistAsync(ICloudCheckpointRepository checkpoints, DateTimeOffset now, CancellationToken cancellationToken)
     {
         byte[] encoded = Encode();
         await checkpoints.UpsertAsync(new(Name, encoded, now), cancellationToken).ConfigureAwait(false);
+        await checkpoints.UpsertAsync(new(PathIndexName, encoded, now), cancellationToken).ConfigureAwait(false);
         if (MayRequireReconciliation)
         {
             await checkpoints.UpsertAsync(new(PendingName, encoded, now), cancellationToken).ConfigureAwait(false);
@@ -47,6 +53,7 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal async ValueTask RemoveAsync(ICloudCheckpointRepository checkpoints, CancellationToken cancellationToken)
     {
         await checkpoints.RemoveAsync(Name, cancellationToken).ConfigureAwait(false);
+        await checkpoints.RemoveAsync(PathIndexName, cancellationToken).ConfigureAwait(false);
         await checkpoints.RemoveAsync(PendingName, cancellationToken).ConfigureAwait(false);
     }
 
@@ -89,7 +96,10 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
 
     internal static RemoteMetadataIntent DecodePending(CloudStateCheckpoint checkpoint) => Decode(checkpoint, pending: true);
 
-    private static RemoteMetadataIntent Decode(CloudStateCheckpoint checkpoint, bool pending)
+    internal static RemoteMetadataIntent DecodePathIndex(CloudStateCheckpoint checkpoint) =>
+        Decode(checkpoint, pending: false, pathIndex: true);
+
+    private static RemoteMetadataIntent Decode(CloudStateCheckpoint checkpoint, bool pending, bool pathIndex = false)
     {
         if (checkpoint.Value.Length > 256 * 1024) { throw new InvalidDataException("Remote metadata evidence exceeds its size limit."); }
         try
@@ -121,7 +131,8 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
                 OutcomeConfirmed = outcomeConfirmed,
                 NativeWriteApplied = nativeWriteApplied,
             };
-            if (id == Guid.Empty || call == Guid.Empty || item == Guid.Empty || checkpoint.Name != (pending ? intent.PendingName : intent.Name) ||
+            string name = pathIndex ? intent.PathIndexName : pending ? intent.PendingName : intent.Name;
+            if (id == Guid.Empty || call == Guid.Empty || item == Guid.Empty || checkpoint.Name != name ||
                 stream.Position != stream.Length || ((outcomeConfirmed || nativeWriteApplied) && !completed))
             { throw new InvalidDataException("Invalid remote metadata evidence."); }
             if (CloudStateModelValidation.CanonicalizeRelativePath(path, nameof(path)) != path)

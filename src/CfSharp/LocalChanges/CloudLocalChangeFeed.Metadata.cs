@@ -1,4 +1,9 @@
+using System.ComponentModel;
 using System.Diagnostics;
+
+using CfSharp.Native;
+
+using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp;
 
@@ -13,10 +18,61 @@ public sealed partial class CloudLocalChangeFeed
             itemId is Guid id ? RemoteMetadataIntent.ItemPrefix(id) : RemoteMetadataIntent.Prefix,
             cancellationToken).ConfigureAwait(false)).Select(RemoteMetadataIntent.Decode).ToArray();
 
+    private static async ValueTask<RemoteMetadataIntent[]> ReadMetadataObservationIntentsAsync(ICloudStateTransaction transaction,
+        string path, Guid? itemId, CancellationToken cancellationToken)
+    {
+        RemoteMetadataIntent[] owned = itemId is Guid id
+            ? await ReadMetadataIntentsAsync(transaction, cancellationToken, id).ConfigureAwait(false) : [];
+        IReadOnlyList<CloudStateCheckpoint> indexed = await transaction.Checkpoints.ListAsync(
+            RemoteMetadataIntent.PathPrefix(path), cancellationToken).ConfigureAwait(false);
+        return owned.Concat(indexed.Select(RemoteMetadataIntent.DecodePathIndex)
+            .Where(intent => intent.ItemId != itemId && intent.Covers(path))).ToArray();
+    }
+
+    private static async ValueTask RetainMetadataObservationProtectionAsync(ICloudCheckpointRepository checkpoints,
+        string path, CloudItemState? owner, DateTimeOffset observedAt, CancellationToken cancellationToken)
+    {
+        // Unbound rows cannot protect an occupant through the journal's item lookup.
+        await checkpoints.UpsertAsync(new(RemoteMetadataIntent.PendingObservationPathName(path), [1], observedAt),
+            cancellationToken).ConfigureAwait(false);
+        if (owner is { IsTombstone: false })
+        {
+            await checkpoints.UpsertAsync(new(RemoteMetadataIntent.PendingObservationItemName(owner.ItemId), [1], observedAt),
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private bool OwnsMetadataObservation(RemoteMetadataIntent intent, LocalChangeSourceEvent? observation, Guid? itemId) =>
         _metadataEchoAuthority?.IsAuthorized(intent) == true &&
         observation is { Action: LocalChangeSourceAction.AttributesModified, SecurityIdentity: { } identity } &&
         intent.Matches(identity, itemId);
+
+    private SecurityFeedProjection? CaptureDirectoryPassthroughOwner(CloudItemPath path, CloudItemState? owner, RemoteMetadataIntent[] intents)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299) ||
+            owner is not { IsTombstone: false, Kind: CloudItemKind.Directory })
+        { return null; }
+        try
+        {
+            using SafeFileHandle reference = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+            if (!MatchesAttributePath(reference, path)) { return null; }
+            LocalCloudItemInspection native = _securityInspection?.Invoke(reference, path.FullPath, owner.Kind, _syncRootPath)
+                ?? CloudItemInspector.Inspect(reference, path.FullPath, owner.Kind, _syncRootPath);
+            if (native.LocalBinding is { } binding &&
+                CloudPlaceholderIdentity.TryDecode(native.PlaceholderIdentity, out CloudPlaceholderIdentity? identity) &&
+                identity.ItemId == owner.ItemId && identity.RemoteId == owner.RemoteId &&
+                intents.Any(intent => intent.ItemId == owner.ItemId && intent.IsConfirmedPassthrough && intent.Binding == binding))
+            {
+                return new(_syncRootPath, path, owner.Kind, native, guard: null, parents: null, _securityInspection, allowRename: true);
+            }
+            return null;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or IOException or
+            UnauthorizedAccessException or CloudFilesException or Win32Exception)
+        {
+            return null;
+        }
+    }
 
     private async ValueTask<bool> RequiresMetadataReconciliationAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken) => (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix,
@@ -78,6 +134,8 @@ public sealed partial class CloudLocalChangeFeed
         // corrupt receipts before the feed begins serving pages from the pending index.
         Dictionary<string, CloudStateCheckpoint> stale = (await checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix,
             cancellationToken).ConfigureAwait(false)).ToDictionary(checkpoint => checkpoint.Name, StringComparer.Ordinal);
+        Dictionary<string, CloudStateCheckpoint> stalePaths = (await checkpoints.ListAsync(RemoteMetadataIntent.PathIndexPrefix,
+            cancellationToken).ConfigureAwait(false)).ToDictionary(checkpoint => checkpoint.Name, StringComparer.Ordinal);
         DateTimeOffset now = DateTimeOffset.UtcNow;
         foreach (RemoteMetadataIntent original in await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false))
         {
@@ -90,19 +148,26 @@ public sealed partial class CloudLocalChangeFeed
                     intent = intent with { RequiresReconciliation = true };
                     await intent.PersistAsync(checkpoints, now, cancellationToken).ConfigureAwait(false);
                     stale.Remove(intent.PendingName);
+                    stalePaths.Remove(intent.PathIndexName);
                     changed = true;
                     continue;
                 }
             }
-            if (!intent.MayRequireReconciliation) { continue; }
             byte[] encoded = intent.Encode();
-            if (!stale.Remove(intent.PendingName, out CloudStateCheckpoint? indexed) || !indexed.Value.Span.SequenceEqual(encoded))
+            if (!stalePaths.Remove(intent.PathIndexName, out CloudStateCheckpoint? indexedPath) ||
+                !indexedPath.Value.Span.SequenceEqual(encoded))
+            {
+                await checkpoints.UpsertAsync(new(intent.PathIndexName, encoded, now), cancellationToken).ConfigureAwait(false);
+                changed = true;
+            }
+            if (intent.MayRequireReconciliation &&
+                (!stale.Remove(intent.PendingName, out CloudStateCheckpoint? indexed) || !indexed.Value.Span.SequenceEqual(encoded)))
             {
                 await checkpoints.UpsertAsync(new(intent.PendingName, encoded, now), cancellationToken).ConfigureAwait(false);
                 changed = true;
             }
         }
-        foreach (string name in stale.Keys)
+        foreach (string name in stale.Keys.Concat(stalePaths.Keys))
         {
             await checkpoints.RemoveAsync(name, cancellationToken).ConfigureAwait(false);
             changed = true;

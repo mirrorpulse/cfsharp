@@ -1,7 +1,119 @@
+using System.Collections.Concurrent;
+
 namespace CfSharp.Storage.Sqlite.Tests;
 
 public sealed partial class CloudLocalChangeFeedTests
 {
+    [Theory]
+    [InlineData("different owner")]
+    [InlineData("moved owner")]
+    [InlineData("same owner, new native generation")]
+    [InlineData("lone passthrough without the original native directory")]
+    public async Task DirectoryNotificationReadsOnlyItsPathAndItemMetadataHistory(string scenario)
+    {
+        const string relative = "directory";
+        Directory.CreateDirectory(Path.Combine(_syncRootPath, relative));
+        await using ICloudStateStore store = await OpenStoreAsync();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        Guid itemId = Guid.NewGuid();
+        bool movedOwner = scenario == "moved owner";
+        bool lonePassthrough = scenario == "lone passthrough without the original native directory";
+        RemoteMetadataIntent historical = new(Guid.NewGuid(), Guid.NewGuid(), scenario == "different owner" ? Guid.NewGuid() : itemId,
+            movedOwner ? "old-directory" : "DIRECTORY", new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: false, Completed: true)
+        { Reconciled = true };
+        if (lonePassthrough)
+        { historical = historical with { Passthrough = true, OutcomeConfirmed = true, NativeWriteApplied = true }; }
+        RemoteMetadataIntent successor = new(Guid.NewGuid(), Guid.NewGuid(), itemId, relative,
+            new(1, Guid.NewGuid(), Guid.NewGuid()), Coordinated: false, Completed: true)
+        { Passthrough = true, OutcomeConfirmed = true, NativeWriteApplied = true };
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            await seed.Items.UpsertAsync(new(itemId, "directory-owner", relative, CloudItemKind.Directory,
+                "r1", null, false, now));
+            // Simulate a database from before the path index existed.
+            await seed.Checkpoints.UpsertAsync(new(historical.Name, historical.Encode(), now));
+            if (!movedOwner && !lonePassthrough)
+            { await seed.Checkpoints.UpsertAsync(new(successor.Name, successor.Encode(), now)); }
+            for (int index = 0; index < 64; index++)
+            {
+                RemoteMetadataIntent unrelated = historical with
+                {
+                    Id = Guid.NewGuid(),
+                    ItemId = Guid.NewGuid(),
+                    RelativePath = $"unrelated-{index}",
+                };
+                await seed.Checkpoints.UpsertAsync(new(unrelated.Name, unrelated.Encode(), now));
+            }
+            await seed.CommitAsync();
+        }
+
+        RaceStore observed = new(store);
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(observed, source);
+        await feed.StartAsync();
+        Assert.False((await feed.BeginScanAsync()).RequiresFullRescan);
+        ConcurrentQueue<string> prefixes = new();
+        observed.CheckpointPrefixRead = prefixes.Enqueue;
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(10));
+        await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
+        CloudLocalChangeBatch fenced = await feed.ReadBatchAsync(deadline.Token);
+        Assert.True(fenced.RequiresFullRescan);
+        Assert.Empty(fenced.Changes);
+        Assert.Contains(RemoteMetadataIntent.PathPrefix(relative), prefixes);
+        Assert.Contains(RemoteMetadataIntent.ItemPrefix(itemId), prefixes);
+        Assert.DoesNotContain(RemoteMetadataIntent.Prefix, prefixes);
+        Assert.DoesNotContain(RemoteMetadataIntent.PathIndexPrefix, prefixes);
+
+        CloudOperationJournalEntry original;
+        await using (ICloudStateTransaction state = await store.BeginTransactionAsync(deadline.Token))
+        {
+            CloudStateCheckpoint indexed = (await state.Checkpoints.GetAsync(historical.PathIndexName, deadline.Token))!;
+            Assert.True(RemoteMetadataIntent.DecodePathIndex(indexed).RequiresReconciliation);
+            original = Assert.Single(await state.Operations.ListAsync(10, cancellationToken: deadline.Token));
+            if (!movedOwner)
+            {
+                Assert.NotNull(await state.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationItemName(itemId), deadline.Token));
+                Assert.NotNull(await state.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationPathName(relative), deadline.Token));
+            }
+        }
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudLocalChange delivered = Assert.Single((await feed.ReadBatchAsync(deadline.Token)).Changes);
+        Assert.Equal((original.OperationId, original.Sequence), (delivered.OperationId, delivered.Sequence));
+        Assert.Null(delivered.ItemId);
+        await feed.AcknowledgeAsync([delivered.OperationId], deadline.Token);
+    }
+
+    [Fact]
+    public async Task DelayedDirectoryTimestampCannotBindToAReplacementFile()
+    {
+        const string relative = "replacement";
+        string path = Path.Combine(_syncRootPath, relative);
+        const string contents = "replacement bytes";
+        await File.WriteAllTextAsync(path, contents);
+        await using ICloudStateStore store = await OpenStoreAsync();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        Guid itemId = Guid.NewGuid();
+        await using (ICloudStateTransaction seed = await store.BeginTransactionAsync())
+        {
+            await seed.Items.UpsertAsync(new(itemId, "replacement-file", relative, CloudItemKind.File, "r1", null, false, now));
+            await seed.Checkpoints.UpsertAsync(new(RemoteMetadataIntent.DirectoryTimeObservationName(relative),
+                Guid.NewGuid().ToByteArray(), now));
+            await seed.CommitAsync();
+        }
+        FakeSource source = new();
+        await using CloudLocalChangeFeed feed = CreateFeed(store, source);
+        await feed.StartAsync();
+        await source.EmitAsync(new(LocalChangeSourceAction.Modified, relative));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(10));
+        await WaitForJournalStateAsync(store, expectedOperations: 1, expectedSuppressions: 0);
+        Assert.True((await feed.ReadBatchAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(deadline.Token);
+        CloudLocalChange observation = Assert.Single((await feed.ReadBatchAsync(deadline.Token)).Changes);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, observation.Kind);
+        Assert.Null(observation.ItemId);
+        Assert.Equal(contents, await File.ReadAllTextAsync(path, deadline.Token));
+    }
+
     [Fact]
     public async Task LegacyMetadataTicketCannotConsumeAGenuineDirectoryObservation()
     {

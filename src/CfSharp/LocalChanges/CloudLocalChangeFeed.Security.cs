@@ -14,6 +14,28 @@ public sealed partial class CloudLocalChangeFeed
 
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
+    private static async ValueTask<StagedSecurityObservation> StageMetadataObservationAsync(ICloudStateTransaction transaction,
+        SecurityFeedProjection projection, CloudItemState owner, CloudItemPath path, LocalChangeSourceEvent sourceEvent,
+        Guid operationId, long observation, DateTimeOffset observedAt, LocalChangeCheckpoint checkpoint, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Keep the original unavailable until the binding has survived both commits.
+            byte[] receipt = new LocalChangePayload(path.RelativePath, null, owner.Kind == CloudItemKind.Directory, observedAt).Encode();
+            CloudOperationJournalEntry entry = new(operationId, CloudStateOperationKind.MetadataUpdate, owner.ItemId, receipt, observedAt);
+            await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), receipt, observedAt), cancellationToken).ConfigureAwait(false);
+            await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt, cancellationToken).ConfigureAwait(false);
+            projection.Validate();
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new(entry, projection, sourceEvent);
+        }
+        catch
+        {
+            projection.Dispose();
+            throw;
+        }
+    }
+
     private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
         SecurityFeedProjection projection, LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {
@@ -133,6 +155,12 @@ public sealed partial class CloudLocalChangeFeed
             LocalChangePayload payload = LocalChangePayload.Decode(receipt.Value);
             await RetainUnboundSecurityObservationAsync(transaction, operationId, receipt.Value, payload.ObservedAt,
                 cancellationToken).ConfigureAwait(false);
+            if (payload.IsDirectory)
+            {
+                CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(payload.RelativePath, cancellationToken).ConfigureAwait(false);
+                await RetainMetadataObservationProtectionAsync(transaction.Checkpoints, payload.RelativePath, owner,
+                    payload.ObservedAt, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.Checkpoints.UpsertAsync(new(NamespaceObservationsPrefix + "/" + operationId.ToString("N"),
                 receipt.Value.Span, payload.ObservedAt), cancellationToken).ConfigureAwait(false);
         }

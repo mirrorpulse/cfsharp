@@ -30,6 +30,8 @@ including after the path changes ownership.
 An unresolved observation protects the path and its current official owner from in-place
 remote writes until reconciliation is acknowledged. The journal row remains available for
 acknowledgement at its historical path.
+Directory timestamp writes also retain a marker for the watcher lifetime. If a file later
+occupies the path, a late directory notification cannot become a bound file update.
 Before opening a replacement watcher, the feed retires markers whose remote calls have ended.
 The startup transaction also requests one full reconciliation and preserves journal originals.
 The new watcher can deliver genuine file writes through the normal incremental path after that
@@ -37,6 +39,9 @@ reconciliation. Markers from in-flight remote mutations stay active for the repl
 
 Reconciliation retains one attribution marker per native generation and historical path. A late
 attribute callback requires reconciliation again instead of becoming a purported new local edit.
+Generic directory modifications consult the affected path and current item's receipts. A retired
+item's path evidence keeps an ambiguous observation unbound even if a successor permits passthrough.
+The feed rebuilds its path lookup from durable receipts before opening the watcher.
 `EchoSuppressionLifetime` limits discard authority, not uncertainty: a timeout cannot prove the
 origin of a queued observation. Subsequent attributes for that generation therefore also require
 reconciliation unless a fresh, valid caller-coordinated declaration covers them. A successor with
