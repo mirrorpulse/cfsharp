@@ -831,7 +831,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Fence delivery for reconciliation before accepting another observation. The
             // catch covers only resolution; durable-store failures must still stop the worker.
             if (kind == CloudLocalChangeKind.ContentUpdate &&
-                await TryRetainUnresolvedFileTimeAsync(relativePath, cancellationToken).ConfigureAwait(false))
+                await TryRetainUnresolvedTimeObservationAsync(relativePath, cancellationToken).ConfigureAwait(false))
             { return; }
             await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
             return;
@@ -898,7 +898,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
     }
 
-    private async ValueTask<bool> TryRetainUnresolvedFileTimeAsync(string relativePath, CancellationToken cancellationToken)
+    private async ValueTask<bool> TryRetainUnresolvedTimeObservationAsync(string relativePath, CancellationToken cancellationToken)
     {
         CloudItemPath path;
         try { path = CloudItemPathResolver.ResolveLexically(_syncRootPath, relativePath, allowRoot: false); }
@@ -971,24 +971,23 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
-        // Generic Modified arrives here as ContentUpdate. Check retained file-time
-        // history before inspecting today's occupant. It may now be a directory with
-        // a completely unrelated metadata receipt.
-        bool uncertainFileContent = kind == CloudLocalChangeKind.ContentUpdate &&
-            await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
-                cancellationToken).ConfigureAwait(false) is not null;
-        if (kind == CloudLocalChangeKind.ContentUpdate && !uncertainFileContent && uncertainDirectory is null &&
-            Directory.Exists(path.FullPath))
+        bool uncertainFileContent = false;
+        if (kind == CloudLocalChangeKind.ContentUpdate)
         {
-            kind = CloudLocalChangeKind.MetadataUpdate;
-        }
-        if (kind == CloudLocalChangeKind.ContentUpdate && !uncertainFileContent)
-        {
-            // A file can also inherit a path previously occupied by a directory.
-            // Keep the generic observation when either a file write or a delayed
-            // directory timestamp notification could have produced it.
-            uncertainFileContent = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
+            // The generic action describes a historical path. Read its watcher-lifetime
+            // history before using the current native kind to classify the notification.
+            bool historicalFile = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
                 cancellationToken).ConfigureAwait(false) is not null;
+            bool historicalDirectory = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
+                cancellationToken).ConfigureAwait(false) is not null;
+            if (!historicalFile && uncertainDirectory is null && Directory.Exists(path.FullPath))
+            {
+                kind = CloudLocalChangeKind.MetadataUpdate;
+            }
+            else
+            {
+                uncertainFileContent = historicalFile || historicalDirectory;
+            }
         }
         bool metadataObservation = kind == CloudLocalChangeKind.MetadataUpdate &&
             securityObservation?.Action != LocalChangeSourceAction.SecurityModified;
@@ -1383,14 +1382,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             .ConfigureAwait(false);
         (bool metadataChanged, bool metadataRequiresReconciliation) =
             await RecoverMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
-        bool retiredFileTimeMarkers = await RetireFileTimeObservationsBeforeStartingAsync(transaction.Checkpoints,
+        (bool retiredTimeMarkers, bool timeMarkersRequireReconciliation) = await RetireTimeObservationsBeforeStartingAsync(transaction.Checkpoints,
             cancellationToken).ConfigureAwait(false);
         bool recoveredObservations = await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false);
-        if (recoveredObservations || metadataRequiresReconciliation || retiredFileTimeMarkers)
+        if (recoveredObservations || metadataRequiresReconciliation || timeMarkersRequireReconciliation)
         {
             await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         }
-        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation || retiredFileTimeMarkers)
+        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation || retiredTimeMarkers)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }

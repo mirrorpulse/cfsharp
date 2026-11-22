@@ -30,10 +30,12 @@ including after the path changes ownership.
 An unresolved observation protects the path and its current official owner from in-place
 remote writes until reconciliation is acknowledged. The journal row remains available for
 acknowledgement at its historical path.
-Directory timestamp writes also retain a marker for the watcher lifetime. If a file later
-occupies the path, a late directory notification cannot become a bound file update.
+Remote directory metadata preparations retain a marker for the watcher lifetime, including
+attribute-only updates. If a file later occupies the path, a late directory notification
+cannot become a bound file update.
 Before opening a replacement watcher, the feed retires markers whose remote calls have ended.
-The startup transaction also requests one full reconciliation and preserves journal originals.
+Retiring file timestamp markers requests one full reconciliation and preserves journal originals.
+Directory marker retirement preserves the reconciliation state already recorded by the feed.
 The new watcher can deliver genuine file writes through the normal incremental path after that
 reconciliation. Markers from in-flight remote mutations stay active for the replacement watcher.
 

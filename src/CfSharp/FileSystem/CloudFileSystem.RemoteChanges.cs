@@ -1240,17 +1240,40 @@ public sealed partial class CloudFileSystem
         RemoteMetadataIntent[] previousIntents = checkpoints.Select(RemoteMetadataIntent.Decode)
             .Where(intent => intent.Covers(change.RelativePath) || (binding is not null && intent.Binding == binding))
             .ToArray();
+        Guid callId = _metadataEchoCall?.Id ?? Guid.NewGuid();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        bool retainTimeHistory = change.ItemKind == CloudItemKind.Directory ||
+            (change.Kind == CloudRemoteChangeKind.MetadataUpdate && !passthrough &&
+             (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue));
+        if (retainTimeHistory)
+        {
+            // A directory's generic notification does not carry the cause or generation.
+            // Even an attribute-only update needs history if a file later occupies the path.
+            // Keep markers from calls that can still write into a replacement watcher.
+            string timeObservation = change.ItemKind == CloudItemKind.Directory
+                ? RemoteMetadataIntent.DirectoryTimeObservationName(change.RelativePath)
+                : RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
+            await preparation.Checkpoints.UpsertAsync(new(timeObservation, callId.ToByteArray(), now),
+                cancellationToken).ConfigureAwait(false);
+        }
         // Unrelated default upserts keep their existing echo handling. An upsert with
         // attribution history must establish its own policy before writing attributes.
         if (change.Kind != CloudRemoteChangeKind.MetadataUpdate && !passthrough && !coordinated && previousIntents.Length == 0)
-        { return null; }
+        {
+            if (retainTimeHistory)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _metadataEchoCall?.TrackPreparation();
+                await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            return null;
+        }
 
-        RemoteMetadataIntent intent = new(Guid.NewGuid(), _metadataEchoCall?.Id ?? Guid.NewGuid(), itemId,
+        RemoteMetadataIntent intent = new(Guid.NewGuid(), callId, itemId,
             change.RelativePath, binding, coordinated, Completed: false)
         { Passthrough = passthrough };
         HashSet<string>? retainedProjections = previousIntents.Length == 0 ? null :
             await RemoteMetadataProjection.ReadRetainedReceiptNamesAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
-        DateTimeOffset now = DateTimeOffset.UtcNow;
         if (passthrough && change.ItemKind == CloudItemKind.File)
         {
             // These provider-issued upsert tickets can match file Modified events
@@ -1304,17 +1327,6 @@ public sealed partial class CloudFileSystem
             RemoteMetadataProjection projection = new(itemId, intent.Id, ProjectedAtTicks: 0,
                 OriginalRowFingerprint: RemoteMetadataProjection.Fingerprint(original));
             await preparation.Checkpoints.UpsertAsync(projection.ToCheckpoint(projectionName, now), cancellationToken).ConfigureAwait(false);
-        }
-        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && (change.ItemKind == CloudItemKind.Directory || !passthrough) &&
-            (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
-        {
-            // Old observers may still carry this path. Record the call so the next
-            // observer also keeps the marker if this mutation is still in flight.
-            string timeObservation = change.ItemKind == CloudItemKind.Directory
-                ? RemoteMetadataIntent.DirectoryTimeObservationName(change.RelativePath)
-                : RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
-            await preparation.Checkpoints.UpsertAsync(new(timeObservation, intent.CallId.ToByteArray(), now),
-                cancellationToken).ConfigureAwait(false);
         }
         cancellationToken.ThrowIfCancellationRequested();
         _metadataEchoCall?.TrackPreparation();

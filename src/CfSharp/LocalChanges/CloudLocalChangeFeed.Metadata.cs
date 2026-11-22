@@ -83,11 +83,12 @@ public sealed partial class CloudLocalChangeFeed
             (intent.HasUnconfirmedOutcome || intent.UsesReconciliationPolicy ||
                 (intent.Coordinated && _metadataEchoAuthority?.IsAuthorized(intent) != true))));
 
-    private async ValueTask<bool> RetireFileTimeObservationsBeforeStartingAsync(ICloudCheckpointRepository checkpoints,
+    private async ValueTask<(bool Changed, bool RequiresReconciliation)> RetireTimeObservationsBeforeStartingAsync(ICloudCheckpointRepository checkpoints,
         CancellationToken cancellationToken)
     {
-        if (_metadataEchoAuthority is not { } authority) { return false; }
+        if (_metadataEchoAuthority is not { } authority) { return default; }
         bool retired = false;
+        bool reconcile = false;
         // The owner admits one feed. A new feed has no queued notifications from a
         // previous source. An active remote call can still write into the new source.
         foreach (CloudStateCheckpoint marker in await checkpoints.ListAsync(
@@ -96,8 +97,11 @@ public sealed partial class CloudLocalChangeFeed
             if (marker.Value.Length == 16 && authority.IsApplying(new Guid(marker.Value.Span))) { continue; }
             await checkpoints.RemoveAsync(marker.Name, cancellationToken).ConfigureAwait(false);
             retired = true;
+            // A directory marker only disambiguates paths that changed type. Its receipt
+            // and the journal retain any pending work that a new watcher must reconcile.
+            reconcile |= !marker.Name.StartsWith(RemoteMetadataIntent.DirectoryTimeObservationPrefix, StringComparison.Ordinal);
         }
-        return retired;
+        return (retired, reconcile);
     }
 
     internal void NotifyRemoteMetadataCallEnded() => SignalAvailable();

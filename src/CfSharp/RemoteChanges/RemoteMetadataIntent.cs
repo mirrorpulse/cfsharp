@@ -23,8 +23,9 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     // The original file-time range now also protects ambiguous directory observations.
     internal const string PendingObservationPrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
     internal const string FileTimeObservationPrefix = "cfsharp/remote-metadata-file-time/v1/";
+    internal const string DirectoryTimeObservationPrefix = FileTimeObservationPrefix + "directory/";
     internal static string FileTimeObservationName(string path) => FileTimeObservationPrefix + FileTimePathKey(path);
-    internal static string DirectoryTimeObservationName(string path) => FileTimeObservationPrefix + "directory/" + FileTimePathKey(path);
+    internal static string DirectoryTimeObservationName(string path) => DirectoryTimeObservationPrefix + FileTimePathKey(path);
     internal static string PendingObservationPathName(string path) => PendingObservationPrefix + "path/" + FileTimePathKey(path);
     internal static string PendingObservationItemName(Guid itemId) => PendingObservationPrefix + "item/" + itemId.ToString("N");
     private static string FileTimePathKey(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path.ToUpperInvariant())));

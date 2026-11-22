@@ -85,6 +85,59 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(CloudRemoteChangeKind.MetadataUpdate)]
+    [InlineData(CloudRemoteChangeKind.DirectoryUpsert)]
+    public async Task DirectoryAttributeHistoryFencesALateTimestampNotificationAtAReplacementFile(CloudRemoteChangeKind operationKind)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        CloudPlaceholderIdentity directory = new(Guid.NewGuid(), "retired-attribute-directory");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, directory).WithInSyncState(true).Build(),
+        ]);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+        CloudRemoteChange attrs = new("attributes", operationKind, directory.RemoteId, "remote-r1",
+            CloudItemKind.Directory, relative, directory.ItemId,
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build());
+        CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(
+            new("retired-directory-attributes", Array.Empty<byte>(), [attrs], new byte[] { 1 }), cancellationToken: deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+
+        LocalChangeSourceEvent delayed = await CaptureNativeModificationAsync(fixture.Root, relative, () =>
+        {
+            Directory.SetLastWriteTimeUtc(path, new DateTime(2025, 6, 7, 8, 9, 10, DateTimeKind.Utc));
+            return Task.CompletedTask;
+        }, deadline.Token);
+        Directory.Move(path, Path.Combine(fixture.Root, "Retired"));
+        const string replacementData = "different file generation";
+        await File.WriteAllTextAsync(path, replacementData, deadline.Token);
+        CloudFile file = fixture.System.GetFile(relative);
+        CloudPlaceholderIdentity replacement = new(Guid.NewGuid(), "after-attribute-directory");
+        await file.ConvertToPlaceholderAsync(replacement, cancellationToken: deadline.Token);
+        await file.SetInSyncAsync(true, cancellationToken: deadline.Token);
+        Assert.Equal(replacement.ItemId, (await file.InspectAsync(deadline.Token)).ItemId);
+        await source.EmitAsync(delayed);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+
+        CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        CloudLocalChange retained = Assert.Single(page.Changes);
+        Assert.Null(retained.ItemId);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, retained.Kind);
+        Assert.Equal((original.OperationId, original.Sequence), (retained.OperationId, retained.Sequence));
+        Assert.Equal(replacementData, await File.ReadAllTextAsync(path, deadline.Token));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task NativeFileTimestampAndSameLengthDataWriteRetainTheirOriginalObservations()
     {
