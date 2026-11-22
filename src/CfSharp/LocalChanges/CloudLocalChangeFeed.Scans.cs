@@ -150,10 +150,11 @@ public sealed partial class CloudLocalChangeFeed
         try
         {
             CloudLocalChange change = ToChange(operation);
-            if (change.Kind == CloudLocalChangeKind.MetadataUpdate)
+            if (change.Kind == CloudLocalChangeKind.MetadataUpdate ||
+                (change.Kind == CloudLocalChangeKind.ContentUpdate && change.ItemId is null))
             {
-                // Metadata observations describe historical paths, even when associated with
-                // an item ID. Reconciliation can leave a junction in place at the old path.
+                // Retained metadata and unbound content describe historical paths.
+                // Reconciliation can leave a junction in place at the old path.
                 CloudItemPathResolver.ResolveLexically(_syncRootPath, change.RelativePath, allowRoot: false);
             }
             else

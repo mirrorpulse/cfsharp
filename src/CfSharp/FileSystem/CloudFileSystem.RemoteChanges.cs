@@ -1231,6 +1231,17 @@ public sealed partial class CloudFileSystem
         }
         _metadataEchoCall?.TrackPreparation();
         await intent.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
+        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && change.ItemKind == CloudItemKind.File && !passthrough &&
+            (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
+        {
+            // Generic file changes have no writer or file generation. Retain the path
+            // even if reconciliation compacts the receipt or the path gets a new occupant.
+            string fileTimeObservation = RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
+            if (await preparation.Checkpoints.GetAsync(fileTimeObservation, cancellationToken).ConfigureAwait(false) is null)
+            {
+                await preparation.Checkpoints.UpsertAsync(new(fileTimeObservation, [1], now), cancellationToken).ConfigureAwait(false);
+            }
+        }
         await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
         return intent;
     }
@@ -1275,6 +1286,9 @@ public sealed partial class CloudFileSystem
         ICloudStateTransaction transaction, Guid itemId, string path, CloudLocalFileBinding? binding,
         RemoteMetadataIntent? preparation, CancellationToken cancellationToken)
     {
+        if (await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingFileTimeName(path), cancellationToken).ConfigureAwait(false) is not null ||
+            await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingFileTimeItemName(itemId), cancellationToken).ConfigureAwait(false) is not null)
+        { return (true, []); }
         if (preparation is not null)
         {
             RemoteMetadataIntent retained = await ReadPreparedRemoteMetadataIntentAsync(transaction, preparation, cancellationToken).ConfigureAwait(false);

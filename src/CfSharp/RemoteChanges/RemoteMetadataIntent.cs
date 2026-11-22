@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace CfSharp;
@@ -18,6 +19,11 @@ internal sealed record RemoteMetadataIntent(Guid Id, Guid CallId, Guid ItemId, s
     internal bool MayRequireReconciliation => !Reconciled && (RequiresReconciliation || HasUnconfirmedOutcome || UsesReconciliationPolicy || Coordinated);
     internal const string Prefix = "cfsharp/remote-metadata/v1/";
     internal const string PendingPrefix = "cfsharp/remote-metadata-pending/v1/";
+    internal const string PendingFileTimePrefix = "cfsharp/remote-metadata-file-time-pending/v1/";
+    internal static string FileTimeObservationName(string path) => "cfsharp/remote-metadata-file-time/v1/" + FileTimePathKey(path);
+    internal static string PendingFileTimeName(string path) => PendingFileTimePrefix + "path/" + FileTimePathKey(path);
+    internal static string PendingFileTimeItemName(Guid itemId) => PendingFileTimePrefix + "item/" + itemId.ToString("N");
+    private static string FileTimePathKey(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path.ToUpperInvariant())));
     internal static string ItemPrefix(Guid itemId) => Prefix + itemId.ToString("N") + "/";
     internal string Name => ItemPrefix(ItemId) + Id.ToString("N");
     internal string PendingName => PendingPrefix + Name[Prefix.Length..];

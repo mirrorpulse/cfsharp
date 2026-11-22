@@ -27,6 +27,7 @@ $suiteName = $Suite.ToLowerInvariant()
 $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen' }
     elseif ($Suite -eq 'AccessJournal') {
         @('FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit',
+            'FullyQualifiedName~NativeFileTimestampAndSameLengthDataWriteRetainTheirOriginalObservations',
             'FullyQualifiedName~RemoteDirectoryMetadataRequiresExplicitAttributeProvenance',
             'FullyQualifiedName~NativeMetadataSharingFailureCannotAuthorizeSuppression',
             'FullyQualifiedName~DefaultMetadataPolicyDoesNotInheritAnEarlierCoordinatedWindow',
@@ -52,7 +53,7 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
     elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
-    elseif ($Suite -eq 'AccessJournal') { 52 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
+    elseif ($Suite -eq 'AccessJournal') { 53 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null

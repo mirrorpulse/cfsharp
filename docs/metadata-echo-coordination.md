@@ -21,6 +21,15 @@ The application must decide and individually acknowledge those observations afte
 An immediately following genuine native Hidden write is retained too; it cannot be silently
 consumed by the remote operation's path/kind ticket.
 
+When a remote file metadata update can write the creation or last-write time, the file's
+generic modification notifications also require reconciliation. Windows uses the same
+notification for timestamp changes and content writes. The feed retains each as an unbound
+`ContentUpdate` so reconciliation can detect genuine writes, including same-length edits.
+The path marker is retained for delayed callbacks, including after the path changes ownership.
+An unresolved observation protects the path and its current official owner from in-place
+remote writes until reconciliation is acknowledged. The journal row remains available for
+acknowledgement at its historical path.
+
 Reconciliation retains one attribution marker per native generation and historical path. A late
 attribute callback requires reconciliation again instead of becoming a purported new local edit.
 `EchoSuppressionLifetime` limits discard authority, not uncertainty: a timeout cannot prove the
