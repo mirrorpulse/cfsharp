@@ -261,6 +261,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// </exception>
     /// <exception cref="ObjectDisposedException">The instance is stopping or disposed.</exception>
     /// <exception cref="OperationCanceledException">Startup was canceled before completion.</exception>
+    /// <exception cref="NotSupportedException">The official SQLite provider cannot enforce the required state schema.</exception>
     /// <exception cref="CloudFilesException">
     /// Windows rejects sync-root registration, lookup, or provider connection.
     /// </exception>
@@ -285,6 +286,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                     $"The sync-root directory does not exist: '{SyncRootPath}'.");
             }
 
+            SqliteStateStoreProtocol.EnsureCompatible(_stateStoreFactory);
             Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Starting);
             ICloudStateStore? openedStore = null;
             ICloudFileSystemRuntimeSession? openedRuntimeSession = null;
@@ -299,6 +301,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                         "The state-store factory returned no store.");
                 }
 
+                SqliteStateStoreProtocol.EnsureCompatible(openedStore);
                 cancellationToken.ThrowIfCancellationRequested();
                 openedRuntimeSession = _runtime.Start(
                     SyncRootPath,

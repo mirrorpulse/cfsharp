@@ -46,8 +46,9 @@ namespace CfSharp.Storage.Sqlite;
 /// Opening and all file access still run under the caller's identity; the factory never changes tokens.
 /// </para>
 /// </remarks>
-public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
+public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory, ISqliteStateStoreProtocol
 {
+    int ISqliteStateStoreProtocol.SchemaVersion => SqliteSchema.CurrentVersion;
     /// <summary>The default time SQLite waits for a conflicting lock.</summary>
     public static readonly TimeSpan DefaultBusyTimeout = TimeSpan.FromSeconds(5);
 
@@ -425,8 +426,9 @@ public sealed class SqliteCloudStateStoreFactory : ICloudStateStoreFactory
         IntPtr templateFile);
 }
 
-internal sealed class SqliteCloudStateStore : ICloudStateStore
+internal sealed class SqliteCloudStateStore : ICloudStateStore, ISqliteStateStoreProtocol
 {
+    int ISqliteStateStoreProtocol.SchemaVersion => SqliteSchema.CurrentVersion;
     private readonly object _lifecycleGate = new();
     private readonly SqliteConnection _connection;
     private readonly string _databasePath;

@@ -132,6 +132,9 @@ outcome stays successful and any unconfirmed receipt remains conservative. A leg
 receipt without durable evidence of a successful native write requires reconciliation.
 The official SQLite store upgrades to schema 10 before writing remote metadata receipts. Preview.15
 and other older SQLite providers reject the upgraded database before opening it for application work.
+Upgrade `CfSharp` and `CfSharp.Storage.Sqlite` together. File-system startup rejects an older official
+SQLite factory or store before starting the runtime. Custom stores that adapt SQLite are responsible
+for using a provider that establishes the same downgrade protection.
 
 A new file-system owner does not recover the former caller's promise about external writers.
 Unreconciled attribution evidence fences the feed on restart, even if the original call used
