@@ -1,3 +1,5 @@
+using System.ComponentModel;
+
 using CfSharp.Native;
 
 using Microsoft.Win32.SafeHandles;
@@ -16,16 +18,21 @@ public sealed partial class CloudFileSystem
     /// <exception cref="ArgumentOutOfRangeException">The entry ordinal is outside the batch.</exception>
     /// <exception cref="ArgumentException">The entry is not a metadata update or the batch fingerprint differs.</exception>
     /// <exception cref="InvalidOperationException">The owner is not started, the next entry differs, or
-    /// the original uncertainty has not been reconciled.</exception>
+    /// the evidence calls for ordinary replay, or full reconciliation has not been acknowledged.</exception>
     /// <exception cref="InvalidDataException">Retained progress or evidence is inconsistent.</exception>
+    /// <exception cref="Win32Exception">A native sharing or locking conflict prevents the original binding check.</exception>
+    /// <exception cref="IOException">A storage operation fails or a path guard reports a sharing or locking conflict.</exception>
+    /// <exception cref="CloudFilesException">A Cloud Files query reports a sharing or locking conflict.</exception>
     /// <exception cref="ObjectDisposedException">The file-system owner is stopping or disposed.</exception>
     /// <exception cref="OperationCanceledException">Cancellation was observed before completion.</exception>
     /// <remarks>
     /// Complete and acknowledge the feed's full rescan before calling. The application chooses this
     /// outcome after reconciling the actual namespace and any work required for the original change.
     /// This Windows-only operation serializes with other remote calls and commits one entry only.
-    /// It does not inspect or mutate the native object, update its revision, acknowledge local
-    /// operations, invoke the provider, or declare success of the uncertain native write.
+    /// A recorded native completion is checked first. If the original outcome can still be
+    /// verified, replay the batch normally. Closing an unverifiable entry leaves the native
+    /// object, official revision and local journal untouched. It does not invoke the provider.
+    /// A transient sharing or locking failure preserves the original evidence and is propagated.
     /// The conflict cannot execute a later KeepRemote decision. Repeating the request after an
     /// ambiguous commit returns the current prefix without creating another conflict.
     /// </remarks>
@@ -60,7 +67,7 @@ public sealed partial class CloudFileSystem
             CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException("The original metadata entry has no pending recovery evidence.");
             RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
-            if (projection.ProjectedAtTicks != 0)
+            if (projection.ProjectedAtTicks == RemoteMetadataProjection.NativeWriteNotAttempted)
             { throw new InvalidOperationException("Replay this metadata entry through ordinary remote application."); }
             CloudStateCheckpoint prepared = await transaction.Checkpoints.GetAsync(projection.ReceiptName, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidDataException("The original metadata attribution preparation is missing.");
@@ -69,6 +76,10 @@ public sealed partial class CloudFileSystem
             { throw new InvalidDataException("The metadata attribution does not match the uncertain batch entry."); }
             if (!intent.Reconciled || intent.RequiresReconciliation)
             { throw new InvalidOperationException("Complete and acknowledge full reconciliation before closing the uncertain metadata entry."); }
+            if (projection.ProjectedAtTicks != 0 &&
+                await FindRemoteMetadataProjectionMismatchAsync(transaction, change, projection, intent, target: null,
+                    checkReplayAvailability: true, cancellationToken).ConfigureAwait(false) is null)
+            { throw new InvalidOperationException("The original metadata outcome can still be verified. Replay the original batch."); }
 
             DateTimeOffset now = DateTimeOffset.UtcNow;
             CloudItemState? current = await transaction.Items.GetByItemIdAsync(intent.ItemId, cancellationToken).ConfigureAwait(false);
@@ -201,9 +212,18 @@ public sealed partial class CloudFileSystem
     private async ValueTask ValidateRemoteMetadataProjectionAsync(ICloudStateTransaction transaction, CloudRemoteChange change,
         RemoteMetadataProjection projection, RemoteMetadataIntent intent, SafeFileHandle? target, CancellationToken cancellationToken)
     {
+        string? mismatch = await FindRemoteMetadataProjectionMismatchAsync(transaction, change, projection, intent, target,
+            checkReplayAvailability: false, cancellationToken).ConfigureAwait(false);
+        if (mismatch is not null) { throw MetadataProjectionUnresolved(change, mismatch); }
+    }
+
+    private async ValueTask<string?> FindRemoteMetadataProjectionMismatchAsync(ICloudStateTransaction transaction, CloudRemoteChange change,
+        RemoteMetadataProjection projection, RemoteMetadataIntent intent, SafeFileHandle? target,
+        bool checkReplayAvailability, CancellationToken cancellationToken)
+    {
         if (intent.Completed || intent.Superseded || intent.Binding is null || !intent.Covers(change.RelativePath) ||
             (change.ItemId is Guid explicitId && explicitId != projection.ItemId))
-        { throw MetadataProjectionUnresolved(change, "the original attribution changed"); }
+        { return "the original attribution changed"; }
 
         bool needsProjection = projection.ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted;
         CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
@@ -212,17 +232,47 @@ public sealed partial class CloudFileSystem
                 ? RemoteMetadataProjection.Fingerprint(owner) != projection.OriginalRowFingerprint
                 : owner.RemoteId != change.RemoteId || owner.RemoteRevision != change.RemoteRevision ||
                   owner.UpdatedAt.UtcTicks != projection.ProjectedAtTicks))
-        { throw MetadataProjectionUnresolved(change, "the official projection changed"); }
+        { return "the official projection changed"; }
 
-        string fullPath = ToFullPath(change.RelativePath);
+        if (!checkReplayAvailability)
+        { return FindRemoteMetadataNativeMismatch(change, intent, ToFullPath(change.RelativePath), target); }
+
+        try
+        {
+            string path = ToFullPath(change.RelativePath);
+            using CloudPathHandleLease parents = CloudPathHandleLease.OpenParentChains(SyncRootPath, [path]);
+            using SafeFileHandle candidate = WindowsFileMetadata.OpenNamespaceGuard(path);
+            return FindRemoteMetadataNativeMismatch(change, intent, path, candidate);
+        }
+        catch (Exception exception) when ((exception is ArgumentException or IOException or UnauthorizedAccessException or CloudFilesException or Win32Exception) &&
+            !IsMetadataRecoverySharingFailure(exception))
+        {
+            // Native namespace failures mean successful replay cannot be authenticated.
+            // Storage failures above still propagate without closing an entry.
+            return "the original native binding cannot be verified";
+        }
+    }
+
+    private string? FindRemoteMetadataNativeMismatch(CloudRemoteChange change, RemoteMetadataIntent intent, string fullPath, SafeFileHandle? target)
+    {
+        if (target is not null &&
+            (((FileAttributes)WindowsFileMetadata.ReadBasic(target.DangerousGetHandle()).Attributes).HasFlag(FileAttributes.Directory) !=
+                (change.ItemKind == CloudItemKind.Directory)))
+        { return "the original native item kind changed"; }
         LocalCloudItemInspection native = target is null ? CloudItemInspector.Inspect(fullPath, change.ItemKind, SyncRootPath) :
             CloudItemInspector.Inspect(target, fullPath, change.ItemKind, SyncRootPath);
         if (!native.Exists || native.Kind != change.ItemKind || native.LocalBinding != intent.Binding ||
             !CloudPlaceholderIdentity.TryDecode(native.PlaceholderIdentity, out CloudPlaceholderIdentity? identity) ||
-            identity.ItemId != owner.ItemId || identity.RemoteId != change.RemoteId || identity.RemoteRevision != change.RemoteRevision ||
+            identity.ItemId != intent.ItemId || identity.RemoteId != change.RemoteId || identity.RemoteRevision != change.RemoteRevision ||
             (target is not null && !CloudDirectoryStateProjection.SamePath(WindowsFileMetadata.ReadFinalPath(target.DangerousGetHandle()), fullPath)))
-        { throw MetadataProjectionUnresolved(change, "the original native binding or identity changed"); }
+        { return "the original native binding or identity changed"; }
+        return null;
     }
+
+    private static bool IsMetadataRecoverySharingFailure(Exception exception) => exception is
+        Win32Exception { NativeErrorCode: 32 or 33 } or CloudFilesException { Win32ErrorCode: 32 or 33 } or
+        IOException { InnerException: Win32Exception { NativeErrorCode: 32 or 33 } } or
+        IOException { HResult: unchecked((int)0x80070020) or unchecked((int)0x80070021) };
 
     private static IOException MetadataProjectionUnresolved(CloudRemoteChange change, string reason) =>
         new($"Remote metadata change '{change.ChangeId}' requires reconciliation because {reason}. Retain the original batch for retry.");

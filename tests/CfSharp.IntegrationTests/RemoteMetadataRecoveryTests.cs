@@ -1,6 +1,9 @@
+using System.ComponentModel;
 using System.Diagnostics;
 
 using CfSharp.Storage.Sqlite;
+
+using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp.IntegrationTests;
 
@@ -979,11 +982,13 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData(true, false, false)]
-    [InlineData(false, false, false)]
-    [InlineData(true, true, false)]
-    [InlineData(true, false, true)]
-    public async Task MetadataOutcomeRollbackRecoversOnlyAnOriginalProjection(bool requirePreviousRevision, bool legacyPreparation, bool replaceObject)
+    [InlineData(true, false, null)]
+    [InlineData(false, false, null)]
+    [InlineData(true, true, null)]
+    [InlineData(true, false, CloudItemKind.Directory)]
+    [InlineData(true, false, CloudItemKind.File)]
+    public async Task MetadataOutcomeRollbackRecoversOnlyAnOriginalProjection(bool requirePreviousRevision, bool legacyPreparation,
+        CloudItemKind? replacementKind)
     {
         MetadataFaultFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "outcome-before"));
@@ -1024,15 +1029,34 @@ public sealed partial class CloudContentConfirmationTests
         }
 
         string originalPath = path;
-        if (replaceObject)
+        string replacementFile = Path.Combine(path, "local.txt");
+        const string replacementData = "replacement remains local";
+        if (replacementKind.HasValue)
         {
             originalPath = Path.Combine(fixture.Root, "Original");
             Directory.Move(path, originalPath);
-            Directory.CreateDirectory(path);
+            if (replacementKind == CloudItemKind.Directory) { Directory.CreateDirectory(path); }
+            else { replacementFile = path; }
+            await File.WriteAllTextAsync(replacementFile, replacementData);
         }
         await fixture.RestartAsync();
+        bool unresolved = legacyPreparation || replacementKind.HasValue;
+        if (!unresolved)
+        {
+            await using CloudLocalChangeFeed intact = fixture.System.CreateLocalChangeFeed(null, new ControlledMetadataSource());
+            await intact.StartAsync();
+            await intact.AcknowledgeFullRescanAsync(intact.BeginFullRescan(), CancellationToken.None);
+            // A transient competing DELETE handle must leave the original outcome available.
+            using (SafeFileHandle competing = OpenSecurityTestDirectory(path, 0x10000, 7, 0, 3, 0x02200000, 0))
+            {
+                Assert.False(competing.IsInvalid);
+                Win32Exception sharing = await Assert.ThrowsAsync<Win32Exception>(
+                    () => fixture.System.ReconcileRemoteMetadataAsync(batch, 0).AsTask());
+                Assert.Equal(32, sharing.NativeErrorCode);
+            }
+            await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.System.ReconcileRemoteMetadataAsync(batch, 0).AsTask());
+        }
         CloudRemoteApplyResult replay = await fixture.System.ApplyRemoteChangesAsync(batch);
-        bool unresolved = legacyPreparation || replaceObject;
         Assert.Equal(unresolved, replay.RequiresRetry);
         Assert.Equal(unresolved ? CloudRemoteApplyEntryStatus.Failed : CloudRemoteApplyEntryStatus.Applied,
             Assert.Single(replay.Entries).Status);
@@ -1044,13 +1068,54 @@ public sealed partial class CloudContentConfirmationTests
         {
             Assert.Equal(projectedAt, (await transaction.Items.GetByItemIdAsync(identity.ItemId))!.UpdatedAt);
             Assert.Empty(await transaction.Conflicts.ListAsync());
-            Assert.Equal(replaceObject, await transaction.Checkpoints.GetAsync(projectionName) is not null);
+            Assert.Equal(replacementKind.HasValue, await transaction.Checkpoints.GetAsync(projectionName) is not null);
         }
         if (!unresolved)
         {
             Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied,
                 Assert.Single((await fixture.System.ApplyRemoteChangesAsync(batch)).Entries).Status);
         }
+        if (replacementKind.HasValue)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.System.ReconcileRemoteMetadataAsync(batch, 0).AsTask());
+            ControlledMetadataSource source = new();
+            await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+            using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+            await feed.StartAsync(deadline.Token);
+            Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+            const string pendingFile = "local-pending.txt";
+            await File.WriteAllTextAsync(Path.Combine(fixture.Root, pendingFile), "preserve this journal entry", deadline.Token);
+            await source.EmitAsync(new(LocalChangeSourceAction.Created, pendingFile));
+            IReadOnlyList<CloudOperationJournalEntry> originals;
+            do
+            {
+                await using (ICloudStateTransaction read = await factory.Store!.BeginTransactionAsync(deadline.Token))
+                {
+                    originals = await read.Operations.ListAsync(10, cancellationToken: deadline.Token);
+                }
+                if (originals.Count == 0) { await Task.Delay(20, deadline.Token); }
+            } while (originals.Count == 0);
+            CloudOperationJournalEntry original = Assert.Single(originals);
+            await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+
+            CloudRemoteApplyResult closed = await fixture.System.ReconcileRemoteMetadataAsync(batch, 0);
+            Assert.False(closed.RequiresRetry);
+            Assert.Equal(finalCursor, closed.SafeCursor.ToArray());
+            Assert.Equal(CloudRemoteConflictReason.RemoteMetadataReconciliationRequired, Assert.Single(closed.Entries).Conflict!.Reason);
+            Guid conflictId = Assert.Single(closed.ConflictIds);
+            Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied,
+                Assert.Single((await fixture.System.ApplyRemoteChangesAsync(batch)).Entries).Status);
+            Assert.Equal(replacementData, await File.ReadAllTextAsync(replacementFile, deadline.Token));
+            Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+            Assert.True(File.GetAttributes(originalPath).HasFlag(FileAttributes.Hidden));
+            CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+            CloudLocalChange retained = Assert.Single(page.Changes);
+            Assert.Equal((original.OperationId, original.Sequence, original.ItemId), (retained.OperationId, retained.Sequence, retained.ItemId));
+            await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync();
+            Assert.Null(await transaction.Checkpoints.GetAsync(projectionName));
+            Assert.Equal(conflictId, Assert.Single(await transaction.Conflicts.ListAsync()).ConflictId);
+        }
+
     }
 
     [Trait("Category", "AccessJournal")]
