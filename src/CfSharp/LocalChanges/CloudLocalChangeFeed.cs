@@ -1135,8 +1135,16 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
                 .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
+            // Creation tickets also match ContentUpdate for the original identity. A
+            // same-revision passthrough write can leave that exact identity in place.
+            bool bypassCreationContentEcho = operationKind == CloudStateOperationKind.ContentUpdate &&
+                observedState is { Kind: CloudItemKind.File, IsTombstone: false } &&
+                suppressions.Any(candidate => candidate.ItemId == observedState.ItemId && RemoteCreationIntent.IsCreationEcho(candidate) &&
+                    CloudDirectoryStateProjection.SamePath(candidate.RelativePath, path.RelativePath)) &&
+                (await ReadMetadataIntentsAsync(transaction, cancellationToken, observedState.ItemId).ConfigureAwait(false))
+                    .Any(intent => intent.Passthrough && !intent.Superseded && intent.Covers(path.RelativePath));
             suppression = suppressions.FirstOrDefault(candidate => candidate.Kind != CloudStateOperationKind.MetadataUpdate && (RemoteCreationIntent.IsCreationEcho(candidate)
-                ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
+                ? !bypassCreationContentEcho && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
                 : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)));
         }
 

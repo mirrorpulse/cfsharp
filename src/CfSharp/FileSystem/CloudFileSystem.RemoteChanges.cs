@@ -12,6 +12,8 @@ namespace CfSharp;
 public sealed partial class CloudFileSystem
 {
     private const int RemoteConflictEnvelopeVersion = 1;
+    private const string RemoteEchoPayloadPrefix = "remote-change/v1|";
+    private static readonly byte[] s_remoteEchoPayloadPrefix = Encoding.UTF8.GetBytes(RemoteEchoPayloadPrefix);
     private readonly SemaphoreSlim _remoteApplyGate = new(1, 1);
     private readonly CloudMetadataEchoAuthority _metadataEchoAuthority = new();
     private CloudMetadataEchoAuthority.Call? _metadataEchoCall;
@@ -1056,7 +1058,7 @@ public sealed partial class CloudFileSystem
                 itemId,
                 kind,
                 change.RelativePath,
-                Encoding.UTF8.GetBytes($"remote-change/v1|{change.ChangeId}"),
+                Encoding.UTF8.GetBytes(RemoteEchoPayloadPrefix + change.ChangeId),
                 DateTimeOffset.UtcNow + options.EchoSuppressionLifetime,
                 change.PreviousRelativePath,
                 options.EchoSuppressionObservationCount),
@@ -1249,6 +1251,23 @@ public sealed partial class CloudFileSystem
         HashSet<string>? retainedProjections = previousIntents.Length == 0 ? null :
             await RemoteMetadataProjection.ReadRetainedReceiptNamesAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
         DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (passthrough && change.ItemKind == CloudItemKind.File)
+        {
+            // These provider-issued upsert tickets can match file Modified events
+            // without a native identity check. Revoke them in the same transaction
+            // that switches policy, before the native write can queue a notification.
+            // A queued observation can carry a time earlier than this switch.
+            IReadOnlyList<CloudEchoSuppressionState> tickets = await preparation.EchoSuppressions
+                .ListActiveAsync(DateTimeOffset.MinValue, cancellationToken).ConfigureAwait(false);
+            foreach (CloudEchoSuppressionState ticket in tickets)
+            {
+                if (ticket.ItemId == itemId && ticket.Kind == CloudStateOperationKind.ContentUpdate &&
+                    ticket.Payload.Span.StartsWith(s_remoteEchoPayloadPrefix))
+                {
+                    await preparation.EchoSuppressions.RemoveAsync(ticket.SuppressionId, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
         foreach (RemoteMetadataIntent previous in previousIntents)
         {
             // Keep unresolved observations and other generations for reconciliation,

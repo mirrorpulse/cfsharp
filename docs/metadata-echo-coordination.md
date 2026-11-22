@@ -100,6 +100,9 @@ Setting `SuppressLocalEcho = false` installs an explicit passthrough policy for 
 updates and in-place file and directory upserts. Provider-generated and genuine observations use
 the ordinary bound metadata path after confirmation. A failed or incomplete operation still
 retains uncertainty. Earlier unresolved observations still require reconciliation.
+Switching an existing file to passthrough revokes that item's automatic content tickets from
+earlier remote upserts before native mutation. Its creation ticket may still handle the
+creation notification. Generic content notifications use the new passthrough policy.
 
 ## Failure, restart and reconciliation
 

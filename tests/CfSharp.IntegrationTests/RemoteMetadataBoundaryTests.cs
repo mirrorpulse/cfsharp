@@ -6,6 +6,85 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FileMetadataPassthroughPreventsEarlierAutomaticTicketsFromConsumingContent(bool creationTicket)
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        string relative = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "upsert-then-timestamp", "remote-r0");
+        if (!creationTicket)
+        {
+            await File.WriteAllBytesAsync(path, []);
+            await fixture.File.ConvertToPlaceholderAsync(identity);
+            await fixture.File.SetInSyncAsync(true);
+        }
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+
+        CloudRemoteChange upsert = new("upsert", CloudRemoteChangeKind.FileUpsert, identity.RemoteId, "remote-r1", CloudItemKind.File,
+            relative, identity.ItemId, previousRemoteRevision: creationTicket ? null : "remote-r0", length: 0,
+            metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
+        CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(
+            new("timestamp-ticket-upsert", Array.Empty<byte>(), [upsert], new byte[] { 1 }),
+            new() { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated, EchoSuppressionObservationCount = 8 }, deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+        Guid originalTicket;
+        Guid unrelatedTicket = Guid.NewGuid();
+        await using (ICloudStateTransaction transaction = await factory!.Store!.BeginTransactionAsync(deadline.Token))
+        {
+            CloudEchoSuppressionState ticket = Assert.Single(await transaction.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow, deadline.Token));
+            Assert.Equal(creationTicket ? CloudStateOperationKind.Create : CloudStateOperationKind.ContentUpdate, ticket.Kind);
+            Assert.Equal(8, ticket.RemainingObservations);
+            originalTicket = ticket.SuppressionId;
+            await transaction.EchoSuppressions.UpsertAsync(new(unrelatedTicket, Guid.NewGuid(), CloudStateOperationKind.ContentUpdate,
+                "other.txt", ticket.Payload.Span, ticket.ExpiresAt), deadline.Token);
+            await transaction.CommitAsync(deadline.Token);
+        }
+
+        DateTimeOffset timestamp = new(2025, 5, 6, 7, 8, 9, TimeSpan.Zero);
+        CloudRemoteChange metadata = new("timestamp", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            creationTicket ? "remote-r1" : "remote-r2",
+            CloudItemKind.File, relative, identity.ItemId, previousRemoteRevision: "remote-r1",
+            metadata: CloudPlaceholderMetadata.CreateFileBuilder().WithLastWriteTime(timestamp).Build());
+        LocalChangeSourceEvent remote = await CaptureNativeModificationAsync(fixture.Root, relative, async () =>
+        {
+            CloudRemoteApplyResult passthrough = await fixture.System.ApplyRemoteChangesAsync(
+                new("timestamp-ticket-passthrough", Array.Empty<byte>(), [metadata], new byte[] { 2 }),
+                new() { SuppressLocalEcho = false }, deadline.Token);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(passthrough.Entries).Status);
+        }, deadline.Token);
+        Assert.Equal(timestamp.UtcDateTime, File.GetLastWriteTimeUtc(path));
+        await source.EmitAsync(remote);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+        const string genuine = "real local contents";
+        LocalChangeSourceEvent local = await CaptureNativeModificationAsync(fixture.Root, relative,
+            () => File.WriteAllTextAsync(path, genuine, deadline.Token), deadline.Token);
+        await source.EmitAsync(local);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 2);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        Assert.False(page.RequiresFullRescan);
+        Assert.Equal(2, page.Changes.Count);
+        Assert.All(page.Changes, row =>
+        {
+            Assert.Equal(identity.ItemId, row.ItemId);
+            Assert.Equal(CloudLocalChangeKind.ContentUpdate, row.Kind);
+        });
+        Assert.NotEqual(page.Changes[0].OperationId, page.Changes[1].OperationId);
+        Assert.Equal(genuine, await File.ReadAllTextAsync(path, deadline.Token));
+        await using ICloudStateTransaction read = await factory!.Store!.BeginTransactionAsync(deadline.Token);
+        CloudEchoSuppressionState? retained = await read.EchoSuppressions.GetAsync(originalTicket, deadline.Token);
+        if (creationTicket) { Assert.Equal(8, retained!.RemainingObservations); }
+        else { Assert.Null(retained); }
+        Assert.Equal(1, (await read.EchoSuppressions.GetAsync(unrelatedTicket, deadline.Token))!.RemainingObservations);
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Fact]
     public async Task NativeFileTimestampAndSameLengthDataWriteRetainTheirOriginalObservations()
     {
