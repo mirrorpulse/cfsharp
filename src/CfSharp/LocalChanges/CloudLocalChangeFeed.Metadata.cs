@@ -121,6 +121,8 @@ public sealed partial class CloudLocalChangeFeed
         RemoteMetadataIntent[] intents = await ReadMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
         if (intents.Any(intent => _metadataEchoAuthority?.IsApplying(intent.CallId) == true))
         { throw new InvalidOperationException("Finish the active remote metadata call before acknowledging reconciliation."); }
+        HashSet<string> retainedProjections = await RemoteMetadataProjection.ReadRetainedReceiptNamesAsync(
+            transaction.Checkpoints, cancellationToken).ConfigureAwait(false);
         // A scan cannot cover a remote call still in flight at admission. Retain its
         // receipts as well as completed grants whose window had not yet expired.
         IEnumerable<RemoteMetadataIntent> retired = intents.Where(intent => retainReceipt?.Invoke(intent) != true &&
@@ -134,14 +136,17 @@ public sealed partial class CloudLocalChangeFeed
                 RemoteMetadataIntent keep = history.FirstOrDefault(intent => !intent.Superseded) ?? history[0];
                 foreach (RemoteMetadataIntent intent in history)
                 {
-                    if (intent.Id != keep.Id) { await intent.RemoveAsync(transaction.Checkpoints, cancellationToken).ConfigureAwait(false); }
-                }
-                // A timeout is not origin evidence. Keep one retired marker per native
-                // generation/path so late callbacks cannot regain a false local association.
-                if (!keep.Reconciled || keep.RequiresReconciliation)
-                {
-                    RemoteMetadataIntent reconciled = keep with { Reconciled = true, RequiresReconciliation = false };
-                    await reconciled.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+                    if (intent.Id != keep.Id && !retainedProjections.Contains(intent.Name))
+                    {
+                        await intent.RemoveAsync(transaction.Checkpoints, cancellationToken).ConfigureAwait(false);
+                    }
+                    // Keep one historical marker per generation/path, plus any receipt
+                    // that still correlates an unsettled remote batch.
+                    else if (!intent.Reconciled || intent.RequiresReconciliation)
+                    {
+                        RemoteMetadataIntent reconciled = intent with { Reconciled = true, RequiresReconciliation = false };
+                        await reconciled.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+                    }
                 }
             }
         }
