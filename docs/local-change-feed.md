@@ -135,28 +135,52 @@ the retry must complete the drain and persist the fence before the store is clos
 ## Start one feed per sync root
 
 ```csharp
-CloudLocalChangeFeed feed = fileSystem.CreateLocalChangeFeed();
+await using CloudLocalChangeFeed feed = fileSystem.CreateLocalChangeFeed();
 await feed.StartAsync(cancellationToken);
+```
 
+Repeat the following step on the same feed. If an observation remains unresolved, retry once the
+application has enough evidence to settle it.
+
+```csharp
 CloudLocalChangeBatch batch = await feed.ReadBatchAsync(cancellationToken);
 if (batch.RequiresFullRescan)
 {
     CloudLocalChangeRescan rescan = feed.BeginFullRescan();
-    await ReconcileEntireSyncRootAsync(fileSystem, cancellationToken);
+    await ReconcileEntireSyncRootAndSaveResultAsync(fileSystem, cancellationToken);
     await feed.AcknowledgeFullRescanAsync(rescan, cancellationToken);
 }
 else
 {
-    await UploadLocalChangesAsync(batch.Changes, cancellationToken);
-    await feed.AcknowledgeAsync(
-        batch.Changes.Select(change => change.OperationId),
-        cancellationToken);
+    foreach (CloudLocalChange change in batch.Changes)
+    {
+        if (change.ItemId is null)
+        {
+            if (!await TrySettleUnboundObservationAsync(change, cancellationToken))
+            {
+                break;
+            }
+        }
+        else
+        {
+            await UploadLocalChangesAsync([change], cancellationToken);
+        }
+
+        await feed.AcknowledgeAsync([change.OperationId], cancellationToken);
+    }
 }
 ```
 
 The feed normalizes paths relative to the sync root, pairs renames, and persists the ordered
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
 only after the application has accepted the batch.
+After acknowledging a full rescan, read again. The original journal still includes unbound
+observations and may include notifications caused by remote writes. In the example, the
+application saves the reconciliation result before clearing the rescan requirement.
+`TrySettleUnboundObservationAsync` uses that result to decide what the original operation
+means. It can record a verified remote echo as handled, or process a verified local change
+against the resolved object. It returns success only after recording the decision durably
+for that `OperationId`. If the application cannot settle the observation, it remains pending.
 Path normalization tolerates a file or ancestor disappearing between its existence and link
 queries, as can happen when a queued notification names the old side of a rename. It does not
 turn that transient absence into a stopped feed or invent native mutation success. Existing
