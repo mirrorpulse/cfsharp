@@ -136,6 +136,67 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Fact]
+    public async Task FirstMetadataApplyRetainsCursorAndRecoveryWhenProjectedItemIsReplaced()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "native-projection-paused-after"));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        string originalPath = Path.Combine(fixture.Root, "Original");
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "batch-metadata-replacement", "remote-r0");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        CloudRemoteChange change = new("metadata", CloudRemoteChangeKind.MetadataUpdate, identity.RemoteId,
+            "remote-r1", CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r0",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder()
+                .WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build());
+        byte[] initialCursor = [7];
+        CloudRemoteChangeBatch batch = new("metadata-first-finalization", initialCursor, [change], new byte[] { 8 });
+        string projectionName = RemoteMetadataProjection.Name(batch, 0);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult> first = fixture.System.ApplyRemoteChangesAsync(batch, cancellationToken: deadline.Token).AsTask();
+        string replacementFile = Path.Combine(path, "local.txt");
+        const string replacementData = "replacement remains local";
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+            Directory.Move(path, originalPath);
+            Directory.CreateDirectory(path);
+            await File.WriteAllTextAsync(replacementFile, replacementData, deadline.Token);
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        await Assert.ThrowsAsync<IOException>(() => first);
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token))
+        {
+            CloudRemoteBatchState progress = (await transaction.RemoteBatches.GetAsync(batch.BatchId, deadline.Token))!;
+            Assert.Equal(0, progress.AppliedEntryCount);
+            Assert.Equal(initialCursor, progress.Cursor.ToArray());
+            RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(
+                (await transaction.Checkpoints.GetAsync(projectionName, deadline.Token))!);
+            Assert.Equal(identity.ItemId, projection.ItemId);
+            Assert.True(projection.ProjectedAtTicks > 0);
+            RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(
+                (await transaction.Checkpoints.GetAsync(projection.ReceiptName, deadline.Token))!);
+            Assert.False(intent.Completed);
+            Assert.Empty(await transaction.Conflicts.ListAsync(cancellationToken: deadline.Token));
+        }
+
+        await fixture.RestartAsync();
+        CloudRemoteApplyResult replay = await fixture.System.ApplyRemoteChangesAsync(batch, cancellationToken: deadline.Token);
+        Assert.True(replay.RequiresRetry);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Failed, Assert.Single(replay.Entries).Status);
+        Assert.Equal(initialCursor, replay.SafeCursor.ToArray());
+        Assert.Equal(replacementData, await File.ReadAllTextAsync(replacementFile, deadline.Token));
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        Assert.True(File.GetAttributes(originalPath).HasFlag(FileAttributes.Hidden));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
     public async Task DirectoryPassthroughWithholdsAnObservationReplacedDuringPublication()
     {
         MetadataFaultFactory? factory = null;

@@ -38,6 +38,8 @@ public sealed partial class CloudFileSystem
     /// prefix references a different item identity and requires explicit reconciliation.
     /// </exception>
     /// <exception cref="InvalidOperationException">The file system has not started.</exception>
+    /// <exception cref="IOException">Metadata outcome publication cannot verify the original
+    /// native object or its durable projection, or an I/O operation fails.</exception>
     /// <exception cref="CloudFilesException">Windows rejects a requested namespace mutation.</exception>
     /// <exception cref="OperationCanceledException">Cancellation was observed at a safe boundary.</exception>
     /// <remarks>
@@ -65,6 +67,8 @@ public sealed partial class CloudFileSystem
     /// preparation retained. Mismatched policy or preparation is rejected before progress changes.
     /// Storage failures during preparation reads or outcome publication propagate to the
     /// caller; replay rereads durable state, including when a commit completed before throwing.
+    /// A metadata update whose native object changes before outcome publication retains its
+    /// recovery evidence and the prior safe cursor.
     /// Cancellation after native success finishes item projection without cancellation and may
     /// leave outcome publication for replay. This protocol covers file moves submitted through
     /// this method; it cannot authenticate historical file moves without original evidence or
@@ -1599,9 +1603,10 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         string? metadataProjectionName = change.Kind == CloudRemoteChangeKind.MetadataUpdate
             ? RemoteMetadataProjection.Name(batch, appliedEntryCount - 1) : null;
-        using IDisposable? metadata = outcome.RecoveredMetadataProjection is null ? null :
-            await HoldRemoteMetadataOutcomeAsync(transaction, change, metadataProjectionName!, outcome,
-                cancellationToken).ConfigureAwait(false);
+        using IDisposable? metadata = metadataProjectionName is not null && outcome.Status == CloudRemoteApplyEntryStatus.Applied
+            ? await HoldRemoteMetadataOutcomeAsync(transaction, change, metadataProjectionName, outcome,
+                cancellationToken).ConfigureAwait(false)
+            : null;
         using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
             ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)
             : null;

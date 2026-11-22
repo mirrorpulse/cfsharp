@@ -68,10 +68,14 @@ For remote `MetadataUpdate`, the default feed policy retains uncertain attribute
 
 An in-place metadata update links its preparation to the immutable batch and entry. After
 Windows applies the change, the store records native completion before projecting the item
-revision. If projection rolls back, replay can repair the original item row and publish the
-outcome together after checking the retained native binding, identity and original official
-row. If only the outcome rolls back, replay verifies the already projected row. Both paths
-leave the native object untouched and retain the original echo-reconciliation policy.
+revision. Before first publishing `Applied`, CfSharp checks that the projected row and the
+original native object still agree. It holds the object and ancestor namespace guards through
+the outcome commit. If the object moved or was replaced, publication fails with the previous
+cursor and recovery evidence still durable. If projection rolls back, replay can repair the
+original item row and publish the outcome after checking the retained native binding, identity
+and original official row. If only the outcome rolls back, replay verifies the already projected
+row. Both paths leave the native object untouched and retain the original echo-reconciliation
+policy.
 If the evidence cannot be verified, the entry remains retryable at the same safe cursor.
 A failure that definitively precedes the native call can be attempted again after reconciliation.
 If native completion is unproven or the retained outcome can no longer be verified, finish
