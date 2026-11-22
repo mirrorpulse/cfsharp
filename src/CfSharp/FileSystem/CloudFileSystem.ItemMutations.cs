@@ -65,7 +65,11 @@ public sealed partial class CloudFileSystem
     internal async ValueTask<CloudPlaceholderMutationResult> UpdatePlaceholderAsync(
         CloudItem item,
         CloudPlaceholderPatch patch,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<CancellationToken, ValueTask<IDisposable>>? acquireUpdateGuard = null,
+        Action<nint>? verifyRemoteTarget = null,
+        Func<ValueTask>? recordNativeWrite = null,
+        Func<ICloudStateTransaction, DateTimeOffset, CancellationToken, ValueTask>? stageIdentityProjection = null)
     {
         ValidatePatch(item, patch);
         using CloudFileSystemOperationLease operation = await AcquireOperationAsync(
@@ -79,20 +83,27 @@ public sealed partial class CloudFileSystem
             throw new FileNotFoundException("The cloud item does not exist.", item.FullPath);
         }
 
-        long operationUsn = CloudPlaceholderMutationPlatform.Update(
-            item.FullPath,
-            patch,
-            before.Length ?? 0);
+        long operationUsn;
+        using (IDisposable? guard = acquireUpdateGuard is null ? null : await acquireUpdateGuard(cancellationToken).ConfigureAwait(false))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            operationUsn = CloudPlaceholderMutationPlatform.Update(item.FullPath, patch, verifyRemoteTarget);
+        }
         bool durableStateUpdated = patch.IdentityChange is not
             CloudPlaceholderIdentityChange.Unchanged;
         if (durableStateUpdated)
         {
             try
             {
+                // Native completion and official identity projection have independent
+                // durability boundaries. Keep completion visible if projection rolls back.
+                if (recordNativeWrite is not null) { await recordNativeWrite().ConfigureAwait(false); }
                 await PersistIdentityPatchAsync(
                     operation.StateStore,
                     item,
                     patch,
+                    requireCurrentOwner: verifyRemoteTarget is not null,
+                    stageIdentityProjection,
                     CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception exception)
@@ -229,7 +240,9 @@ public sealed partial class CloudFileSystem
         Action? validateBeforeCommit = null,
         Action? onCommitted = null,
         bool preserveExistingState = false,
-        long? observedLocalFileId = null)
+        long? observedLocalFileId = null,
+        bool requireCurrentOwner = false,
+        Func<ICloudStateTransaction, DateTimeOffset, CancellationToken, ValueTask>? stageIdentityProjection = null)
     {
         await using ICloudStateTransaction transaction = await stateStore
             .BeginTransactionAsync(cancellationToken)
@@ -237,6 +250,10 @@ public sealed partial class CloudFileSystem
         CloudItemState? existing = await transaction.Items
             .GetByRelativePathAsync(item.RelativePath, cancellationToken)
             .ConfigureAwait(false);
+        if (requireCurrentOwner && (existing is null || existing.IsTombstone || existing.ItemId != identity.ItemId))
+        {
+            throw new InvalidOperationException("The remote placeholder no longer owns its durable path.");
+        }
         if (preserveExistingState)
         {
             await ValidateProtectedLocalIdentityAsync(transaction, item, identity, cancellationToken).ConfigureAwait(false);
@@ -247,29 +264,43 @@ public sealed partial class CloudFileSystem
                 .ConfigureAwait(false);
         }
 
-        await transaction.Items.UpsertAsync(
-            new CloudItemState(
-                identity.ItemId,
-                identity.RemoteId,
-                item.RelativePath,
-                item.Kind,
-                preserveExistingState ? existing?.RemoteRevision : identity.RemoteRevision,
-                localFileId: preserveExistingState ? existing?.LocalFileId ?? observedLocalFileId : null,
-                isTombstone: false,
-                DateTimeOffset.UtcNow),
-            cancellationToken).ConfigureAwait(false);
-        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, item.SyncRootPath,
-            item.RelativePath, item.Kind, cancellationToken).ConfigureAwait(false);
+        DateTimeOffset projectedAt = DateTimeOffset.UtcNow;
+        await WriteIdentityProjectionAsync(transaction, item, identity,
+            preserveExistingState ? existing?.RemoteRevision : identity.RemoteRevision,
+            preserveExistingState ? existing?.LocalFileId ?? observedLocalFileId : null,
+            projectedAt, cancellationToken).ConfigureAwait(false);
+        if (stageIdentityProjection is not null)
+        { await stageIdentityProjection(transaction, projectedAt, cancellationToken).ConfigureAwait(false); }
         validateBeforeCommit?.Invoke();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         // Record success before transaction disposal, which can fail after a real commit.
         onCommitted?.Invoke();
     }
 
+    private static async ValueTask WriteIdentityProjectionAsync(ICloudStateTransaction transaction, CloudItem item,
+        CloudPlaceholderIdentity identity, string? remoteRevision, long? localFileId, DateTimeOffset projectedAt, CancellationToken cancellationToken)
+    {
+        await transaction.Items.UpsertAsync(
+            new CloudItemState(
+                identity.ItemId,
+                identity.RemoteId,
+                item.RelativePath,
+                item.Kind,
+                remoteRevision,
+                localFileId,
+                isTombstone: false,
+                projectedAt),
+            cancellationToken).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, item.SyncRootPath,
+            item.RelativePath, item.Kind, cancellationToken).ConfigureAwait(false);
+    }
+
     private static async ValueTask PersistIdentityPatchAsync(
         ICloudStateStore stateStore,
         CloudItem item,
         CloudPlaceholderPatch patch,
+        bool requireCurrentOwner,
+        Func<ICloudStateTransaction, DateTimeOffset, CancellationToken, ValueTask>? stageIdentityProjection,
         CancellationToken cancellationToken)
     {
         if (patch.IdentityChange is CloudPlaceholderIdentityChange.Replace)
@@ -278,7 +309,9 @@ public sealed partial class CloudFileSystem
                 stateStore,
                 item,
                 patch.ReplacementIdentity!,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                requireCurrentOwner: requireCurrentOwner,
+                stageIdentityProjection: stageIdentityProjection).ConfigureAwait(false);
             return;
         }
 

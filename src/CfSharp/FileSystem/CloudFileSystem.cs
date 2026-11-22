@@ -107,7 +107,9 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// reconciliation of <see cref="SyncRootPath"/>.
     /// </remarks>
     public CloudLocalChangeFeed CreateLocalChangeFeed(
-        CloudLocalChangeFeedOptions? options = null)
+        CloudLocalChangeFeedOptions? options = null) => CreateLocalChangeFeed(options, source: null);
+
+    internal CloudLocalChangeFeed CreateLocalChangeFeed(CloudLocalChangeFeedOptions? options, ILocalChangeSource? source)
     {
         lock (_localChangeFeedGate)
         {
@@ -117,7 +119,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                 _stateStore ?? throw new InvalidOperationException(
                     "The cloud file system has no open state store."),
                 options ?? CloudLocalChangeFeedOptions.Default,
-                new WindowsLocalChangeSource(
+                source ?? new WindowsLocalChangeSource(
                     SyncRootPath,
                     (options ?? CloudLocalChangeFeedOptions.Default).BufferCapacity),
                 disposedFeed =>
@@ -134,7 +136,8 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                     scopes, allowLocalChangeDrain: true, cancellationToken: cancellationToken).ConfigureAwait(false),
                 acquireAttributeOperation: async (scopes, cancellationToken) => await AcquireOperationCoreAsync(
                     scopes, allowLocalChangeDrain: true, protectNamespace: false,
-                    cancellationToken: cancellationToken).ConfigureAwait(false));
+                    cancellationToken: cancellationToken).ConfigureAwait(false),
+                metadataEchoAuthority: _metadataEchoAuthority);
         }
     }
 
@@ -258,6 +261,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
     /// </exception>
     /// <exception cref="ObjectDisposedException">The instance is stopping or disposed.</exception>
     /// <exception cref="OperationCanceledException">Startup was canceled before completion.</exception>
+    /// <exception cref="NotSupportedException">The official SQLite provider cannot enforce the required state schema.</exception>
     /// <exception cref="CloudFilesException">
     /// Windows rejects sync-root registration, lookup, or provider connection.
     /// </exception>
@@ -282,6 +286,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                     $"The sync-root directory does not exist: '{SyncRootPath}'.");
             }
 
+            SqliteStateStoreProtocol.EnsureCompatible(_stateStoreFactory);
             Volatile.Write(ref _state, (int)CloudFileSystemLifecycleState.Starting);
             ICloudStateStore? openedStore = null;
             ICloudFileSystemRuntimeSession? openedRuntimeSession = null;
@@ -296,6 +301,7 @@ public sealed partial class CloudFileSystem : IDisposable, IAsyncDisposable
                         "The state-store factory returned no store.");
                 }
 
+                SqliteStateStoreProtocol.EnsureCompatible(openedStore);
                 cancellationToken.ThrowIfCancellationRequested();
                 openedRuntimeSession = _runtime.Start(
                     SyncRootPath,

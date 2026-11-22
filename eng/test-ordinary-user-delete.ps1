@@ -25,13 +25,50 @@ $userName = 'CfSharp-' + $id.Substring(0, 8)
 $executionRoot = Join-Path $env:PUBLIC "CfSharpOrdinaryTests/$id"
 $suiteName = $Suite.ToLowerInvariant()
 $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversItsOwnReceiptsAcrossOfficialStoreReopen' }
-    elseif ($Suite -eq 'AccessJournal') { 'FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit' }
+    elseif ($Suite -eq 'AccessJournal') {
+        @('FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit',
+            'FullyQualifiedName~NativeFileTimestampAndSameLengthDataWriteRetainTheirOriginalObservations',
+            'FullyQualifiedName~UnconfirmedFileTimestampPassthroughRetainsItsDelayedNotification',
+            'FullyQualifiedName~ConfirmedFileTimestampPassthroughDoesNotUnbindLaterContent',
+            'FullyQualifiedName~FileMetadataPassthroughPreventsEarlierAutomaticTicketsFromConsumingContent',
+            'FullyQualifiedName~DirectoryAttributeHistoryFencesALateTimestampNotificationAtAReplacementFile',
+            'FullyQualifiedName~DelayedFileTimestampCannotBindToDirectoryAtTheSamePath',
+            'FullyQualifiedName~FreshFeedRetiresHistoricalFileTimestampBeforeARealContentWrite',
+            'FullyQualifiedName~RemoteDirectoryMetadataRequiresExplicitAttributeProvenance',
+            'FullyQualifiedName~NativeMetadataSharingFailureCannotAuthorizeSuppression',
+            'FullyQualifiedName~DefaultMetadataPolicyDoesNotInheritAnEarlierCoordinatedWindow',
+            'FullyQualifiedName~ProtectedUpsertCannotOverwriteAnUnreconciledAttributeEdit',
+            'FullyQualifiedName~ProtectedUpsertRequiresLiveMetadataCoordinationBeforeNotificationDelivery',
+            'FullyQualifiedName~ProtectedMetadataWriteRechecksCoordinationAfterPreparation',
+            'FullyQualifiedName~FullRescanAcknowledgementPreservesCoordinationThatExpiresWhileWaiting',
+            'FullyQualifiedName~StaleRescanAcknowledgementCannotClearANewMetadataReceipt',
+            'FullyQualifiedName~RescanAcknowledgementCannotClearNewMetadataEvidence',
+            'FullyQualifiedName~RemoteMetadataWritePreservesConcurrentReconciliation',
+            'FullyQualifiedName~RejectedPassthroughRetainsADelayedRemoteObservationUnboundAfterRescan',
+            'FullyQualifiedName~RemoteMetadataPublicationPreservesObservationsWithOverlappingTransactions',
+            'FullyQualifiedName~RemoteMetadataWriteRejectsAReplacementAfterPreparation',
+            'FullyQualifiedName~MetadataUpdateRejectsAnExplicitIdForADifferentItem',
+            'FullyQualifiedName~ExpiredMetadataCoordinationWakesIdleRead',
+            'FullyQualifiedName~InPlaceMetadataWriteReplacesTheEarlierCoordinatedPolicy',
+            'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes',
+            'FullyQualifiedName~MetadataOutcomeRollbackRecoversOnlyAnOriginalProjection',
+            'FullyQualifiedName~MetadataProjectionRollbackRepairsOriginalWriteWithoutMutatingAgain',
+            'FullyQualifiedName~KeepRemoteMetadataRecoversTheSameConflictWithoutRewritingThePlaceholder',
+            'FullyQualifiedName~KeepRemoteMetadataRetainsConflictWhenOriginalItemIsReplacedBeforeFinalization',
+            'FullyQualifiedName~FirstMetadataApplyRetainsCursorAndRecoveryWhenProjectedItemIsReplaced',
+            'FullyQualifiedName~UnprovenMetadataCompletionCanBeClosedWithoutRewritingAndResumeTheOriginalBatch',
+            'FullyQualifiedName~DirectoryPassthroughWithholdsAnObservationReplacedDuringPublication',
+            'FullyQualifiedName~MetadataPreparationFailureCanRetryAfterReconciliation',
+            'FullyQualifiedName~MetadataCancellationBeforePreparationDoesNotWaitForCleanup',
+            'FullyQualifiedName~AmbiguousMetadataCommitProtectsAnUnobservedNativeAttributeEdit',
+            'FullyQualifiedName~SegmentedPassthroughConfirmsOnlyAcknowledgedMetadataOutcomes') -join '|'
+    }
     elseif ($Suite -eq 'OfflineReference') { 'FullyQualifiedName~OfflinePlaceholderReferencesPreserveNativeStateInIndependentProcess' }
     elseif ($Suite -eq 'DeleteReconciliation') { 'FullyQualifiedName~LocalDeleteReconciliationRetainsAnOriginalConflictWithoutNativeWork' }
     elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
-    elseif ($Suite -in @('AccessJournal', 'DeleteReconciliation')) { 4 } else { 2 }
+    elseif ($Suite -eq 'AccessJournal') { 82 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null
@@ -62,8 +99,15 @@ try {
     Copy-Item -LiteralPath (Join-Path $repository 'CfSharp.sln'), (Join-Path $repository 'global.json') -Destination $executionRoot
     $childScript = Join-Path $executionRoot 'run-tests.ps1'
     @'
-param([string] $Assembly, [string] $Results, [string] $Dotnet, [string] $ExpectedSid, [string] $ExpectedArchitecture, [string] $Filter, [string] $SuiteName)
 $ErrorActionPreference = 'Stop'
+$configuration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'test-run.json') -Raw | ConvertFrom-Json
+$Assembly = $configuration.assembly
+$Results = $configuration.results
+$Dotnet = $configuration.dotnet
+$ExpectedSid = $configuration.expectedSid
+$ExpectedArchitecture = $configuration.expectedArchitecture
+$Filter = $configuration.filter
+$SuiteName = $configuration.suiteName
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -99,14 +143,19 @@ if ($LASTEXITCODE -ne 0) { throw 'The ordinary-user SDK host could not be inspec
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath $childScript -Encoding utf8
 
-    $assembly = Join-Path $executionRoot "tests/CfSharp.IntegrationTests/bin/$Configuration/net10.0-windows/CfSharp.IntegrationTests.dll"
     $results = Join-Path $executionRoot 'results'
-    $dotnet = (Get-Command dotnet -ErrorAction Stop).Source
-    # All quoted arguments are validated configuration, generated identifiers or Windows paths
-    # (which cannot contain a quote). No shell or credential text is interpolated into a command.
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', ('"{0}"' -f $childScript), '-Assembly', ('"{0}"' -f $assembly),
-        '-Results', ('"{0}"' -f $results), '-Dotnet', ('"{0}"' -f $dotnet), '-ExpectedSid', $account.SID.Value, '-ExpectedArchitecture', $env:RUNNER_ARCH,
-        '-Filter', ('"{0}"' -f $filter), '-SuiteName', $suiteName)
+    @{
+        assembly = Join-Path $executionRoot "tests/CfSharp.IntegrationTests/bin/$Configuration/net10.0-windows/CfSharp.IntegrationTests.dll"
+        results = $results
+        dotnet = (Get-Command dotnet -ErrorAction Stop).Source
+        expectedSid = $account.SID.Value
+        expectedArchitecture = $env:RUNNER_ARCH
+        filter = $filter
+        suiteName = $suiteName
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $executionRoot 'test-run.json') -Encoding utf8
+    # CreateProcessWithLogonW limits the full command line to 1024 characters. The test
+    # configuration is data, so growing a filter or path need not lengthen the command.
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', ('"{0}"' -f $childScript))
     $process = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList $arguments -Credential $credential `
         -LoadUserProfile -UseNewEnvironment -WorkingDirectory $executionRoot -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $executionRoot 'stdout.log') -RedirectStandardError (Join-Path $executionRoot 'stderr.log')

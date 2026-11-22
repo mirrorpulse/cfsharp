@@ -18,6 +18,8 @@
       href: local-change-feed.md
     - name: Remote change application
       href: remote-change-application.md
+    - name: Metadata echo coordination
+      href: metadata-echo-coordination.md
     - name: SQLite state store
       href: state-store-sqlite.md
     - name: CfSharp Sample

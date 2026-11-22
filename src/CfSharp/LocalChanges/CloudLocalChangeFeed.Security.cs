@@ -14,8 +14,30 @@ public sealed partial class CloudLocalChangeFeed
 
     private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
+    private static async ValueTask<StagedSecurityObservation> StageMetadataObservationAsync(ICloudStateTransaction transaction,
+        SecurityFeedProjection projection, CloudItemState owner, CloudItemPath path, LocalChangeSourceEvent sourceEvent,
+        Guid operationId, long observation, DateTimeOffset observedAt, LocalChangeCheckpoint checkpoint, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Keep the original unavailable until the binding has survived both commits.
+            byte[] receipt = new LocalChangePayload(path.RelativePath, null, owner.Kind == CloudItemKind.Directory, observedAt).Encode();
+            CloudOperationJournalEntry entry = new(operationId, CloudStateOperationKind.MetadataUpdate, owner.ItemId, receipt, observedAt);
+            await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), receipt, observedAt), cancellationToken).ConfigureAwait(false);
+            await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt, cancellationToken).ConfigureAwait(false);
+            projection.Validate();
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new(entry, projection, sourceEvent);
+        }
+        catch
+        {
+            projection.Dispose();
+            throw;
+        }
+    }
+
     private async ValueTask PublishValidatedSecurityObservationAsync(CloudOperationJournalEntry entry,
-        SecurityFeedProjection projection, CancellationToken cancellationToken)
+        SecurityFeedProjection projection, LocalChangeSourceEvent observation, CancellationToken cancellationToken)
     {
         string receipt = SecurityValidationName(entry.OperationId);
         CloudOperationJournalEntry? published = null;
@@ -25,6 +47,13 @@ public sealed partial class CloudLocalChangeFeed
             if (await transaction.Checkpoints.GetAsync(receipt, cancellationToken).ConfigureAwait(false) is not null)
             {
                 if (projection.AllowsRename) { projection.Validate(); }
+                if (await TrySuppressCoordinatedMetadataAsync(transaction, entry, observation, cancellationToken).ConfigureAwait(false))
+                {
+                    // A crash before this completed decision recovers the staged original ID.
+                    await transaction.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return;
+                }
                 published = await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
                 // A snapshot can change during CommitAsync. Keep its receipt atomically with
                 // the journal row: readers and ACK must withhold it until post-commit validation.
@@ -126,6 +155,12 @@ public sealed partial class CloudLocalChangeFeed
             LocalChangePayload payload = LocalChangePayload.Decode(receipt.Value);
             await RetainUnboundSecurityObservationAsync(transaction, operationId, receipt.Value, payload.ObservedAt,
                 cancellationToken).ConfigureAwait(false);
+            if (payload.IsDirectory)
+            {
+                CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(payload.RelativePath, cancellationToken).ConfigureAwait(false);
+                await RetainMetadataObservationProtectionAsync(transaction.Checkpoints, payload.RelativePath, owner,
+                    payload.ObservedAt, cancellationToken).ConfigureAwait(false);
+            }
             await transaction.Checkpoints.UpsertAsync(new(NamespaceObservationsPrefix + "/" + operationId.ToString("N"),
                 receipt.Value.Span, payload.ObservedAt), cancellationToken).ConfigureAwait(false);
         }
@@ -133,7 +168,8 @@ public sealed partial class CloudLocalChangeFeed
         return receipts.Count != 0;
     }
 
-    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection) : IDisposable
+    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection,
+        LocalChangeSourceEvent Observation) : IDisposable
     {
         public void Dispose() => Projection.Dispose();
     }

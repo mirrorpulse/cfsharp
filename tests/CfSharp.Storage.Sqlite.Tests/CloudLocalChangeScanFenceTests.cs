@@ -482,6 +482,7 @@ public sealed partial class CloudLocalChangeFeedTests
         internal Func<ValueTask>? BeforeBegin { get; set; }
         internal Func<ValueTask>? AfterRollback { get; set; }
         internal Func<ValueTask>? BeforeCommit { get; set; }
+        internal Action<string>? CheckpointPrefixRead { get; set; }
         public async ValueTask<ICloudStateTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
         {
             Func<ValueTask>? hook = BeforeBegin;
@@ -496,14 +497,30 @@ public sealed partial class CloudLocalChangeFeedTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class RaceTransaction(ICloudStateTransaction inner, RaceStore store) : ICloudStateTransaction
+    private sealed class RaceTransaction(ICloudStateTransaction inner, RaceStore store) : ICloudStateTransaction, ICloudCheckpointRepository
     {
         public ICloudItemStateRepository Items => inner.Items;
-        public ICloudCheckpointRepository Checkpoints => inner.Checkpoints;
+        public ICloudCheckpointRepository Checkpoints => store.CheckpointPrefixRead is null ? inner.Checkpoints : this;
         public ICloudOperationJournal Operations => inner.Operations;
         public ICloudConflictRepository Conflicts => inner.Conflicts;
         public ICloudRemoteBatchRepository RemoteBatches => inner.RemoteBatches;
         public ICloudEchoSuppressionRepository EchoSuppressions => inner.EchoSuppressions;
+
+        ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken) =>
+            inner.Checkpoints.GetAsync(name, cancellationToken);
+
+        ValueTask<IReadOnlyList<CloudStateCheckpoint>> ICloudCheckpointRepository.ListAsync(string namePrefix, CancellationToken cancellationToken)
+        {
+            store.CheckpointPrefixRead?.Invoke(namePrefix);
+            return inner.Checkpoints.ListAsync(namePrefix, cancellationToken);
+        }
+
+        ValueTask ICloudCheckpointRepository.UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken) =>
+            inner.Checkpoints.UpsertAsync(checkpoint, cancellationToken);
+
+        ValueTask ICloudCheckpointRepository.RemoveAsync(string name, CancellationToken cancellationToken) =>
+            inner.Checkpoints.RemoveAsync(name, cancellationToken);
+
         public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
         {
             Func<ValueTask>? hook = store.BeforeCommit;

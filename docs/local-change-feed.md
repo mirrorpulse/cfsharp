@@ -11,7 +11,11 @@ Security notifications bypass provider echo suppression. The existing path and o
 cannot establish that a provider write caused an independently reported DACL change.
 
 Attribute notifications follow the same identity validation, staging and reconciliation rules as
-security observations and also bypass provider echo suppression. Windows can report an attribute
+security observations and bypass path/kind suppression. Remote `MetadataUpdate` now defaults to
+retaining possible echoes as unbound metadata observations behind a reconciliation fence. Automatic
+attribute suppression requires the explicit caller guarantee described in
+[metadata echo coordination](metadata-echo-coordination.md). Security and data notifications bypass
+that authorization as well. Windows can report an attribute
 change during a rename without changing resident bytes. That observation remains metadata; the
 independent size, last-write and creation-time subscription still reports conservative content
 candidates, including same-length writes before, between or after successive renames. No content
@@ -131,27 +135,52 @@ the retry must complete the drain and persist the fence before the store is clos
 ## Start one feed per sync root
 
 ```csharp
-CloudLocalChangeFeed feed = fileSystem.CreateLocalChangeFeed();
+await using CloudLocalChangeFeed feed = fileSystem.CreateLocalChangeFeed();
 await feed.StartAsync(cancellationToken);
+```
 
+Repeat the following step on the same feed. If an observation remains unresolved, retry once the
+application has enough evidence to settle it.
+
+```csharp
 CloudLocalChangeBatch batch = await feed.ReadBatchAsync(cancellationToken);
 if (batch.RequiresFullRescan)
 {
-    await ReconcileEntireSyncRootAsync(fileSystem, cancellationToken);
-    await feed.AcknowledgeFullRescanAsync(cancellationToken);
+    CloudLocalChangeRescan rescan = feed.BeginFullRescan();
+    await ReconcileEntireSyncRootAndSaveResultAsync(fileSystem, cancellationToken);
+    await feed.AcknowledgeFullRescanAsync(rescan, cancellationToken);
 }
 else
 {
-    await UploadLocalChangesAsync(batch.Changes, cancellationToken);
-    await feed.AcknowledgeAsync(
-        batch.Changes.Select(change => change.OperationId),
-        cancellationToken);
+    foreach (CloudLocalChange change in batch.Changes)
+    {
+        if (change.ItemId is null)
+        {
+            if (!await TrySettleUnboundObservationAsync(change, cancellationToken))
+            {
+                break;
+            }
+        }
+        else
+        {
+            await UploadLocalChangesAsync([change], cancellationToken);
+        }
+
+        await feed.AcknowledgeAsync([change.OperationId], cancellationToken);
+    }
 }
 ```
 
 The feed normalizes paths relative to the sync root, pairs renames, and persists the ordered
 journal with its watcher checkpoint in one transaction. Acknowledgement advances durable progress
-only after the application has accepted the batch.
+for the operations the application has accepted.
+After acknowledging a full rescan, read again. The original journal still includes unbound
+observations and may include notifications caused by remote writes. In the example, the
+application saves the reconciliation result before clearing the rescan requirement.
+`TrySettleUnboundObservationAsync` uses that result to decide what the original operation
+means. It can record a verified remote echo as handled, or process a verified local change
+against the resolved object. It returns success only after recording the decision durably
+for that `OperationId`. If the application cannot settle the observation, it remains pending.
 Path normalization tolerates a file or ancestor disappearing between its existence and link
 queries, as can happen when a queued notification names the old side of a rename. It does not
 turn that transient absence into a stopped feed or invent native mutation success. Existing
@@ -224,9 +253,15 @@ the read, even when the worker commits the rescan marker before the reading tran
 The original journal remains pending until explicitly acknowledged after reconciliation.
 
 An overflow/error or a full-rescan acknowledgement invalidates previously captured scans even
-after the durable marker is cleared. Begin a new scan after recovery. If a new loss races
-`AcknowledgeFullRescanAsync`, it either rejects acknowledgement with `InvalidOperationException`
-or remains observable as a new rescan condition; finish reconciliation before retrying.
+after the durable marker is cleared. Capture a full-rescan boundary immediately before reconciling
+and pass it to `AcknowledgeFullRescanAsync`. New metadata evidence or a loss signal can
+invalidate the boundary, requiring a new boundary and reconciliation before retrying. Receipts
+from metadata calls still in flight when reconciliation starts remain pending.
+
+For remote metadata, the overload without a boundary uses the first rescan requirement delivered
+by a read since the previous acknowledgement. Later reads do not move that boundary. After a
+stale acknowledgement, read a fresh rescan requirement before rescanning. Use an explicit
+boundary when starting your own full rescan.
 
 ## Directory rename projection
 

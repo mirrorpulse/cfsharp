@@ -151,6 +151,18 @@ from the new creation receipts and preserve processed-conflict receipts. No priv
 editing or provider generation codec is required. See the remote-change guide for already affected
 preview.7 states and legacy preparations, which require explicit reconciliation.
 
+### Schema 10: remote metadata reconciliation
+
+The official SQLite store commits the schema 10 marker before it opens for application work.
+The upgrade preserves the existing tables, item rows, checkpoints, and journal entries. The marker
+protects durable remote metadata receipts and observations that require reconciliation, even before
+the feed starts or a watcher notification arrives. Preview.15 and other older SQLite providers
+reject schema 10 with `SqliteCloudStateStoreError.UnsupportedSchema`.
+
+Use matching core and SQLite packages. To roll back, restore the database backup taken before the
+upgrade together with its corresponding sync state. Custom stores must enforce the same protocol
+boundary before allowing older runtimes to open persistent state containing the new receipts.
+
 ### Original tombstone Delete rejection
 
 The explicit `ReconcileRemoteDeleteAsync` protocol uses existing schema-9 checkpoint, conflict

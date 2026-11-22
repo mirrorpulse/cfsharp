@@ -40,6 +40,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireOperation;
     private readonly Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? _acquireAttributeOperation;
     private readonly CloudSecurityInspection? _securityInspection;
+    private readonly CloudMetadataEchoAuthority? _metadataEchoAuthority;
     private readonly Channel<LocalChangeSourceEvent> _sourceEvents;
     private readonly Channel<bool> _availability = Channel.CreateUnbounded<bool>(
         new UnboundedChannelOptions
@@ -71,7 +72,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         Action<CloudLocalChangeFeed>? onDisposed = null,
         Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireOperation = null,
         CloudSecurityInspection? securityInspection = null,
-        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireAttributeOperation = null)
+        Func<IReadOnlyList<CloudItemOperationScope>, CancellationToken, ValueTask<IDisposable>>? acquireAttributeOperation = null,
+        CloudMetadataEchoAuthority? metadataEchoAuthority = null)
     {
         _syncRootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(syncRootPath));
         _stateStore = stateStore;
@@ -82,6 +84,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         _acquireOperation = acquireOperation;
         _acquireAttributeOperation = acquireAttributeOperation;
         _securityInspection = securityInspection;
+        _metadataEchoAuthority = metadataEchoAuthority;
         _sourceEvents = Channel.CreateBounded<LocalChangeSourceEvent>(
             new BoundedChannelOptions(options.BufferCapacity)
             {
@@ -181,12 +184,17 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         while (true)
         {
             ThrowIfFailed();
+            // Capture the deadline before reading the receipts. If another reader
+            // prunes the grant during this read, we still wake by its deadline.
+            long? metadataExpiration = _metadataEchoAuthority?.GetNextExpirationTimestamp();
             long generation = Volatile.Read(ref _persistedLossGeneration);
+            long acknowledgementGeneration = Volatile.Read(ref _rescanAcknowledgementGeneration);
             await using ICloudStateTransaction transaction = await _stateStore
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
                 .ConfigureAwait(false);
-            bool creation = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
+            bool recovery = await RequiresCreationReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false) ||
+                await RequiresMetadataReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
             int validatedCount = await ValidatedMetadataPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
@@ -195,11 +203,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
             // the durable boundary before reading so loss already pending at entry is also
             // retained across that handoff, rather than mistaken for part of this snapshot.
-            bool rescan = creation || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
+            bool rescan = recovery || checkpoint.RequiresFullRescan || HasUnpersistedLoss ||
                 generation != Volatile.Read(ref _lossGeneration);
-            if (rescan && (creation || operations.Count != 0 ||
+            if (rescan && (recovery || operations.Count != 0 ||
                 Interlocked.CompareExchange(ref _rescanNoticeDelivered, 1, 0) == 0))
             {
+                RememberObservedRescan(acknowledgementGeneration);
                 return new CloudLocalChangeBatch([], requiresFullRescan: true);
             }
 
@@ -210,7 +219,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
             try
             {
-                await _availability.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                await WaitForAvailabilityAsync(metadataExpiration, cancellationToken).ConfigureAwait(false);
             }
             catch (ChannelClosedException)
             {
@@ -268,6 +277,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             return;
         }
 
+        // A revision acknowledgement changes the same official row that remote
+        // metadata recovery verifies and repairs. Order these writes on custom stores too.
+        using IDisposable? publication = values.Any(value => value.RemoteRevision is not null)
+            ? await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false) : null;
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         foreach (CloudLocalChangeAcknowledgement acknowledgement in values)
@@ -316,17 +329,79 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// reconciliation of the sync root.
     /// </summary>
     /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
+    /// <remarks>
+    /// For remote metadata this overload uses the first rescan requirement delivered since the
+    /// last acknowledgement. After a stale acknowledgement, read a fresh rescan requirement
+    /// before rescanning. For a caller-initiated rescan, call <see cref="BeginFullRescan"/>
+    /// before scanning and acknowledge its returned boundary.
+    /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// The feed has not started or has stopped with a failure, a remote creation, file move or Delete
-    /// remains pending, a loss signal is not yet durable, or new loss raced this acknowledgement.
+    /// remains pending, a loss signal is not yet durable, or new loss or metadata evidence
+    /// invalidated the reconciliation boundary.
     /// Finish recovery and retry after the worker has persisted its signal.
     /// </exception>
-    public async ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default)
+    public ValueTask AcknowledgeFullRescanAsync(CancellationToken cancellationToken = default) =>
+        AcknowledgeFullRescanCoreAsync(Volatile.Read(ref _observedRescan), validateRescanLoss: false, cancellationToken);
+
+    /// <summary>Acknowledges a full rescan completed from the supplied reconciliation boundary.</summary>
+    /// <param name="rescan">The boundary captured by <see cref="BeginFullRescan"/> before reconciliation.</param>
+    /// <param name="cancellationToken">Token that cancels before the marker commit.</param>
+    /// <remarks>
+    /// Only the feed that created the boundary can accept it. A new loss signal, another
+    /// acknowledgement, or new metadata evidence can invalidate it. Receipts from calls
+    /// in flight and grants still valid when reconciliation started remain protected.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The boundary is null.</exception>
+    /// <exception cref="ArgumentException">The boundary belongs to another feed lifetime.</exception>
+    /// <exception cref="InvalidOperationException">The boundary is stale, recovery is pending, or the feed is not running.</exception>
+    /// <exception cref="ObjectDisposedException">The feed has been disposed.</exception>
+    public ValueTask AcknowledgeFullRescanAsync(CloudLocalChangeRescan rescan, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(rescan);
+        if (rescan.StoreScope != _scanScope)
+        {
+            throw new ArgumentException("The rescan belongs to another feed lifetime.", nameof(rescan));
+        }
+        return AcknowledgeFullRescanCoreAsync(rescan, validateRescanLoss: true, cancellationToken);
+    }
+
+    private async ValueTask AcknowledgeFullRescanCoreAsync(CloudLocalChangeRescan? rescan, bool validateRescanLoss,
+        CancellationToken cancellationToken)
     {
         EnsureStarted();
-        long generation = Volatile.Read(ref _lossGeneration);
+        // Legacy readers can report an overflow before its marker becomes durable.
+        // The metadata generation below separately protects changes to receipts.
+        long generation = validateRescanLoss ? rescan!.LossGeneration : Volatile.Read(ref _lossGeneration);
+        CloudLocalChangeRescan boundary = rescan ?? CaptureRescanBoundary();
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        if (boundary.MetadataGeneration != _metadataEchoAuthority?.ReconciliationGeneration)
+        {
+            if (!validateRescanLoss && rescan is not null)
+            {
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_observedRescan, rescan))
+                    {
+                        Volatile.Write(ref _observedRescan, null);
+                        Volatile.Write(ref _rescanNoticeDelivered, 0);
+                    }
+                }
+            }
+            throw new InvalidOperationException("Metadata reconciliation changed after the rescan boundary. Repeat reconciliation from a new boundary.");
+        }
+        if (rescan is not null && boundary.AcknowledgementGeneration != Volatile.Read(ref _rescanAcknowledgementGeneration))
+        {
+            throw new InvalidOperationException("Another acknowledgement ended this rescan boundary. Begin a new full rescan.");
+        }
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        if (rescan is null && _metadataEchoAuthority is not null &&
+            ((await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.PendingPrefix, cancellationToken).ConfigureAwait(false)).Count != 0 ||
+             (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.PendingObservationPrefix, cancellationToken).ConfigureAwait(false)).Count != 0))
+        {
+            throw new InvalidOperationException("Capture a boundary with BeginFullRescan before reconciling pending remote metadata.");
+        }
         IReadOnlyList<CloudStateCheckpoint> creations = await transaction.Checkpoints
             .ListAsync(RemoteCreationIntent.Prefix, cancellationToken).ConfigureAwait(false);
         if (creations.Count != 0 ||
@@ -334,6 +409,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             (await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false)).Count != 0)
         {
             throw new InvalidOperationException("Replay pending remote creations, moves and deletions before acknowledging reconciliation.");
+        }
+        await ClearReconciledMetadataIntentsAsync(transaction, boundary.RetainReceipt, cancellationToken).ConfigureAwait(false);
+        foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
+            .ListAsync(RemoteMetadataIntent.PendingObservationPrefix, cancellationToken).ConfigureAwait(false))
+        {
+            await transaction.Checkpoints.RemoveAsync(observation.Name, cancellationToken).ConfigureAwait(false);
         }
 
         foreach (CloudStateCheckpoint observation in await transaction.Checkpoints
@@ -368,7 +449,11 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         // Full reconciliation establishes a new consumer boundary even when pending creation
         // recovery cleared its records before this feed read them. Pre-reconciliation scans must
         // not resume after an acknowledgement makes the durable marker disappear.
-        Interlocked.Increment(ref _rescanAcknowledgementGeneration);
+        lock (_gate)
+        {
+            Interlocked.Increment(ref _rescanAcknowledgementGeneration);
+            Volatile.Write(ref _observedRescan, null);
+        }
         Volatile.Write(ref _rescanNoticeDelivered, 0);
     }
 
@@ -380,6 +465,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// <param name="expiresAt">UTC time after which the suppression is ignored.</param>
     /// <param name="itemId">Known item identity, when available.</param>
     /// <param name="cancellationToken">Token that cancels before the suppression commits.</param>
+    /// <exception cref="NotSupportedException">Metadata suppression requires an explicit remote attribute provenance policy.</exception>
     public async ValueTask SuppressProviderEchoAsync(
         CloudStateOperationKind kind,
         string relativePath,
@@ -410,7 +496,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     /// Number of matching watcher observations to consume before the suppression is removed.
     /// </param>
     /// <param name="cancellationToken">Token that cancels before the suppression commits.</param>
-    /// <remarks>Independent Windows security notifications do not consume these records.</remarks>
+    /// <remarks>
+    /// Independent Windows security and attribute notifications do not consume path/kind tickets.
+    /// For remote metadata, use <see cref="CloudRemoteApplyOptions.AttributeEchoPolicy"/> and its
+    /// explicit caller-coordination contract. Existing metadata tickets never authorize suppression.
+    /// </remarks>
+    /// <exception cref="NotSupportedException"><paramref name="kind"/> is metadata.</exception>
     public async ValueTask SuppressProviderEchoAsync(
         CloudStateOperationKind kind,
         string relativePath,
@@ -421,6 +512,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureStarted();
+        if (kind == CloudStateOperationKind.MetadataUpdate)
+        { throw new NotSupportedException("Metadata echo suppression requires CloudRemoteApplyOptions.AttributeEchoPolicy and its explicit provenance contract."); }
         CloudItemPath path = CloudItemPathResolver.Resolve(_syncRootPath, relativePath, allowRoot: false);
         CloudItemPath? previousPath = previousRelativePath is null
             ? null
@@ -694,7 +787,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     CloudLocalChangeKind.ContentUpdate,
                     sourceEvent.RelativePath,
                     previousRelativePath: null,
-                    cancellationToken, classifyModified: true).ConfigureAwait(false);
+                    cancellationToken).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
             case LocalChangeSourceAction.AttributesModified:
@@ -723,8 +816,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         string relativePath,
         string? previousRelativePath,
         CancellationToken cancellationToken,
-        LocalChangeSourceEvent? securityObservation = null,
-        bool classifyModified = false)
+        LocalChangeSourceEvent? securityObservation = null)
     {
         CloudItemPath path;
         try
@@ -738,6 +830,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // A path query can lose access without invalidating the root subscription.
             // Fence delivery for reconciliation before accepting another observation. The
             // catch covers only resolution; durable-store failures must still stop the worker.
+            if (kind == CloudLocalChangeKind.ContentUpdate &&
+                await TryRetainUnresolvedTimeObservationAsync(relativePath, cancellationToken).ConfigureAwait(false))
+            { return; }
             await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -757,13 +852,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
                 return;
             }
-        }
-
-        if (classifyModified)
-        {
-            // Resolve once before classifying. A separate preliminary walk could fail outside
-            // the recovery boundary, or disagree with the path validated for persistence.
-            kind = Directory.Exists(path.FullPath) ? CloudLocalChangeKind.MetadataUpdate : CloudLocalChangeKind.ContentUpdate;
         }
 
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
@@ -787,6 +875,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Reuse the observation identity whether the original transaction rolled back
             // or staged the observation before a late native check failed.
             SignalLoss();
+            if (kind == CloudLocalChangeKind.ContentUpdate && exception.IsDirectory)
+            { kind = CloudLocalChangeKind.MetadataUpdate; }
             await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
                 cancellationToken, securityObservation).ConfigureAwait(false);
         }
@@ -808,10 +898,30 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
     }
 
+    private async ValueTask<bool> TryRetainUnresolvedTimeObservationAsync(string relativePath, CancellationToken cancellationToken)
+    {
+        CloudItemPath path;
+        try { path = CloudItemPathResolver.ResolveLexically(_syncRootPath, relativePath, allowRoot: false); }
+        catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
+        { return false; }
+        await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if ((await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
+                    cancellationToken).ConfigureAwait(false)).Count == 0 &&
+                await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
+                    cancellationToken).ConfigureAwait(false) is null)
+            { return false; }
+        }
+        await PersistChangeAttemptAsync(CloudLocalChangeKind.ContentUpdate, path, null, Guid.NewGuid(),
+            DateTimeOffset.UtcNow, uncertainDirectory: false, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     private async ValueTask PersistChangeAttemptAsync(CloudLocalChangeKind kind, CloudItemPath path,
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
         CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
     {
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         StagedSecurityObservation? staged = null;
         try
         {
@@ -824,7 +934,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             if (staged is not null)
             {
                 staged.Projection.Validate();
-                await PublishValidatedSecurityObservationAsync(staged.Entry, staged.Projection, cancellationToken).ConfigureAwait(false);
+                await PublishValidatedSecurityObservationAsync(staged.Entry, staged.Projection, staged.Observation, cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -861,6 +971,44 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
+        bool uncertainFileContent = false;
+        if (kind == CloudLocalChangeKind.ContentUpdate)
+        {
+            // The generic action describes a historical path. Read its watcher-lifetime
+            // history before using the current native kind to classify the notification.
+            bool historicalFile = (await transaction.Checkpoints.ListAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
+                cancellationToken).ConfigureAwait(false)).Count != 0;
+            bool historicalDirectory = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
+                cancellationToken).ConfigureAwait(false) is not null;
+            if (!historicalFile && uncertainDirectory is null && Directory.Exists(path.FullPath))
+            {
+                kind = CloudLocalChangeKind.MetadataUpdate;
+            }
+            else
+            {
+                uncertainFileContent = historicalFile || historicalDirectory;
+            }
+        }
+        bool metadataObservation = kind == CloudLocalChangeKind.MetadataUpdate &&
+            securityObservation?.Action != LocalChangeSourceAction.SecurityModified;
+        bool genericDirectoryMetadata = metadataObservation && securityObservation is null;
+        RemoteMetadataIntent[] metadataIntents = genericDirectoryMetadata
+            ? await ReadMetadataObservationIntentsAsync(transaction, path.RelativePath, current?.ItemId, cancellationToken).ConfigureAwait(false)
+            : [];
+        if (!genericDirectoryMetadata && (metadataObservation || uncertainFileContent) && current is not null)
+        {
+            metadataIntents = (await ReadMetadataIntentsAsync(transaction, cancellationToken, current.ItemId).ConfigureAwait(false))
+                .Where(intent => securityObservation?.SecurityIdentity is not { } identity || intent.Matches(identity, intent.ItemId) ||
+                    ((intent.Binding is null || (intent.RequiresReconciliation && !intent.Reconciled)) && intent.Covers(path.RelativePath))).ToArray();
+        }
+        // A path-only event from a retired item cannot redeem its successor's authority.
+        // The same official ID can also have more than one native generation at this path.
+        bool ambiguousDirectoryGeneration = genericDirectoryMetadata &&
+            (uncertainDirectory is not null || metadataIntents.Any(intent => intent.ItemId != current?.ItemId) ||
+             metadataIntents.Where(intent => intent.Covers(path.RelativePath)).Select(intent => intent.Binding).Distinct().Skip(1).Any());
+        bool canPassThrough = metadataIntents.Any(intent => intent.IsConfirmedPassthrough);
+        bool pendingMetadata = uncertainFileContent || ambiguousDirectoryGeneration || metadataIntents.Length != 0 && (metadataIntents.Any(NeedsMetadataReconciliation) ||
+            (!canPassThrough && !metadataIntents.Any(intent => OwnsMetadataObservation(intent, securityObservation, current?.ItemId))));
         // A delayed observation may arrive after a remote Delete's terminal commit consumed
         // its preparation. Never resurrect that historical identity for a replacement at the
         // same path. Retain the observation without assigning an identity until reconciliation.
@@ -877,23 +1025,56 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Neither historical endpoint can establish the replacement's current ownership.
             uncertainDirectory ??= (previous ?? current)?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath);
         }
-        if (pendingCreation || pendingMove || pendingDelete || supersededDelete || (tombstonedGeneration && kind != CloudLocalChangeKind.Move))
+        bool pendingNamespace = pendingCreation || pendingMove || pendingDelete || supersededDelete ||
+            (tombstonedGeneration && kind != CloudLocalChangeKind.Move);
+        if (!pendingNamespace && !pendingMetadata && genericDirectoryMetadata && canPassThrough)
+        {
+            SecurityFeedProjection? projection = uncertainDirectory is null ? CaptureDirectoryPassthroughOwner(path, current, metadataIntents) : null;
+            if (projection is not null)
+            {
+                return await StageMetadataObservationAsync(transaction, projection, current!, path,
+                    new(LocalChangeSourceAction.Modified, path.RelativePath), operationId, observation, observedAt, checkpoint,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            ambiguousDirectoryGeneration = true;
+            pendingMetadata = true;
+        }
+        if (pendingNamespace || pendingMetadata)
         {
             long generation = SignalLoss();
             // Do not assign or relocate a local identity while native remote work is pending. Retain
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
-            LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
-                uncertainDirectory ?? (securityObservation is { } security
+            bool directoryObservation = !uncertainFileContent && (uncertainDirectory ?? (securityObservation is { } security
                     ? security.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory
-                    : Directory.Exists(path.FullPath)), observedAt);
-            if (securityObservation is not null)
+                    : Directory.Exists(path.FullPath)));
+            LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath, directoryObservation, observedAt);
+            if (uncertainFileContent)
+            {
+                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.ContentUpdate, null,
+                    uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+            }
+            else if (securityObservation is not null || pendingMetadata)
             {
                 await RetainUnboundSecurityObservationAsync(transaction, operationId, uncertain.Encode(), observedAt,
                     cancellationToken).ConfigureAwait(false);
             }
+            if (uncertainFileContent || ambiguousDirectoryGeneration)
+            {
+                await RetainMetadataObservationProtectionAsync(transaction.Checkpoints, path.RelativePath, current, observedAt,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            if (pendingMetadata)
+            {
+                _metadataEchoAuthority?.TrackReconciliationChange();
+                foreach (RemoteMetadataIntent intent in metadataIntents)
+                {
+                    RemoteMetadataIntent retained = intent with { RequiresReconciliation = true, Reconciled = false };
+                    await retained.PersistAsync(transaction.Checkpoints, observedAt, cancellationToken).ConfigureAwait(false);
+                }
+            }
             await transaction.Checkpoints.UpsertAsync(new CloudStateCheckpoint(
-                (pendingMove || pendingDelete || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + operationId.ToString("N"),
+                (pendingMove || pendingDelete || pendingMetadata || tombstonedGeneration || supersededDelete ? NamespaceObservationsPrefix : RemoteCreationIntent.ObservationsPrefix) + "/" + kind + "/" + operationId.ToString("N"),
                 uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
             await UpsertCheckpointAsync(transaction, observation, true, observedAt, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -909,26 +1090,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     attributeObservation: securityEvent.Action == LocalChangeSourceAction.AttributesModified) : null;
             if (projection is not null)
             {
-                try
-                {
-                    // A committed receipt stays outside the journal until the post-commit
-                    // check succeeds. Security retains native guards; attributes retain an
-                    // identity snapshot and reopen the path without locking a pending rename.
-                    LocalChangePayload bound = new(path.RelativePath, null, current!.Kind == CloudItemKind.Directory, observedAt);
-                    byte[] receipt = bound.Encode();
-                    CloudOperationJournalEntry boundEntry = new(operationId, CloudStateOperationKind.MetadataUpdate, current.ItemId, receipt, observedAt);
-                    await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), receipt, observedAt),
-                        cancellationToken).ConfigureAwait(false);
-                    await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt, cancellationToken).ConfigureAwait(false);
-                    projection.Validate();
-                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                    return new(boundEntry, projection);
-                }
-                catch
-                {
-                    projection.Dispose();
-                    throw;
-                }
+                return await StageMetadataObservationAsync(transaction, projection, current!, path, securityEvent,
+                    operationId, observation, observedAt, checkpoint, cancellationToken).ConfigureAwait(false);
             }
 
             // Independent native subscriptions have no common delivery order. A historical
@@ -971,9 +1134,17 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         {
             IReadOnlyList<CloudEchoSuppressionState> suppressions = await transaction.EchoSuppressions
                 .ListActiveAsync(observedAt, cancellationToken).ConfigureAwait(false);
-            suppression = suppressions.FirstOrDefault(candidate => RemoteCreationIntent.IsCreationEcho(candidate)
-                ? MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
-                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId));
+            // Creation tickets also match ContentUpdate for the original identity. A
+            // same-revision passthrough write can leave that exact identity in place.
+            bool bypassCreationContentEcho = operationKind == CloudStateOperationKind.ContentUpdate &&
+                observedState is { Kind: CloudItemKind.File, IsTombstone: false } &&
+                suppressions.Any(candidate => candidate.ItemId == observedState.ItemId && RemoteCreationIntent.IsCreationEcho(candidate) &&
+                    CloudDirectoryStateProjection.SamePath(candidate.RelativePath, path.RelativePath)) &&
+                (await ReadMetadataIntentsAsync(transaction, cancellationToken, observedState.ItemId).ConfigureAwait(false))
+                    .Any(intent => intent.Passthrough && !intent.Superseded && intent.Covers(path.RelativePath));
+            suppression = suppressions.FirstOrDefault(candidate => candidate.Kind != CloudStateOperationKind.MetadataUpdate && (RemoteCreationIntent.IsCreationEcho(candidate)
+                ? !bypassCreationContentEcho && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
+                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)));
         }
 
         if (suppression is not null)
@@ -1136,6 +1307,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
     private async ValueTask MarkRescanRequiredAsync(CancellationToken cancellationToken)
     {
         long generation = SignalLoss();
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
@@ -1200,6 +1372,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask LoadCheckpointAsync(CancellationToken cancellationToken)
     {
+        using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         // Negotiate before recovery or source opening, and again on publication transactions.
@@ -1207,9 +1380,17 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         RequireJournalAssociationUpdates(transaction);
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
-        if (await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false))
+        (bool metadataChanged, bool metadataRequiresReconciliation) =
+            await RecoverMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        (bool retiredTimeMarkers, bool timeMarkersRequireReconciliation) = await RetireTimeObservationsBeforeStartingAsync(transaction.Checkpoints,
+            cancellationToken).ConfigureAwait(false);
+        bool recoveredObservations = await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        if (recoveredObservations || metadataRequiresReconciliation || timeMarkersRequireReconciliation)
         {
             await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        }
+        if (recoveredObservations || metadataChanged || metadataRequiresReconciliation || retiredTimeMarkers)
+        {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         else

@@ -1,13 +1,22 @@
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+
+using CfSharp.Native;
+
+using Microsoft.Win32.SafeHandles;
 
 namespace CfSharp;
 
 public sealed partial class CloudFileSystem
 {
     private const int RemoteConflictEnvelopeVersion = 1;
+    private const string RemoteEchoPayloadPrefix = "remote-change/v1|";
+    private static readonly byte[] s_remoteEchoPayloadPrefix = Encoding.UTF8.GetBytes(RemoteEchoPayloadPrefix);
     private readonly SemaphoreSlim _remoteApplyGate = new(1, 1);
+    private readonly CloudMetadataEchoAuthority _metadataEchoAuthority = new();
+    private CloudMetadataEchoAuthority.Call? _metadataEchoCall;
 
     /// <summary>
     /// Applies an immutable application-supplied remote change batch to this sync root.
@@ -29,6 +38,8 @@ public sealed partial class CloudFileSystem
     /// prefix references a different item identity and requires explicit reconciliation.
     /// </exception>
     /// <exception cref="InvalidOperationException">The file system has not started.</exception>
+    /// <exception cref="IOException">Metadata outcome publication cannot verify the original
+    /// native object or its durable projection, or an I/O operation fails.</exception>
     /// <exception cref="CloudFilesException">Windows rejects a requested namespace mutation.</exception>
     /// <exception cref="OperationCanceledException">Cancellation was observed at a safe boundary.</exception>
     /// <remarks>
@@ -56,6 +67,8 @@ public sealed partial class CloudFileSystem
     /// preparation retained. Mismatched policy or preparation is rejected before progress changes.
     /// Storage failures during preparation reads or outcome publication propagate to the
     /// caller; replay rereads durable state, including when a commit completed before throwing.
+    /// A metadata update whose native object changes before outcome publication retains its
+    /// recovery evidence and the prior safe cursor.
     /// Cancellation after native success finishes item projection without cancellation and may
     /// leave outcome publication for replay. This protocol covers file moves submitted through
     /// this method; it cannot authenticate historical file moves without original evidence or
@@ -81,8 +94,19 @@ public sealed partial class CloudFileSystem
                     cancellationToken)
                 .ConfigureAwait(false);
             operation.EstablishContext();
-            return await ApplyRemoteChangesCoreAsync(batch, options, cancellationToken)
-                .ConfigureAwait(false);
+            CloudMetadataEchoAuthority.Call metadataCall = _metadataEchoAuthority.Begin();
+            _metadataEchoCall = metadataCall;
+            CloudRemoteApplyOptions? coordinatedOptions = null;
+            try
+            {
+                CloudRemoteApplyResult result = await ApplyRemoteChangesCoreAsync(batch, options, cancellationToken).ConfigureAwait(false);
+                if (result.Status == CloudRemoteBatchStatus.Applied && !result.RequiresRetry)
+                {
+                    coordinatedOptions = options ?? CloudRemoteApplyOptions.Default;
+                }
+                return result;
+            }
+            finally { await EndRemoteMetadataCallAsync(operation.StateStore, metadataCall, coordinatedOptions).ConfigureAwait(false); }
         }
         finally
         {
@@ -213,6 +237,11 @@ public sealed partial class CloudFileSystem
                     status,
                     cancellationToken)
                 .ConfigureAwait(false);
+            // Confirmation requires both a native write and a successful outcome commit.
+            if (outcome.Status == CloudRemoteApplyEntryStatus.Applied && outcome.RecoveredMetadataProjection is null)
+            {
+                _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
+            }
             results.Add(new CloudRemoteApplyEntryResult(
                 change.ChangeId,
                 outcome.Status,
@@ -246,9 +275,12 @@ public sealed partial class CloudFileSystem
     /// object retained by default preservation. Native identity, sealed evidence and final
     /// transaction checks still apply, but user-mode deletion does not exclude concurrent
     /// external attribute writes. The conflict is removed only after validated completion.
+    /// For a metadata update, retry KeepRemote with the same conflict identifier to
+    /// settle a verified native write without changing the placeholder again. If the
+    /// outcome cannot be verified, reconcile the root before dismissing the conflict.
     /// Calls serialize on this file-system instance; no ownership of caller resources changes.
-    /// LocalDeleteReconciliationRequired conflicts always remain Conflict for every decision:
-    /// they authorize metadata rejection only. Explicit dismissal is the non-destructive close.
+    /// Delete and metadata reconciliation conflicts remain Conflict for every decision.
+    /// Explicit dismissal closes these records after application reconciliation.
     /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
@@ -266,8 +298,10 @@ public sealed partial class CloudFileSystem
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             operation.EstablishContext();
-            return await ResolveRemoteConflictCoreAsync(conflictId, resolution, cancellationToken)
-                .ConfigureAwait(false);
+            CloudMetadataEchoAuthority.Call metadataCall = _metadataEchoAuthority.Begin();
+            _metadataEchoCall = metadataCall;
+            try { return await ResolveRemoteConflictCoreAsync(conflictId, resolution, cancellationToken).ConfigureAwait(false); }
+            finally { await EndRemoteMetadataCallAsync(operation.StateStore, metadataCall).ConfigureAwait(false); }
         }
         finally
         {
@@ -289,10 +323,10 @@ public sealed partial class CloudFileSystem
         ArgumentNullException.ThrowIfNull(resolution);
         (CloudRemoteConflict conflict, CloudConflictState durableState) =
             await ReadRemoteConflictAsync(conflictId, cancellationToken).ConfigureAwait(false);
-        if (conflict.Reason == CloudRemoteConflictReason.LocalDeleteReconciliationRequired)
+        if (conflict.Reason is CloudRemoteConflictReason.LocalDeleteReconciliationRequired or
+            CloudRemoteConflictReason.RemoteMetadataReconciliationRequired)
         {
-            // This receipt authorizes rejection only. A later occupant must never inherit
-            // destructive authority through a delayed KeepRemote or KeepBoth decision.
+            // Delayed conflict resolution cannot re-execute an uncertain native operation.
             return new(conflict.Change.ChangeId, CloudRemoteApplyEntryStatus.Conflict, conflict);
         }
         if (resolution.Decision is CloudRemoteConflictDecision.Defer or
@@ -325,12 +359,15 @@ public sealed partial class CloudFileSystem
         RemoteChangeRequest? deleteRequest = retry.Kind == CloudRemoteChangeKind.Delete
             ? new(new CloudRemoteChangeBatch("cfsharp.resolve-delete/" + conflictId.ToString("N"), ReadOnlyMemory<byte>.Empty, [retry], ReadOnlyMemory<byte>.Empty), 0, resolutionOptions)
             : null;
+        string? metadataProjectionName = retry.Kind == CloudRemoteChangeKind.MetadataUpdate
+            ? RemoteMetadataProjection.ConflictName(conflictId) : null;
         RemoteEntryOutcome outcome = await ApplyRemoteEntryCoreAsync(
                 retry,
                 resolutionOptions,
                 cancellationToken,
                 deleteRequest,
-                new(conflict.Change, resolution.Decision))
+                new(conflict.Change, resolution.Decision),
+                metadataProjectionName)
             .ConfigureAwait(false);
         if (outcome.Status is not CloudRemoteApplyEntryStatus.Applied)
         {
@@ -340,31 +377,44 @@ public sealed partial class CloudFileSystem
                 outcome.Conflict);
         }
 
-        await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
+        using IDisposable? publication = outcome.MetadataIntent is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        await using (ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
-        using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
-            ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
-            : null;
-        using RemoteCreationOutcomeLease? creation = retry.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
-            ? await HoldRemoteCreationOutcomeAsync(transaction, conflict.Change, cancellationToken).ConfigureAwait(false) : null;
-        if (deleteRequest is not null && deleteParents is not null)
+            .ConfigureAwait(false))
         {
-            await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+            using IDisposable? metadata = metadataProjectionName is null ? null :
+                await HoldRemoteMetadataOutcomeAsync(transaction, retry, metadataProjectionName, outcome,
+                    cancellationToken).ConfigureAwait(false);
+            using RemoteNamespaceParentLease? deleteParents = deleteRequest is not null
+                ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, deleteRequest.Batch, 0, cancellationToken).ConfigureAwait(false)
+                : null;
+            using RemoteCreationOutcomeLease? creation = retry.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert
+                ? await HoldRemoteCreationOutcomeAsync(transaction, conflict.Change, cancellationToken).ConfigureAwait(false) : null;
+            if (deleteRequest is not null && deleteParents is not null)
+            {
+                await ValidateRemoteDeleteOutcomeAsync(transaction, deleteRequest.Batch, 0, deleteParents.Parents, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
                 .ConfigureAwait(false);
+            if (deleteRequest is not null)
+            {
+                await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
+            }
+            if (metadataProjectionName is not null)
+            {
+                await transaction.Checkpoints.RemoveAsync(metadataProjectionName, cancellationToken).ConfigureAwait(false);
+            }
+            if (creation is not null)
+            {
+                await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(conflict.Change), cancellationToken).ConfigureAwait(false);
+                creation.Validate();
+            }
+            await CompleteRemoteMetadataIntentAsync(transaction, outcome, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
-        await transaction.Conflicts.RemoveAsync(durableState.ConflictId, cancellationToken)
-            .ConfigureAwait(false);
-        if (deleteRequest is not null)
-        {
-            await transaction.Checkpoints.RemoveAsync(RemoteDeleteIntent.Name(deleteRequest.Batch.BatchId, 0), cancellationToken).ConfigureAwait(false);
-        }
-        if (creation is not null)
-        {
-            await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(conflict.Change), cancellationToken).ConfigureAwait(false);
-            creation.Validate();
-        }
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _metadataEchoCall?.RecordCommittedOutcome(outcome.MetadataIntent);
         return new CloudRemoteApplyEntryResult(
             conflict.Change.ChangeId,
             CloudRemoteApplyEntryStatus.Applied);
@@ -559,8 +609,21 @@ public sealed partial class CloudFileSystem
         CloudRemoteApplyOptions options,
         CancellationToken cancellationToken,
         RemoteChangeRequest? request = null,
-        RemoteCreationResolution? creationResolution = null)
+        RemoteCreationResolution? creationResolution = null,
+        string? conflictMetadataProjectionName = null)
     {
+        string? metadataProjectionName = conflictMetadataProjectionName;
+        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && request is not null)
+        {
+            metadataProjectionName = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
+        }
+        if (metadataProjectionName is not null && (creationResolution is null || conflictMetadataProjectionName is not null))
+        {
+            RemoteEntryOutcome? recovered = await RecoverRemoteMetadataAsync(change, metadataProjectionName,
+                conflictMetadataProjectionName is not null, cancellationToken).ConfigureAwait(false);
+            if (recovered is not null) { return recovered; }
+        }
+
         if (change.Kind == CloudRemoteChangeKind.Delete && request is not null)
         {
             RemoteDeleteIntent? pending = await ReadRemoteDeleteIntentAsync(request, cancellationToken).ConfigureAwait(false);
@@ -589,11 +652,12 @@ public sealed partial class CloudFileSystem
 
         RemoteEntryContext context = await ReadRemoteEntryContextAsync(change, cancellationToken)
             .ConfigureAwait(false);
-        if (change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert &&
-            ((change.ItemId is Guid explicitId && context.LocalState is not null &&
-                context.LocalState.ItemId != explicitId) ||
-            (context.ByItemId is not null && context.ByItemId.RemoteId != change.RemoteId) ||
-            (context.LocalState is not null && context.LocalState.Kind != change.ItemKind)))
+        bool upsert = change.Kind is CloudRemoteChangeKind.FileUpsert or CloudRemoteChangeKind.DirectoryUpsert;
+        bool explicitIdMismatch = change.ItemId is Guid explicitId && context.LocalState is { } resolved &&
+            resolved.ItemId != explicitId;
+        if (((upsert || change.Kind == CloudRemoteChangeKind.MetadataUpdate) && explicitIdMismatch) ||
+            (upsert && ((context.ByItemId is not null && context.ByItemId.RemoteId != change.RemoteId) ||
+                (context.LocalState is not null && context.LocalState.Kind != change.ItemKind))))
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(
                 change, context.LocalState, CloudRemoteConflictReason.PathCollision));
@@ -638,6 +702,12 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.PathCollision));
         }
 
+        if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && request is not null && creationResolution is null &&
+            context.LocalState is { } metadataOwner && metadataOwner.RemoteRevision == change.RemoteRevision)
+        {
+            await RequireCorrelatedRemoteMetadataProjectionAsync(change, metadataOwner.ItemId, cancellationToken).ConfigureAwait(false);
+        }
+
         if (change.PreviousRemoteRevision is not null &&
             (context.LocalState is null || !string.Equals(
                 context.LocalState.RemoteRevision,
@@ -650,8 +720,6 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.StaleRemoteRevision));
         }
 
-        bool upsert = change.Kind is CloudRemoteChangeKind.FileUpsert or
-            CloudRemoteChangeKind.DirectoryUpsert;
         if (options.PreserveUnsynchronizedLocalContent &&
             context.LocalState is not null && context.LocalOperations.Count != 0)
         {
@@ -683,21 +751,38 @@ public sealed partial class CloudFileSystem
                 CloudRemoteConflictReason.Move));
         }
 
-        Guid itemId = change.ItemId ?? context.LocalState?.ItemId ?? Guid.NewGuid();
+        Guid itemId = context.LocalState?.ItemId ?? change.ItemId ?? Guid.NewGuid();
         bool localExists = change.ItemKind is CloudItemKind.Directory
             ? Directory.Exists(ToFullPath(change.RelativePath))
             : File.Exists(ToFullPath(change.RelativePath));
+        CloudLocalFileBinding? metadataBinding = null;
+        IReadOnlyList<RemoteMetadataIntent> metadataGrants = [];
         if (context.LocalState is not null && localExists)
         {
             CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
             CloudItemSnapshot snapshot = await item.InspectAsync(cancellationToken)
                 .ConfigureAwait(false);
+            metadataBinding = snapshot.LocalBinding;
             if (!snapshot.IsPlaceholder)
             {
                 return RemoteEntryOutcome.ConflictResult(CreateConflict(
                     change,
                     context.LocalState,
                     CloudRemoteConflictReason.Content));
+            }
+
+            // All update variants can write attributes. Consult the durable attribution
+            // evidence even if the watcher has not published an observation yet.
+            if (options.PreserveUnsynchronizedLocalContent)
+            {
+                await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                (bool requiresReconciliation, IReadOnlyList<RemoteMetadataIntent> grants) = await ReadRemoteMetadataProtectionAsync(
+                    transaction, itemId, change.RelativePath, metadataBinding, preparation: null, cancellationToken).ConfigureAwait(false);
+                if (requiresReconciliation)
+                {
+                    return RemoteEntryOutcome.ConflictResult(CreateConflict(change, context.LocalState, CloudRemoteConflictReason.Metadata));
+                }
+                metadataGrants = grants;
             }
 
             if (options.PreserveUnsynchronizedLocalContent &&
@@ -712,11 +797,6 @@ public sealed partial class CloudFileSystem
             }
         }
 
-        CloudStateOperationKind suppressionKind = context.LocalState is null || !localExists
-            ? CloudStateOperationKind.Create
-            : change.Kind is CloudRemoteChangeKind.MetadataUpdate
-                ? CloudStateOperationKind.MetadataUpdate
-                : CloudStateOperationKind.ContentUpdate;
         if (!upsert && (context.LocalState is null || !localExists))
         {
             return RemoteEntryOutcome.ConflictResult(CreateConflict(
@@ -735,14 +815,20 @@ public sealed partial class CloudFileSystem
         // without mutating the namespace. A conflict must not leave behind a
         // record that could consume an unrelated future local observation.
         Guid? suppressionId = null;
+        RemoteMetadataIntent? metadataIntent = null;
+        bool metadataPreparationCommitStarted = false;
+        bool nativeMetadataAttempted = false;
         try
         {
-            if (options.SuppressLocalEcho)
+            metadataIntent = await PrepareRemoteMetadataIntentAsync(change, itemId, metadataBinding, options, metadataProjectionName,
+                () => metadataPreparationCommitStarted = true, cancellationToken)
+                .ConfigureAwait(false);
+            if (upsert && options.SuppressLocalEcho)
             {
                 suppressionId = await RegisterRemoteEchoSuppressionAsync(
                         change,
                         itemId,
-                        suppressionKind,
+                        CloudStateOperationKind.ContentUpdate,
                         options,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -755,21 +841,50 @@ public sealed partial class CloudFileSystem
             }
             else
             {
-                await UpdateRemotePlaceholderAsync(change, context.LocalState!, options, cancellationToken)
+                CloudPlaceholderMutationResult updated = await UpdateRemotePlaceholderAsync(
+                    change, context.LocalState!, options, metadataBinding, metadataIntent, metadataGrants, metadataProjectionName,
+                    () => nativeMetadataAttempted = true, cancellationToken)
                     .ConfigureAwait(false);
+                if (metadataIntent is not null && (metadataIntent.Binding is null || updated.Snapshot.LocalBinding != metadataIntent.Binding))
+                { metadataIntent = metadataIntent with { RequiresReconciliation = true }; }
+                if (metadataIntent is { Coordinated: true, RequiresReconciliation: false, Binding: { } completedBinding })
+                { _metadataEchoCall?.Record(metadataIntent.ItemId, completedBinding); }
             }
         }
-        catch
+        catch (Exception exception)
         {
+            if (metadataProjectionName is not null && metadataPreparationCommitStarted && !nativeMetadataAttempted)
+            {
+                // A failed preparation commit can itself be durable. Look it up even
+                // when preparation did not return an intent to this call.
+                try
+                {
+                    if (await RecordUnattemptedRemoteMetadataAsync(metadataProjectionName).ConfigureAwait(false))
+                    { metadataIntent = null; }
+                }
+                catch (Exception cleanup)
+                {
+                    exception.Data["CfSharp.RemoteMetadataPreparationCleanup"] = cleanup;
+                    ExceptionDispatchInfo.Throw(exception);
+                }
+            }
             if (suppressionId is Guid registeredSuppressionId)
             {
                 await RemoveRemoteEchoSuppressionAsync(registeredSuppressionId).ConfigureAwait(false);
             }
 
+            if (exception is RemotePlaceholderWriteConflictException conflict)
+            {
+                // Preserve reconciliation evidence when the final guard rejects a prepared write.
+                return RemoteEntryOutcome.ConflictResult(CreateConflict(change, context.LocalState, conflict.Reason)) with
+                {
+                    MetadataIntent = metadataIntent is null ? null : metadataIntent with { RequiresReconciliation = true },
+                };
+            }
             throw;
         }
 
-        return RemoteEntryOutcome.AppliedResult;
+        return RemoteEntryOutcome.AppliedResult with { MetadataIntent = metadataIntent };
     }
 
     private async ValueTask<RemoteEntryOutcome> ApplyRemoteMoveAsync(
@@ -966,7 +1081,7 @@ public sealed partial class CloudFileSystem
                 itemId,
                 kind,
                 change.RelativePath,
-                Encoding.UTF8.GetBytes($"remote-change/v1|{change.ChangeId}"),
+                Encoding.UTF8.GetBytes(RemoteEchoPayloadPrefix + change.ChangeId),
                 DateTimeOffset.UtcNow + options.EchoSuppressionLifetime,
                 change.PreviousRelativePath,
                 options.EchoSuppressionObservationCount),
@@ -1022,10 +1137,15 @@ public sealed partial class CloudFileSystem
         await parent.CreatePlaceholderAsync(directory, cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask UpdateRemotePlaceholderAsync(
+    private async ValueTask<CloudPlaceholderMutationResult> UpdateRemotePlaceholderAsync(
         CloudRemoteChange change,
         CloudItemState localState,
         CloudRemoteApplyOptions options,
+        CloudLocalFileBinding? metadataBinding,
+        RemoteMetadataIntent? metadataIntent,
+        IReadOnlyList<RemoteMetadataIntent> metadataGrants,
+        string? metadataProjectionName,
+        Action recordNativeAttempt,
         CancellationToken cancellationToken)
     {
         CloudPlaceholderIdentity identity = new(
@@ -1061,7 +1181,325 @@ public sealed partial class CloudFileSystem
         }
 
         CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
-        await item.UpdatePlaceholderAsync(builder.Build(), cancellationToken).ConfigureAwait(false);
+        return await UpdatePlaceholderAsync(item, builder.Build(), cancellationToken,
+            options.PreserveUnsynchronizedLocalContent
+                ? token => GuardRemotePlaceholderWriteAsync(change, localState.ItemId, metadataBinding, metadataIntent, token)
+                : null,
+            handle =>
+            {
+                using SafeFileHandle reference = new(handle, ownsHandle: false);
+                LocalCloudItemInspection target = CloudItemInspector.Inspect(reference, item.FullPath, item.Kind, SyncRootPath);
+                if (target.LocalBinding != metadataBinding ||
+                    !CloudPlaceholderIdentity.TryDecode(target.PlaceholderIdentity, out CloudPlaceholderIdentity? identity) ||
+                    identity.ItemId != localState.ItemId ||
+                    !CloudDirectoryStateProjection.SamePath(WindowsFileMetadata.ReadFinalPath(handle), item.FullPath))
+                {
+                    throw new RemotePlaceholderWriteConflictException(CloudRemoteConflictReason.PathCollision);
+                }
+                if (options.PreserveUnsynchronizedLocalContent && target.SynchronizationState == CloudSynchronizationState.NotInSync)
+                {
+                    throw new RemotePlaceholderWriteConflictException(change.Kind == CloudRemoteChangeKind.MetadataUpdate
+                        ? CloudRemoteConflictReason.Metadata : CloudRemoteConflictReason.Content);
+                }
+                if (metadataGrants.Any(grant => !_metadataEchoAuthority.IsAuthorized(grant)))
+                {
+                    throw new RemotePlaceholderWriteConflictException(CloudRemoteConflictReason.Metadata);
+                }
+                recordNativeAttempt();
+            },
+            metadataProjectionName is not null && metadataIntent is not null
+                ? () => RecordRemoteMetadataNativeWriteAsync(metadataProjectionName, metadataIntent)
+                : null,
+            metadataProjectionName is not null && metadataIntent is not null
+                ? (transaction, projectedAt, token) => StageRemoteMetadataProjectionAsync(transaction, metadataProjectionName,
+                    metadataIntent, projectedAt, token)
+                : null).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IDisposable> GuardRemotePlaceholderWriteAsync(CloudRemoteChange change, Guid itemId,
+        CloudLocalFileBinding? binding, RemoteMetadataIntent? preparation, CancellationToken cancellationToken)
+    {
+        IDisposable publication = await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
+            if (owner is null || owner.IsTombstone || owner.ItemId != itemId)
+            {
+                throw new RemotePlaceholderWriteConflictException(CloudRemoteConflictReason.PathCollision);
+            }
+            (bool requiresReconciliation, _) = await ReadRemoteMetadataProtectionAsync(transaction, itemId, change.RelativePath,
+                binding, preparation, cancellationToken).ConfigureAwait(false);
+            if (requiresReconciliation)
+            {
+                throw new RemotePlaceholderWriteConflictException(CloudRemoteConflictReason.Metadata);
+            }
+            IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations.ListByItemIdAsync(
+                itemId, maximumCount: 1, cancellationToken).ConfigureAwait(false);
+            if (operations.Count != 0)
+            {
+                throw new RemotePlaceholderWriteConflictException(change.Kind == CloudRemoteChangeKind.MetadataUpdate
+                    ? CloudRemoteConflictReason.Metadata : CloudRemoteConflictReason.Content);
+            }
+            return publication;
+        }
+        catch
+        {
+            publication.Dispose();
+            throw;
+        }
+    }
+
+    private async ValueTask<RemoteMetadataIntent?> PrepareRemoteMetadataIntentAsync(CloudRemoteChange change,
+        Guid itemId, CloudLocalFileBinding? binding, CloudRemoteApplyOptions options, string? metadataProjectionName,
+        Action recordPreparationCommit, CancellationToken cancellationToken)
+    {
+        bool passthrough = !options.SuppressLocalEcho;
+        bool coordinated = !passthrough && options.AttributeEchoPolicy == CloudRemoteAttributeEchoPolicy.CallerCoordinated;
+        using IDisposable publication = await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
+        await using ICloudStateTransaction preparation = await _stateStore!.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CloudStateCheckpoint> checkpoints = await preparation.Checkpoints.ListAsync(
+            RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
+        RemoteMetadataIntent[] previousIntents = checkpoints.Select(RemoteMetadataIntent.Decode)
+            .Where(intent => intent.Covers(change.RelativePath) || (binding is not null && intent.Binding == binding))
+            .ToArray();
+        Guid callId = _metadataEchoCall?.Id ?? Guid.NewGuid();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        bool retainTimeHistory = change.ItemKind == CloudItemKind.Directory ||
+            (change.Kind == CloudRemoteChangeKind.MetadataUpdate && !passthrough &&
+             (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue));
+        if (retainTimeHistory)
+        {
+            // A directory's generic notification does not carry the cause or generation.
+            // Even an attribute-only update needs history if a file later occupies the path.
+            // Keep markers from calls that can still write into a replacement watcher.
+            string timeObservation = change.ItemKind == CloudItemKind.Directory
+                ? RemoteMetadataIntent.DirectoryTimeObservationName(change.RelativePath)
+                : RemoteMetadataIntent.FileTimeObservationName(change.RelativePath);
+            await preparation.Checkpoints.UpsertAsync(new(timeObservation, callId.ToByteArray(), now),
+                cancellationToken).ConfigureAwait(false);
+        }
+        // Unrelated default upserts keep their existing echo handling. An upsert with
+        // attribution history must establish its own policy before writing attributes.
+        if (change.Kind != CloudRemoteChangeKind.MetadataUpdate && !passthrough && !coordinated && previousIntents.Length == 0)
+        {
+            if (retainTimeHistory)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _metadataEchoCall?.TrackPreparation();
+                await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            return null;
+        }
+
+        RemoteMetadataIntent intent = new(Guid.NewGuid(), callId, itemId,
+            change.RelativePath, binding, coordinated, Completed: false)
+        { Passthrough = passthrough };
+        HashSet<string>? retainedProjections = previousIntents.Length == 0 ? null :
+            await RemoteMetadataProjection.ReadRetainedReceiptNamesAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
+        if (passthrough && change.ItemKind == CloudItemKind.File)
+        {
+            if (change.Kind == CloudRemoteChangeKind.MetadataUpdate &&
+                (change.Metadata!.CreationTime.HasValue || change.Metadata.LastWriteTime.HasValue))
+            {
+                // Only confirmation of this write can retire its marker. A later
+                // confirmed write cannot account for an earlier queued notification.
+                await preparation.Checkpoints.UpsertAsync(new(intent.ProvisionalFileTimeObservationName, callId.ToByteArray(), now),
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            // These provider-issued upsert tickets can match file Modified events
+            // without a native identity check. Revoke them in the same transaction
+            // that switches policy, before the native write can queue a notification.
+            // A queued observation can carry a time earlier than this switch.
+            IReadOnlyList<CloudEchoSuppressionState> tickets = await preparation.EchoSuppressions
+                .ListActiveAsync(DateTimeOffset.MinValue, cancellationToken).ConfigureAwait(false);
+            foreach (CloudEchoSuppressionState ticket in tickets)
+            {
+                if (ticket.ItemId == itemId && ticket.Kind == CloudStateOperationKind.ContentUpdate &&
+                    ticket.Payload.Span.StartsWith(s_remoteEchoPayloadPrefix))
+                {
+                    await preparation.EchoSuppressions.RemoveAsync(ticket.SuppressionId, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+        foreach (RemoteMetadataIntent previous in previousIntents)
+        {
+            // Keep unresolved observations and other generations for reconciliation,
+            // while revoking any earlier permission before the native write.
+            bool replaceable = previous.Reconciled || previous.IsConfirmedPassthrough ||
+                _metadataEchoAuthority.IsAuthorized(previous) ||
+                (previous.CallId == intent.CallId && !previous.UsesReconciliationPolicy &&
+                    !previous.RequiresReconciliation && !previous.Superseded);
+            bool replacesPriorReceipt = previous.Completed && replaceable && !previous.RequiresReconciliation && previous.Binding == binding;
+            if (replacesPriorReceipt && previous.Covers(change.RelativePath) && retainedProjections?.Contains(previous.Name) != true)
+            {
+                await previous.RemoveAsync(preparation.Checkpoints, cancellationToken).ConfigureAwait(false);
+            }
+            else if (!previous.Superseded)
+            {
+                // After a move, retire replaceable evidence but keep its historical path.
+                // The new preparation protects the same binding and the native guard still
+                // checks the original grant's expiry before attempting the write.
+                RemoteMetadataIntent superseded = previous with
+                {
+                    Superseded = true,
+                    Reconciled = previous.Reconciled || replacesPriorReceipt,
+                };
+                await superseded.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        await intent.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
+        if (metadataProjectionName is not null)
+        {
+            CloudItemState? original = await preparation.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
+            if (original is null || original.IsTombstone || original.ItemId != itemId)
+            { throw MetadataProjectionUnresolved(change, "the original official item is unavailable"); }
+            RemoteMetadataProjection projection = new(itemId, intent.Id, ProjectedAtTicks: 0,
+                OriginalRowFingerprint: RemoteMetadataProjection.Fingerprint(original));
+            await preparation.Checkpoints.UpsertAsync(projection.ToCheckpoint(metadataProjectionName, now), cancellationToken).ConfigureAwait(false);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        _metadataEchoCall?.TrackPreparation();
+        recordPreparationCommit();
+        await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return intent;
+    }
+
+    private static async ValueTask CompleteRemoteMetadataIntentAsync(ICloudStateTransaction transaction,
+        RemoteEntryOutcome outcome, CancellationToken cancellationToken)
+    {
+        if (outcome.MetadataIntent is { } intent)
+        {
+            RemoteMetadataIntent retained = await ReadPreparedRemoteMetadataIntentAsync(transaction, intent, cancellationToken).ConfigureAwait(false);
+
+            // The feed can record a local observation after preparation commits.
+            // Complete the retained receipt and merge any uncertainty found during the native update.
+            // Completion shares the outcome commit. A failed/ambiguous commit cannot grant
+            // authority: activation also requires this public call to return successfully.
+            RemoteMetadataIntent completed = retained with
+            {
+                Completed = true,
+                NativeWriteApplied = outcome.Status == CloudRemoteApplyEntryStatus.Applied,
+                RequiresReconciliation = retained.RequiresReconciliation || intent.RequiresReconciliation,
+            };
+            await completed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async ValueTask<RemoteMetadataIntent> ReadPreparedRemoteMetadataIntentAsync(
+        ICloudStateTransaction transaction, RemoteMetadataIntent intent, CancellationToken cancellationToken)
+    {
+        CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(intent.Name, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("The prepared remote metadata receipt is missing.");
+        RemoteMetadataIntent retained = RemoteMetadataIntent.Decode(checkpoint);
+        if (retained.Name != intent.Name || retained.CallId != intent.CallId || retained.Completed ||
+            retained.RelativePath != intent.RelativePath || retained.Binding != intent.Binding ||
+            retained.Coordinated != intent.Coordinated || retained.Passthrough != intent.Passthrough)
+        {
+            throw new InvalidDataException("The prepared remote metadata receipt changed before completion.");
+        }
+        return retained;
+    }
+
+    private async ValueTask<(bool RequiresReconciliation, IReadOnlyList<RemoteMetadataIntent> Grants)> ReadRemoteMetadataProtectionAsync(
+        ICloudStateTransaction transaction, Guid itemId, string path, CloudLocalFileBinding? binding,
+        RemoteMetadataIntent? preparation, CancellationToken cancellationToken)
+    {
+        if (await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationPathName(path), cancellationToken).ConfigureAwait(false) is not null ||
+            await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.PendingObservationItemName(itemId), cancellationToken).ConfigureAwait(false) is not null)
+        { return (true, []); }
+        if (preparation is not null)
+        {
+            RemoteMetadataIntent retained = await ReadPreparedRemoteMetadataIntentAsync(transaction, preparation, cancellationToken).ConfigureAwait(false);
+            if (retained.RequiresReconciliation || retained.Reconciled || retained.Superseded) { return (true, []); }
+        }
+        IReadOnlyList<CloudStateCheckpoint> checkpoints = await transaction.Checkpoints.ListAsync(
+            RemoteMetadataIntent.ItemPrefix(itemId), cancellationToken).ConfigureAwait(false);
+        List<RemoteMetadataIntent> grants = [];
+        foreach (CloudStateCheckpoint checkpoint in checkpoints)
+        {
+            RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
+            bool sameObject = binding is not null && intent.Binding == binding;
+            if (intent.Id == preparation?.Id || intent.Reconciled || (!intent.Covers(path) && !sameObject)) { continue; }
+
+            // The declared writer guarantee covers entries in the current call. A
+            // later call needs a live grant even when the earlier outcome was confirmed.
+            bool currentCall = intent.CallId == _metadataEchoCall?.Id;
+            bool lostCoordination = intent.Coordinated && (!sameObject || intent.Superseded ||
+                (!currentCall && !_metadataEchoAuthority.IsAuthorized(intent)));
+            if (intent.RequiresReconciliation || intent.UsesReconciliationPolicy || lostCoordination ||
+                (intent.HasUnconfirmedOutcome && !currentCall))
+            {
+                return (true, []);
+            }
+            if (intent.Coordinated && !currentCall) { grants.Add(intent); }
+        }
+        return (false, grants);
+    }
+
+    private sealed class RemotePlaceholderWriteConflictException(CloudRemoteConflictReason reason) : Exception
+    {
+        internal CloudRemoteConflictReason Reason { get; } = reason;
+    }
+
+    private async ValueTask EndRemoteMetadataCallAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call,
+        CloudRemoteApplyOptions? coordinatedOptions = null)
+    {
+        using IDisposable? publication = call.HasMetadataPreparation
+            ? await _metadataEchoAuthority.AcquirePublicationAsync(CancellationToken.None).ConfigureAwait(false) : null;
+        try
+        {
+            await ConfirmRemoteMetadataOutcomesAsync(store, call).ConfigureAwait(false);
+            if (coordinatedOptions is not null) { call.Authorize(coordinatedOptions); }
+        }
+        finally
+        {
+            _metadataEchoCall = null;
+            call.Dispose();
+            // A preparation commit can throw before any native call runs. Wake a legacy reader
+            // even when no watcher event will arrive. Readers check retained evidence directly.
+            if (call.HasMetadataPreparation) { Volatile.Read(ref _localChangeFeed)?.NotifyRemoteMetadataCallEnded(); }
+        }
+    }
+
+    private static async ValueTask ConfirmRemoteMetadataOutcomesAsync(ICloudStateStore store, CloudMetadataEchoAuthority.Call call)
+    {
+        if (call.CommittedOutcomes.Count == 0) { return; }
+        try
+        {
+            await using ICloudStateTransaction transaction = await store.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
+            foreach (RemoteMetadataIntent outcome in call.CommittedOutcomes)
+            {
+                if (outcome.CallId != call.Id) { continue; }
+                CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(outcome.Name, CancellationToken.None).ConfigureAwait(false);
+                if (checkpoint is not null)
+                {
+                    RemoteMetadataIntent intent = RemoteMetadataIntent.Decode(checkpoint);
+                    if (intent.CallId != call.Id || !intent.NativeWriteApplied) { continue; }
+                    RemoteMetadataIntent confirmed = intent with { OutcomeConfirmed = true };
+                    await confirmed.PersistAsync(transaction.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None).ConfigureAwait(false);
+                }
+                // Another entry in this call can replace the canonical receipt.
+                // The committed outcome still confirms its own marker and records
+                // any native binding uncertainty separately from feed observations.
+                if (outcome.Passthrough && !outcome.RequiresReconciliation)
+                {
+                    await transaction.Checkpoints.RemoveAsync(outcome.ProvisionalFileTimeObservationName,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            // The apply outcome already returned successfully from its commit. Failure to
+            // record that confirmation leaves the feed conservative, without failing the apply.
+            System.Diagnostics.Activity? activity = CloudDiagnostics.StartActivity(
+                "cfsharp.remote-metadata.outcome-confirmation", "remote-metadata.outcome-confirmation");
+            CloudDiagnostics.RecordException(activity, exception);
+            CloudDiagnostics.StopActivity(activity, "failed");
+        }
     }
 
     private string ToFullPath(string relativePath) =>
@@ -1158,9 +1596,17 @@ public sealed partial class CloudFileSystem
                 $"Remote batch '{batch.BatchId}' cannot publish an incomplete applied state.");
         }
 
+        using IDisposable? publication = outcome.MetadataIntent is null ? null :
+            await _metadataEchoAuthority.AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         await using ICloudStateTransaction transaction = await (_stateStore ?? throw new InvalidOperationException(
                 "The cloud file system has no open state store.")).BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        string? metadataProjectionName = change.Kind == CloudRemoteChangeKind.MetadataUpdate
+            ? RemoteMetadataProjection.Name(batch, appliedEntryCount - 1) : null;
+        using IDisposable? metadata = metadataProjectionName is not null && outcome.Status == CloudRemoteApplyEntryStatus.Applied
+            ? await HoldRemoteMetadataOutcomeAsync(transaction, change, metadataProjectionName, outcome,
+                cancellationToken).ConfigureAwait(false)
+            : null;
         using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
             ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)
             : null;
@@ -1209,6 +1655,11 @@ public sealed partial class CloudFileSystem
                 batch.Fingerprint.Span, DateTimeOffset.UtcNow), cancellationToken).ConfigureAwait(false);
         }
         await transaction.RemoteBatches.UpsertAsync(next, cancellationToken).ConfigureAwait(false);
+        await CompleteRemoteMetadataIntentAsync(transaction, outcome, cancellationToken).ConfigureAwait(false);
+        if (metadataProjectionName is not null)
+        {
+            await transaction.Checkpoints.RemoveAsync(metadataProjectionName, cancellationToken).ConfigureAwait(false);
+        }
         await transaction.Checkpoints.RemoveAsync(RemoteCreationIntent.Name(change), cancellationToken)
             .ConfigureAwait(false);
         await transaction.Checkpoints.RemoveAsync(RemoteMoveIntent.Name(batch.BatchId, appliedEntryCount - 1), cancellationToken)
@@ -1467,6 +1918,8 @@ public sealed partial class CloudFileSystem
         CloudRemoteApplyEntryStatus Status,
         CloudRemoteConflict? Conflict)
     {
+        internal RemoteMetadataIntent? MetadataIntent { get; init; }
+        internal RemoteMetadataProjection? RecoveredMetadataProjection { get; init; }
         internal static RemoteEntryOutcome AppliedResult { get; } = new(
             CloudRemoteApplyEntryStatus.Applied,
             null);

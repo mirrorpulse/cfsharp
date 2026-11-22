@@ -63,6 +63,36 @@ available for recovery. Native mutation and durable state are separate resources
 `r`n### Cached content during file upserts
 
 File upserts atomically invalidate hydrated ranges when replacing the placeholder identity and metadata. Subsequent reads obtain the new revision from the content provider. Metadata-only changes retain cached content. The default preservation policy also verifies in-sync state in the native update. If Windows rejects invalidation (for example, a pinned or always-full file), the entry fails with its native error and the durable revision does not advance; CfSharp does not silently change pin or root policies.
+
+For remote `MetadataUpdate`, the default feed policy retains uncertain attribute echoes and requests reconciliation. Applications that can coordinate all relevant writers can declare ownership of those notifications. See [metadata echo coordination](metadata-echo-coordination.md) for the policy, acknowledgement rules, and upgrade behavior.
+
+An in-place metadata update links its preparation to the immutable batch and entry. After
+Windows applies the change, the store records native completion before projecting the item
+revision. Before first publishing `Applied`, CfSharp checks that the projected row and the
+original native object still agree. It holds the object and ancestor namespace guards through
+the outcome commit. If the object moved or was replaced, publication fails with the previous
+cursor and recovery evidence still durable. If projection rolls back, replay can repair the
+original item row and publish the outcome after checking the retained native binding, identity
+and original official row. If only the outcome rolls back, replay verifies the already projected
+row. Both paths leave the native object untouched and retain the original echo-reconciliation
+policy.
+If the evidence cannot be verified, the entry remains retryable at the same safe cursor.
+A failure that definitively precedes the native call can be attempted again after reconciliation.
+If native completion is unproven or the retained outcome can no longer be verified, finish
+and acknowledge a full rescan. Then call `ReconcileRemoteMetadataAsync(originalBatch, nextEntryIndex)`
+to explicitly close that entry as a durable conflict. Use the returned safe cursor and resume
+the original batch. If a sharing or locking failure prevents validation, retry after it clears.
+The method preserves the native object, the official item revision and local journal. The
+conflict can be dismissed after application reconciliation. KeepRemote leaves it unresolved.
+If the call loses its return after committing, repeat with the same batch and ordinal to
+read the accepted prefix without creating another conflict.
+
+Explicit `KeepRemote` for a persisted `MetadataUpdate` conflict records native completion
+under that conflict ID. If finalization fails, retry `ResolveRemoteConflictAsync` with the same ID
+and decision. Verified recovery applies any missing official projection and closes the conflict
+without changing the native object's metadata again. If recovery cannot verify the outcome,
+reconcile the actual state and dismiss the conflict with `DismissRemoteConflictAsync`.
+Dismissal keeps the local journal and any outstanding full rescan requirement.
 `r`n### Keeping local content and closing a conflict
 
 `KeepLocal` and `Defer` continue to leave the conflict unresolved. To explicitly close an individual persistent conflict without changing local content, call `DismissRemoteConflictAsync(conflictId)`. `Dismissed` means the unresolved record and a durable receipt were atomically updated. A retry, including after restart, returns `AlreadyDismissed`. `NotFound` means no active record or dismissal receipt exists; it is not proof of successful resolution by another action.
@@ -146,9 +176,10 @@ to settle a move after later edits instead of clearing or overwriting them.
 
 ### Compatibility and limits
 
-The official SQLite provider upgrades schemas 0–8 in place to **schema 9**, retaining existing
-repositories and enforcing foreign keys. Older providers reject that version before ignoring
-pending file-move evidence. Use matching core/provider packages; never downgrade the schema marker.
+The official SQLite provider upgrades schemas 0–9 in place to **schema 10**, retaining existing
+repositories and enforcing foreign keys. Schema 9 introduced retained generations at the same path.
+The version check prevents older providers from opening incompatible recovery state. Use matching
+core and provider packages.
 Custom stores use the existing public repositories and must atomically isolate transactions across
 all repositories, preserve opaque checkpoints and their ordinal prefix listing, and fence older
 runtimes themselves. Stores lacking those contracts cannot support this protocol. Only metadata
