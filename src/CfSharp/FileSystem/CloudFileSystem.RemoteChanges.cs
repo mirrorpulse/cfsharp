@@ -791,10 +791,12 @@ public sealed partial class CloudFileSystem
         Guid? suppressionId = null;
         RemoteMetadataIntent? metadataIntent = null;
         RemoteChangeRequest? metadataRequest = change.Kind == CloudRemoteChangeKind.MetadataUpdate ? request : null;
+        bool metadataPreparationCommitStarted = false;
         bool nativeMetadataAttempted = false;
         try
         {
-            metadataIntent = await PrepareRemoteMetadataIntentAsync(change, itemId, metadataBinding, options, metadataRequest, cancellationToken)
+            metadataIntent = await PrepareRemoteMetadataIntentAsync(change, itemId, metadataBinding, options, metadataRequest,
+                () => metadataPreparationCommitStarted = true, cancellationToken)
                 .ConfigureAwait(false);
             if (upsert && options.SuppressLocalEcho)
             {
@@ -826,7 +828,7 @@ public sealed partial class CloudFileSystem
         }
         catch (Exception exception)
         {
-            if (metadataRequest is not null && !nativeMetadataAttempted)
+            if (metadataRequest is not null && metadataPreparationCommitStarted && !nativeMetadataAttempted)
             {
                 // A failed preparation commit can itself be durable. Look it up even
                 // when preparation did not return an intent to this call.
@@ -1222,7 +1224,7 @@ public sealed partial class CloudFileSystem
 
     private async ValueTask<RemoteMetadataIntent?> PrepareRemoteMetadataIntentAsync(CloudRemoteChange change,
         Guid itemId, CloudLocalFileBinding? binding, CloudRemoteApplyOptions options, RemoteChangeRequest? metadataRequest,
-        CancellationToken cancellationToken)
+        Action recordPreparationCommit, CancellationToken cancellationToken)
     {
         bool passthrough = !options.SuppressLocalEcho;
         bool coordinated = !passthrough && options.AttributeEchoPolicy == CloudRemoteAttributeEchoPolicy.CallerCoordinated;
@@ -1270,7 +1272,6 @@ public sealed partial class CloudFileSystem
                 await superseded.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
             }
         }
-        _metadataEchoCall?.TrackPreparation();
         await intent.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
         if (metadataRequest is not null)
         {
@@ -1289,6 +1290,9 @@ public sealed partial class CloudFileSystem
                 await preparation.Checkpoints.UpsertAsync(new(fileTimeObservation, [1], now), cancellationToken).ConfigureAwait(false);
             }
         }
+        cancellationToken.ThrowIfCancellationRequested();
+        _metadataEchoCall?.TrackPreparation();
+        recordPreparationCommit();
         await preparation.CommitAsync(cancellationToken).ConfigureAwait(false);
         return intent;
     }

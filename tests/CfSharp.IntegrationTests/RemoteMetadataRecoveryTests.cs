@@ -903,6 +903,42 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Fact]
+    public async Task MetadataCancellationBeforePreparationDoesNotWaitForCleanup()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "metadata-cancel-preparation"));
+        const string relative = "Documents";
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "cancel-metadata-before-preparation");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        CloudRemoteChangeBatch batch = MetadataBoundaryBatch(identity, relative, CloudItemKind.Directory);
+        using CancellationTokenSource cancellation = new();
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        factory!.Armed = true;
+        Task<CloudRemoteApplyResult> apply = fixture.System.ApplyRemoteChangesAsync(batch, cancellationToken: cancellation.Token).AsTask();
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(deadline.Token);
+            factory.PauseNextTransaction();
+            await cancellation.CancelAsync();
+            Task first = await Task.WhenAny(apply, factory.TransactionPaused.Task).WaitAsync(deadline.Token);
+            Assert.Same(apply, first);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => apply);
+        }
+        finally
+        {
+            factory.ResumeOutcome.TrySetResult();
+            factory.ResumeTransaction.TrySetResult();
+        }
+
+        await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(deadline.Token);
+        Assert.Empty(await transaction.Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, deadline.Token));
+        Assert.Equal(0, (await transaction.RemoteBatches.GetAsync(batch.BatchId, deadline.Token))!.AppliedEntryCount);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
     public async Task MetadataPreparationFailureCanRetryAfterReconciliation()
     {
         MetadataFaultFactory? factory = null;
@@ -1163,7 +1199,8 @@ public sealed partial class CloudContentConfirmationTests
             private readonly List<Func<ICloudStateTransaction, CancellationToken, ValueTask>> _writes = [];
             private bool _writesReconciliation;
             public ICloudItemStateRepository Items => inner.Items;
-            public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites || owner._boundary == "rescan-before-preparation" ? this : inner.Checkpoints;
+            public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites ||
+                owner._boundary is "rescan-before-preparation" or "metadata-cancel-preparation" ? this : inner.Checkpoints;
             public ICloudOperationJournal Operations => inner.Operations;
             public ICloudConflictRepository Conflicts => inner.Conflicts;
             public ICloudRemoteBatchRepository RemoteBatches => owner.OverlappingWrites ? this : inner.RemoteBatches;
@@ -1183,12 +1220,18 @@ public sealed partial class CloudContentConfirmationTests
                 }
                 return await inner.Checkpoints.ListAsync(namePrefix, cancellationToken);
             }
-            ValueTask ICloudCheckpointRepository.UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken)
+            async ValueTask ICloudCheckpointRepository.UpsertAsync(CloudStateCheckpoint checkpoint, CancellationToken cancellationToken)
             {
+                if (owner.Armed && owner._boundary == "metadata-cancel-preparation" &&
+                    checkpoint.Name.StartsWith(RemoteMetadataProjection.Prefix, StringComparison.Ordinal))
+                {
+                    owner.OutcomePaused.TrySetResult();
+                    await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
+                }
                 _writes.Add((transaction, token) => transaction.Checkpoints.UpsertAsync(checkpoint, token));
                 _writesReconciliation |= checkpoint.Name.StartsWith(RemoteMetadataIntent.Prefix, StringComparison.Ordinal) &&
                     RemoteMetadataIntent.Decode(checkpoint).RequiresReconciliation;
-                return inner.Checkpoints.UpsertAsync(checkpoint, cancellationToken);
+                await inner.Checkpoints.UpsertAsync(checkpoint, cancellationToken);
             }
             ValueTask ICloudCheckpointRepository.RemoveAsync(string name, CancellationToken cancellationToken)
             {
