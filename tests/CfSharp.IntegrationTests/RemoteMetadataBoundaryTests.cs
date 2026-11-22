@@ -437,13 +437,13 @@ public sealed partial class CloudContentConfirmationTests
     }
 
     private static async Task<LocalChangeSourceEvent> CaptureNativeModificationAsync(string root, string relative,
-        Func<Task> mutate, CancellationToken cancellationToken)
+        Func<Task> mutate, CancellationToken cancellationToken, LocalChangeSourceAction action = LocalChangeSourceAction.Modified)
     {
         TaskCompletionSource<LocalChangeSourceEvent> observed = new(TaskCreationOptions.RunContinuationsAsynchronously);
         await using WindowsLocalChangeSource native = new(root, 4096);
         await native.StartAsync(change =>
         {
-            if (change.Action == LocalChangeSourceAction.Modified && change.RelativePath == relative)
+            if (change.Action == action && change.RelativePath == relative)
             { observed.TrySetResult(change); }
             return ValueTask.CompletedTask;
         }, cancellationToken);
@@ -908,29 +908,51 @@ public sealed partial class CloudContentConfirmationTests
             CloudDirectoryPlaceholderSpec.CreateBuilder("Other", other).WithInSyncState(true).Build(),
         ]);
         CloudLocalFileBinding otherBinding = Assert.IsType<CloudLocalFileBinding>((await fixture.System.GetDirectory("Other").InspectAsync()).LocalBinding);
-        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed();
-        await feed.StartAsync();
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
         Assert.Equal(CloudRemoteBatchStatus.Applied, (await fixture.System.ApplyRemoteChangesAsync(
             MetadataBoundaryBatch(owned, "Owned", CloudItemKind.Directory), new()
-            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated })).Status);
-        await using (ICloudStateTransaction store = await factory!.Store!.BeginTransactionAsync())
+            { AttributeEchoPolicy = CloudRemoteAttributeEchoPolicy.CallerCoordinated }, deadline.Token)).Status);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        RemoteMetadataIntent expanded;
+        await using (ICloudStateTransaction store = await factory!.Store!.BeginTransactionAsync(deadline.Token))
         {
-            RemoteMetadataIntent original = Assert.Single((await store.Checkpoints.ListAsync(RemoteMetadataIntent.Prefix)).Select(RemoteMetadataIntent.Decode));
-            RemoteMetadataIntent expanded = new(Guid.NewGuid(), original.CallId, other.ItemId, "Other", otherBinding,
-                Coordinated: true, Completed: true);
-            await expanded.PersistAsync(store.Checkpoints, DateTimeOffset.UtcNow, CancellationToken.None);
-            await store.CommitAsync();
+            RemoteMetadataIntent original = Assert.Single((await store.Checkpoints.ListAsync(
+                RemoteMetadataIntent.Prefix, deadline.Token)).Select(RemoteMetadataIntent.Decode));
+            Assert.Equal(owned.ItemId, original.ItemId);
+            Assert.False(original.HasUnconfirmedOutcome);
+            expanded = new(Guid.NewGuid(), original.CallId, other.ItemId, "Other", otherBinding,
+                Coordinated: true, Completed: true)
+            {
+                OutcomeConfirmed = true,
+                NativeWriteApplied = true,
+            };
+            await expanded.PersistAsync(store.Checkpoints, DateTimeOffset.UtcNow, deadline.Token);
+            await store.CommitAsync(deadline.Token);
         }
         // Even a structurally valid custom-store receipt cannot enlarge the in-memory
         // native object set that the completed public call actually authorized.
         string otherPath = Path.Combine(fixture.Root, "Other");
-        File.SetAttributes(otherPath, File.GetAttributes(otherPath) | FileAttributes.Hidden);
-        await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => LocalChangePayload.Decode(row.Payload).RelativePath == "Other"));
-        await feed.DisposeAsync();
-        CloudOperationJournalEntry retained = Assert.Single((await AccessRowsAsync(factory!))
-            .Where(row => LocalChangePayload.Decode(row.Payload).RelativePath == "Other"));
+        LocalChangeSourceEvent observation = await CaptureNativeModificationAsync(fixture.Root, "Other", () =>
+        {
+            File.SetAttributes(otherPath, File.GetAttributes(otherPath) | FileAttributes.Hidden);
+            return Task.CompletedTask;
+        }, deadline.Token, LocalChangeSourceAction.AttributesModified);
+        LocalSecurityChangeIdentity nativeIdentity = Assert.IsType<LocalSecurityChangeIdentity>(observation.SecurityIdentity);
+        Assert.True(expanded.Matches(nativeIdentity, other.ItemId));
+        await source.EmitAsync(observation);
+        CloudOperationJournalEntry originalObservation = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, deadline.Token);
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChange retained = Assert.Single((await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token)).Changes);
+        Assert.Equal((originalObservation.OperationId, originalObservation.Sequence), (retained.OperationId, retained.Sequence));
+        Assert.Equal("Other", retained.RelativePath);
+        Assert.Equal(CloudLocalChangeKind.MetadataUpdate, retained.Kind);
         Assert.Null(retained.ItemId);
         Assert.True(File.GetAttributes(otherPath).HasFlag(FileAttributes.Hidden));
+        await feed.AcknowledgeAsync([retained.OperationId], deadline.Token);
     }
 
     [Trait("Category", "AccessJournal")]
