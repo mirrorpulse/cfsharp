@@ -1,3 +1,7 @@
+using CfSharp.Native;
+
+using Microsoft.Win32.SafeHandles;
+
 namespace CfSharp;
 
 public sealed partial class CloudFileSystem
@@ -22,12 +26,27 @@ public sealed partial class CloudFileSystem
             { return null; }
             throw MetadataProjectionUnresolved(change, "the unattempted write still needs reconciliation");
         }
-        await ValidateRemoteMetadataProjectionAsync(transaction, change, projection, intent, cancellationToken).ConfigureAwait(false);
+        await ValidateRemoteMetadataProjectionAsync(transaction, change, projection, intent, target: null, cancellationToken).ConfigureAwait(false);
         return RemoteEntryOutcome.AppliedResult with
         {
             MetadataIntent = intent with { RequiresReconciliation = !intent.Reconciled },
             RecoveredMetadataProjection = projection,
         };
+    }
+
+    private async ValueTask RecordRemoteMetadataNativeWriteAsync(RemoteChangeRequest request, RemoteMetadataIntent intent)
+    {
+        await using ICloudStateTransaction transaction = await _stateStore!.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
+        string name = RemoteMetadataProjection.Name(request.Batch, request.EntryIndex);
+        CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name).ConfigureAwait(false)
+            ?? throw new InvalidDataException("The remote metadata projection preparation is missing.");
+        RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
+        if (projection.ReceiptName != intent.Name || projection.ProjectedAtTicks != 0 || projection.OriginalRowFingerprint is null)
+        { throw new InvalidDataException("The remote metadata projection preparation changed before native completion."); }
+
+        await transaction.Checkpoints.UpsertAsync((projection with { ProjectedAtTicks = RemoteMetadataProjection.NativeWriteCompleted })
+            .ToCheckpoint(name, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+        await transaction.CommitAsync().ConfigureAwait(false);
     }
 
     private async ValueTask<bool> RecordUnattemptedRemoteMetadataAsync(RemoteChangeRequest request)
@@ -71,29 +90,35 @@ public sealed partial class CloudFileSystem
         CloudStateCheckpoint checkpoint = await transaction.Checkpoints.GetAsync(name, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("The remote metadata projection preparation is missing.");
         RemoteMetadataProjection projection = RemoteMetadataProjection.Decode(checkpoint);
-        if (projection.ReceiptName != intent.Name || projection.ProjectedAtTicks != 0)
-        { throw new InvalidDataException("The remote metadata projection preparation changed."); }
+        if (projection.ReceiptName != intent.Name || projection.ProjectedAtTicks != RemoteMetadataProjection.NativeWriteCompleted)
+        { throw new InvalidDataException("The remote metadata native completion receipt changed."); }
         await transaction.Checkpoints.UpsertAsync((projection with { ProjectedAtTicks = projectedAt.UtcTicks })
             .ToCheckpoint(name, projectedAt), cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask ValidateRemoteMetadataProjectionAsync(ICloudStateTransaction transaction, CloudRemoteChange change,
-        RemoteMetadataProjection projection, RemoteMetadataIntent intent, CancellationToken cancellationToken)
+        RemoteMetadataProjection projection, RemoteMetadataIntent intent, SafeFileHandle? target, CancellationToken cancellationToken)
     {
         if (intent.Completed || intent.Superseded || intent.Binding is null || !intent.Covers(change.RelativePath) ||
             (change.ItemId is Guid explicitId && explicitId != projection.ItemId))
         { throw MetadataProjectionUnresolved(change, "the original attribution changed"); }
 
+        bool needsProjection = projection.ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted;
         CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
         if (owner is null || owner.IsTombstone || owner.ItemId != projection.ItemId || owner.Kind != change.ItemKind ||
-            owner.RemoteId != change.RemoteId || owner.RemoteRevision != change.RemoteRevision ||
-            owner.UpdatedAt.UtcTicks != projection.ProjectedAtTicks)
+            (needsProjection
+                ? RemoteMetadataProjection.Fingerprint(owner) != projection.OriginalRowFingerprint
+                : owner.RemoteId != change.RemoteId || owner.RemoteRevision != change.RemoteRevision ||
+                  owner.UpdatedAt.UtcTicks != projection.ProjectedAtTicks))
         { throw MetadataProjectionUnresolved(change, "the official projection changed"); }
 
-        LocalCloudItemInspection native = CloudItemInspector.Inspect(ToFullPath(change.RelativePath), change.ItemKind, SyncRootPath);
+        string fullPath = ToFullPath(change.RelativePath);
+        LocalCloudItemInspection native = target is null ? CloudItemInspector.Inspect(fullPath, change.ItemKind, SyncRootPath) :
+            CloudItemInspector.Inspect(target, fullPath, change.ItemKind, SyncRootPath);
         if (!native.Exists || native.Kind != change.ItemKind || native.LocalBinding != intent.Binding ||
             !CloudPlaceholderIdentity.TryDecode(native.PlaceholderIdentity, out CloudPlaceholderIdentity? identity) ||
-            identity.ItemId != owner.ItemId || identity.RemoteId != change.RemoteId || identity.RemoteRevision != change.RemoteRevision)
+            identity.ItemId != owner.ItemId || identity.RemoteId != change.RemoteId || identity.RemoteRevision != change.RemoteRevision ||
+            (target is not null && !CloudDirectoryStateProjection.SamePath(WindowsFileMetadata.ReadFinalPath(target.DangerousGetHandle()), fullPath)))
         { throw MetadataProjectionUnresolved(change, "the original native binding or identity changed"); }
     }
 

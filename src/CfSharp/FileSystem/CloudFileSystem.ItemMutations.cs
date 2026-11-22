@@ -68,6 +68,7 @@ public sealed partial class CloudFileSystem
         CancellationToken cancellationToken,
         Func<CancellationToken, ValueTask<IDisposable>>? acquireUpdateGuard = null,
         Action<nint>? verifyRemoteTarget = null,
+        Func<ValueTask>? recordNativeWrite = null,
         Func<ICloudStateTransaction, DateTimeOffset, CancellationToken, ValueTask>? stageIdentityProjection = null)
     {
         ValidatePatch(item, patch);
@@ -94,6 +95,9 @@ public sealed partial class CloudFileSystem
         {
             try
             {
+                // Native completion and official identity projection have independent
+                // durability boundaries. Keep completion visible if projection rolls back.
+                if (recordNativeWrite is not null) { await recordNativeWrite().ConfigureAwait(false); }
                 await PersistIdentityPatchAsync(
                     operation.StateStore,
                     item,
@@ -261,25 +265,34 @@ public sealed partial class CloudFileSystem
         }
 
         DateTimeOffset projectedAt = DateTimeOffset.UtcNow;
-        await transaction.Items.UpsertAsync(
-            new CloudItemState(
-                identity.ItemId,
-                identity.RemoteId,
-                item.RelativePath,
-                item.Kind,
-                preserveExistingState ? existing?.RemoteRevision : identity.RemoteRevision,
-                localFileId: preserveExistingState ? existing?.LocalFileId ?? observedLocalFileId : null,
-                isTombstone: false,
-                projectedAt),
-            cancellationToken).ConfigureAwait(false);
-        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, item.SyncRootPath,
-            item.RelativePath, item.Kind, cancellationToken).ConfigureAwait(false);
+        await WriteIdentityProjectionAsync(transaction, item, identity,
+            preserveExistingState ? existing?.RemoteRevision : identity.RemoteRevision,
+            preserveExistingState ? existing?.LocalFileId ?? observedLocalFileId : null,
+            projectedAt, cancellationToken).ConfigureAwait(false);
         if (stageIdentityProjection is not null)
         { await stageIdentityProjection(transaction, projectedAt, cancellationToken).ConfigureAwait(false); }
         validateBeforeCommit?.Invoke();
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         // Record success before transaction disposal, which can fail after a real commit.
         onCommitted?.Invoke();
+    }
+
+    private static async ValueTask WriteIdentityProjectionAsync(ICloudStateTransaction transaction, CloudItem item,
+        CloudPlaceholderIdentity identity, string? remoteRevision, long? localFileId, DateTimeOffset projectedAt, CancellationToken cancellationToken)
+    {
+        await transaction.Items.UpsertAsync(
+            new CloudItemState(
+                identity.ItemId,
+                identity.RemoteId,
+                item.RelativePath,
+                item.Kind,
+                remoteRevision,
+                localFileId,
+                isTombstone: false,
+                projectedAt),
+            cancellationToken).ConfigureAwait(false);
+        await CloudDirectoryProvenance.RetainProjectionAsync(transaction, item.SyncRootPath,
+            item.RelativePath, item.Kind, cancellationToken).ConfigureAwait(false);
     }
 
     private static async ValueTask PersistIdentityPatchAsync(

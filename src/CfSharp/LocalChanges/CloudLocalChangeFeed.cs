@@ -277,6 +277,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             return;
         }
 
+        // A revision acknowledgement changes the same official row that remote
+        // metadata recovery verifies and repairs. Order these writes on custom stores too.
+        using IDisposable? publication = values.Any(value => value.RemoteRevision is not null)
+            ? await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false) : null;
         await using ICloudStateTransaction transaction = await _stateStore
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         foreach (CloudLocalChangeAcknowledgement acknowledgement in values)

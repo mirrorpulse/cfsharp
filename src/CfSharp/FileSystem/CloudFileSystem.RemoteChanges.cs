@@ -1183,6 +1183,9 @@ public sealed partial class CloudFileSystem
                 recordNativeAttempt();
             },
             metadataRequest is not null && metadataIntent is not null
+                ? () => RecordRemoteMetadataNativeWriteAsync(metadataRequest, metadataIntent)
+                : null,
+            metadataRequest is not null && metadataIntent is not null
                 ? (transaction, projectedAt, token) => StageRemoteMetadataProjectionAsync(transaction, metadataRequest,
                     metadataIntent, projectedAt, token)
                 : null).ConfigureAwait(false);
@@ -1275,8 +1278,12 @@ public sealed partial class CloudFileSystem
         await intent.PersistAsync(preparation.Checkpoints, now, cancellationToken).ConfigureAwait(false);
         if (metadataRequest is not null)
         {
+            CloudItemState? original = await preparation.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
+            if (original is null || original.IsTombstone || original.ItemId != itemId)
+            { throw MetadataProjectionUnresolved(change, "the original official item is unavailable"); }
             string projectionName = RemoteMetadataProjection.Name(metadataRequest.Batch, metadataRequest.EntryIndex);
-            RemoteMetadataProjection projection = new(itemId, intent.Id, ProjectedAtTicks: 0);
+            RemoteMetadataProjection projection = new(itemId, intent.Id, ProjectedAtTicks: 0,
+                OriginalRowFingerprint: RemoteMetadataProjection.Fingerprint(original));
             await preparation.Checkpoints.UpsertAsync(projection.ToCheckpoint(projectionName, now), cancellationToken).ConfigureAwait(false);
         }
         if (change.Kind == CloudRemoteChangeKind.MetadataUpdate && change.ItemKind == CloudItemKind.File && !passthrough &&
@@ -1523,12 +1530,27 @@ public sealed partial class CloudFileSystem
             .ConfigureAwait(false);
         string? metadataProjectionName = change.Kind == CloudRemoteChangeKind.MetadataUpdate
             ? RemoteMetadataProjection.Name(batch, appliedEntryCount - 1) : null;
+        string? recoveredMetadataPath = outcome.RecoveredMetadataProjection is not null ? ToFullPath(change.RelativePath) : null;
+        using CloudPathHandleLease? recoveredMetadataParents = recoveredMetadataPath is null ? null :
+            CloudPathHandleLease.OpenParentChains(SyncRootPath, [recoveredMetadataPath]);
+        using SafeFileHandle? recoveredMetadataTarget = recoveredMetadataPath is null ? null :
+            WindowsFileMetadata.OpenNamespaceGuard(recoveredMetadataPath);
         if (outcome.RecoveredMetadataProjection is { } projection)
         {
             CloudStateCheckpoint? checkpoint = await transaction.Checkpoints.GetAsync(metadataProjectionName!, cancellationToken).ConfigureAwait(false);
             if (checkpoint is null || RemoteMetadataProjection.Decode(checkpoint) != projection)
             { throw MetadataProjectionUnresolved(change, "the original projection evidence changed"); }
-            await ValidateRemoteMetadataProjectionAsync(transaction, change, projection, outcome.MetadataIntent!, cancellationToken).ConfigureAwait(false);
+            await ValidateRemoteMetadataProjectionAsync(transaction, change, projection, outcome.MetadataIntent!,
+                recoveredMetadataTarget, cancellationToken).ConfigureAwait(false);
+            if (projection.ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted)
+            {
+                // The original native call already succeeded. Repair its official row
+                // in the outcome transaction without applying metadata a second time.
+                CloudItem item = CreateItemReference(change.RelativePath, change.ItemKind);
+                CloudPlaceholderIdentity identity = new(projection.ItemId, change.RemoteId, change.RemoteRevision);
+                await WriteIdentityProjectionAsync(transaction, item, identity, change.RemoteRevision,
+                    localFileId: null, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+            }
         }
         using RemoteNamespaceParentLease? deleteParents = change.Kind == CloudRemoteChangeKind.Delete && outcome.Conflict is null
             ? await HoldRemoteDeleteOutcomeParentsAsync(transaction, batch, appliedEntryCount - 1, cancellationToken).ConfigureAwait(false)

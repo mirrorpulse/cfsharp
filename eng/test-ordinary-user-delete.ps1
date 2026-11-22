@@ -46,6 +46,7 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
             'FullyQualifiedName~InPlaceMetadataWriteReplacesTheEarlierCoordinatedPolicy',
             'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes',
             'FullyQualifiedName~MetadataOutcomeRollbackRecoversOnlyAnOriginalProjection',
+            'FullyQualifiedName~MetadataProjectionRollbackRepairsOriginalWriteWithoutMutatingAgain',
             'FullyQualifiedName~MetadataPreparationFailureCanRetryAfterReconciliation',
             'FullyQualifiedName~MetadataCancellationBeforePreparationDoesNotWaitForCleanup',
             'FullyQualifiedName~AmbiguousMetadataCommitProtectsAnUnobservedNativeAttributeEdit',
@@ -56,7 +57,7 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
     elseif ($Suite -eq 'CreationBinding') { 'FullyQualifiedName~OfficialCreationBindingSurvivesOnlyCommittedProjection' }
     else { 'FullyQualifiedName~ExplicitSuccessorAtRetiredPathPreservesBothGenerationsAcrossReopen' }
 $expectedCount = if ($Suite -eq 'Delete') { 14 } elseif ($Suite -eq 'CreationBinding') { 6 }
-    elseif ($Suite -eq 'AccessJournal') { 59 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
+    elseif ($Suite -eq 'AccessJournal') { 63 } elseif ($Suite -eq 'DeleteReconciliation') { 4 } else { 2 }
 $evidence = Join-Path $repository ('artifacts/ordinary-user-' + $suiteName)
 New-Item -ItemType Directory -Path $executionRoot, $evidence -Force | Out-Null
 $account = $null

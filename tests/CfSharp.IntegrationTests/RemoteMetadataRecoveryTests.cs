@@ -8,6 +8,89 @@ public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
     [Theory]
+    [InlineData("new revision")]
+    [InlineData("same revision")]
+    [InlineData("new remote ID")]
+    [InlineData("changed original row")]
+    public async Task MetadataProjectionRollbackRepairsOriginalWriteWithoutMutatingAgain(string scenario)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "projection-before"));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-projection-rollback", "remote-r0");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, identity).WithInSyncState(true).Build(),
+        ]);
+        string revision = scenario == "same revision" ? "remote-r0" : "remote-r1";
+        string remoteId = scenario == "new remote ID" ? "metadata-rebound" : identity.RemoteId;
+        CloudRemoteChange change = new("metadata", CloudRemoteChangeKind.MetadataUpdate, remoteId, revision,
+            CloudItemKind.Directory, relative, identity.ItemId, previousRemoteRevision: "remote-r0",
+            metadata: CloudPlaceholderMetadata.CreateDirectoryBuilder().WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build());
+        CloudRemoteChangeBatch batch = new("metadata-fault", new byte[] { 7 }, [change], new byte[] { 8 });
+        string projectionName = RemoteMetadataProjection.Name(batch, 0);
+        factory!.Armed = true;
+
+        CloudRemoteApplyResult interrupted = await fixture.System.ApplyRemoteChangesAsync(batch);
+        Assert.True(interrupted.RequiresRetry);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Failed, Assert.Single(interrupted.Entries).Status);
+        Assert.IsType<CloudItemCoordinationException>(Assert.Single(interrupted.Entries).Error);
+        Assert.Equal(new byte[] { 7 }, interrupted.SafeCursor.ToArray());
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync())
+        {
+            CloudItemState original = (await transaction.Items.GetByItemIdAsync(identity.ItemId))!;
+            Assert.Equal("remote-r0", original.RemoteRevision);
+            Assert.Equal(identity.RemoteId, original.RemoteId);
+            RemoteMetadataProjection retained = RemoteMetadataProjection.Decode((await transaction.Checkpoints.GetAsync(projectionName))!);
+            Assert.Equal(RemoteMetadataProjection.NativeWriteCompleted, retained.ProjectedAtTicks);
+            Assert.Equal(RemoteMetadataProjection.Fingerprint(original), retained.OriginalRowFingerprint);
+            if (scenario == "changed original row")
+            {
+                await transaction.Items.UpsertAsync(new(original.ItemId, original.RemoteId, original.RelativePath, original.Kind,
+                    "acknowledged-local-revision", original.LocalFileId, original.IsTombstone, original.UpdatedAt));
+                await transaction.CommitAsync();
+            }
+        }
+
+        await fixture.RestartAsync();
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        await feed.StartAsync();
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        File.SetAttributes(path, File.GetAttributes(path) & ~FileAttributes.Hidden);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), CancellationToken.None);
+        CloudRemoteApplyResult replay = await fixture.System.ApplyRemoteChangesAsync(batch);
+        if (scenario == "changed original row")
+        {
+            Assert.True(replay.RequiresRetry);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Failed, Assert.Single(replay.Entries).Status);
+            Assert.Equal(new byte[] { 7 }, replay.SafeCursor.ToArray());
+            Assert.Empty(replay.ConflictIds);
+            await using ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync();
+            Assert.NotNull(await transaction.Checkpoints.GetAsync(projectionName));
+            Assert.Equal("acknowledged-local-revision", (await transaction.Items.GetByItemIdAsync(identity.ItemId))!.RemoteRevision);
+            return;
+        }
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(replay.Entries).Status);
+        Assert.False(replay.RequiresRetry);
+        Assert.Equal(new byte[] { 8 }, replay.SafeCursor.ToArray());
+        Assert.Empty(replay.ConflictIds);
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync())
+        {
+            CloudItemState projected = (await transaction.Items.GetByItemIdAsync(identity.ItemId))!;
+            Assert.Equal(revision, projected.RemoteRevision);
+            Assert.Equal(remoteId, projected.RemoteId);
+            Assert.Null(await transaction.Checkpoints.GetAsync(projectionName));
+            Assert.Empty(await transaction.Conflicts.ListAsync());
+        }
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, Assert.Single((await fixture.System.ApplyRemoteChangesAsync(batch)).Entries).Status);
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
     [InlineData(true, true)]
     [InlineData(true, false)]
     [InlineData(false, true)]
@@ -1266,6 +1349,8 @@ public sealed partial class CloudContentConfirmationTests
                         "preparation-after" or "preparation-paused-after" => intents.Any(intent => !intent.Completed),
                         "native-projection-paused-after" => intents.Any(intent => !intent.Completed) &&
                             (await Items.GetByRelativePathAsync("Documents", cancellationToken))?.RemoteRevision == "remote-r1",
+                        "projection-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
+                            .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks > 0),
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
@@ -1310,7 +1395,7 @@ public sealed partial class CloudContentConfirmationTests
                     await inner.CommitAsync(cancellationToken);
                     return;
                 }
-                if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before"))
+                if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before" or "projection-before"))
                 { await inner.CommitAsync(cancellationToken); }
                 if (staged is not null)
                 { owner.Staged.TrySetResult(Guid.ParseExact(staged.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N")); }
