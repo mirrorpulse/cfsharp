@@ -787,7 +787,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     CloudLocalChangeKind.ContentUpdate,
                     sourceEvent.RelativePath,
                     previousRelativePath: null,
-                    cancellationToken, classifyModified: true).ConfigureAwait(false);
+                    cancellationToken).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
             case LocalChangeSourceAction.AttributesModified:
@@ -816,8 +816,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         string relativePath,
         string? previousRelativePath,
         CancellationToken cancellationToken,
-        LocalChangeSourceEvent? securityObservation = null,
-        bool classifyModified = false)
+        LocalChangeSourceEvent? securityObservation = null)
     {
         CloudItemPath path;
         try
@@ -831,7 +830,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // A path query can lose access without invalidating the root subscription.
             // Fence delivery for reconciliation before accepting another observation. The
             // catch covers only resolution; durable-store failures must still stop the worker.
-            if (classifyModified && await TryRetainUnresolvedFileTimeAsync(relativePath, cancellationToken).ConfigureAwait(false))
+            if (kind == CloudLocalChangeKind.ContentUpdate &&
+                await TryRetainUnresolvedFileTimeAsync(relativePath, cancellationToken).ConfigureAwait(false))
             { return; }
             await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
             return;
@@ -852,13 +852,6 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 await MarkRescanRequiredAsync(cancellationToken).ConfigureAwait(false);
                 return;
             }
-        }
-
-        if (classifyModified)
-        {
-            // Resolve once before classifying. A separate preliminary walk could fail outside
-            // the recovery boundary, or disagree with the path validated for persistence.
-            kind = Directory.Exists(path.FullPath) ? CloudLocalChangeKind.MetadataUpdate : CloudLocalChangeKind.ContentUpdate;
         }
 
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
@@ -974,14 +967,19 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
-        bool metadataObservation = kind == CloudLocalChangeKind.MetadataUpdate &&
-            securityObservation?.Action != LocalChangeSourceAction.SecurityModified;
-        // Last-write and creation-time notifications share the generic file Modified action
-        // with actual data writes. Keep their original kind and never infer a writer from
-        // the current timestamp, sync flag or notification order.
+        // Generic Modified arrives here as ContentUpdate. Check retained file-time
+        // history before inspecting today's occupant. It may now be a directory with
+        // a completely unrelated metadata receipt.
         bool uncertainFileContent = kind == CloudLocalChangeKind.ContentUpdate &&
             await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.FileTimeObservationName(path.RelativePath),
                 cancellationToken).ConfigureAwait(false) is not null;
+        if (kind == CloudLocalChangeKind.ContentUpdate && !uncertainFileContent && uncertainDirectory is null &&
+            Directory.Exists(path.FullPath))
+        {
+            kind = CloudLocalChangeKind.MetadataUpdate;
+        }
+        bool metadataObservation = kind == CloudLocalChangeKind.MetadataUpdate &&
+            securityObservation?.Action != LocalChangeSourceAction.SecurityModified;
         RemoteMetadataIntent[] metadataIntents = metadataObservation || (uncertainFileContent && current is not null)
             ? (securityObservation is not null && current is null ? [] :
                 await ReadMetadataIntentsAsync(transaction, cancellationToken,
@@ -1016,10 +1014,10 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             // Do not assign or relocate a local identity while native remote work is pending. Retain
             // the observation durably and require reconciliation after remote replay; its
             // origin cannot be proved solely from a path, timestamp, or notification kind.
-            LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath,
-                uncertainDirectory ?? (securityObservation is { } security
+            bool directoryObservation = !uncertainFileContent && (uncertainDirectory ?? (securityObservation is { } security
                     ? security.SecurityIdentity?.IsDirectory ?? current?.Kind == CloudItemKind.Directory
-                    : Directory.Exists(path.FullPath)), observedAt);
+                    : Directory.Exists(path.FullPath)));
+            LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath, directoryObservation, observedAt);
             if (uncertainFileContent)
             {
                 await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.ContentUpdate, null,

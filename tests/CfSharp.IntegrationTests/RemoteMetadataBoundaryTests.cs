@@ -81,18 +81,9 @@ public sealed partial class CloudContentConfirmationTests
 
         async Task RecordNativeModificationAsync(Func<Task> mutate)
         {
-            TaskCompletionSource<LocalChangeSourceEvent> observed = new(TaskCreationOptions.RunContinuationsAsynchronously);
             // Each native subscription starts immediately before its own mutation, so the
             // second observation cannot be a delayed callback from the remote write.
-            await using WindowsLocalChangeSource native = new(fixture.Root, 4096);
-            await native.StartAsync(change =>
-            {
-                if (change.Action == LocalChangeSourceAction.Modified && change.RelativePath == relative)
-                { observed.TrySetResult(change); }
-                return ValueTask.CompletedTask;
-            }, deadline.Token);
-            await mutate();
-            await source.EmitAsync(await observed.Task.WaitAsync(deadline.Token));
+            await source.EmitAsync(await CaptureNativeModificationAsync(fixture.Root, relative, mutate, deadline.Token));
             await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
         }
 
@@ -111,6 +102,73 @@ public sealed partial class CloudContentConfirmationTests
             await feed.AcknowledgeAsync([change.OperationId], deadline.Token);
             return change.OperationId;
         }
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task DelayedFileTimestampCannotBindToDirectoryAtTheSamePath()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        string relative = fixture.File.RelativePath;
+        CloudPlaceholderIdentity file = new(Guid.NewGuid(), "timestamp-retired-file");
+        await File.WriteAllBytesAsync(fixture.File.FullPath, "resident bytes"u8.ToArray());
+        await fixture.File.ConvertToPlaceholderAsync(file);
+        await fixture.File.SetInSyncAsync(true);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        await feed.StartAsync(deadline.Token);
+
+        CloudRemoteChange timestamp = new("timestamp", CloudRemoteChangeKind.MetadataUpdate, file.RemoteId, "remote-r1",
+            CloudItemKind.File, relative, file.ItemId, metadata: CloudPlaceholderMetadata.CreateFileBuilder()
+                .WithLastWriteTime(new(2025, 3, 4, 5, 6, 7, TimeSpan.Zero)).Build());
+        LocalChangeSourceEvent delayed = await CaptureNativeModificationAsync(fixture.Root, relative, async () =>
+        {
+            CloudRemoteApplyResult applied = await fixture.System.ApplyRemoteChangesAsync(
+                new("retire-timestamp-file", Array.Empty<byte>(), [timestamp], new byte[] { 1 }), cancellationToken: deadline.Token);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(applied.Entries).Status);
+        }, deadline.Token);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        await fixture.File.MoveToAsync(fixture.System.Root, "retired.bin", cancellationToken: deadline.Token);
+
+        CloudPlaceholderIdentity directory = new(Guid.NewGuid(), "timestamp-directory-successor");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, directory).WithInSyncState(true).Build(),
+        ], cancellationToken: deadline.Token);
+        CloudRemoteApplyResult passthrough = await fixture.System.ApplyRemoteChangesAsync(
+            MetadataBoundaryBatch(directory, relative, CloudItemKind.Directory), new() { SuppressLocalEcho = false }, deadline.Token);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(passthrough.Entries).Status);
+        Assert.False((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+
+        await source.EmitAsync(delayed);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+        CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
+        Assert.True((await feed.BeginScanAsync(deadline.Token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), deadline.Token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(deadline.Token), 0, 10, deadline.Token);
+        CloudLocalChange record = Assert.Single(page.Changes);
+        Assert.Null(record.ItemId);
+        Assert.False(record.IsDirectory);
+        Assert.Equal(CloudLocalChangeKind.ContentUpdate, record.Kind);
+        Assert.Equal((original.OperationId, original.Sequence), (record.OperationId, record.Sequence));
+        Assert.Equal(relative, record.RelativePath);
+        await feed.AcknowledgeAsync([record.OperationId], deadline.Token);
+    }
+
+    private static async Task<LocalChangeSourceEvent> CaptureNativeModificationAsync(string root, string relative,
+        Func<Task> mutate, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<LocalChangeSourceEvent> observed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using WindowsLocalChangeSource native = new(root, 4096);
+        await native.StartAsync(change =>
+        {
+            if (change.Action == LocalChangeSourceAction.Modified && change.RelativePath == relative)
+            { observed.TrySetResult(change); }
+            return ValueTask.CompletedTask;
+        }, cancellationToken);
+        await mutate();
+        return await observed.Task.WaitAsync(cancellationToken);
     }
 
     [Trait("Category", "AccessJournal")]
