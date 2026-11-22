@@ -74,6 +74,13 @@ row. If only the outcome rolls back, replay verifies the already projected row. 
 leave the native object untouched and retain the original echo-reconciliation policy.
 If the evidence cannot be verified, the entry remains retryable at the same safe cursor.
 A failure that definitively precedes the native call can be attempted again after reconciliation.
+If native completion is unproven, finish and acknowledge a full rescan, then call
+`ReconcileRemoteMetadataAsync(originalBatch, nextEntryIndex)` to explicitly close that
+entry as a durable conflict. Use the returned safe cursor and resume the original batch.
+The method preserves the native object, the official item revision and local journal. The
+conflict can be dismissed after application reconciliation. KeepRemote leaves it unresolved.
+If the call loses its return after committing, repeat with the same batch and ordinal to
+read the accepted prefix without creating another conflict.
 `r`n### Keeping local content and closing a conflict
 
 `KeepLocal` and `Defer` continue to leave the conflict unresolved. To explicitly close an individual persistent conflict without changing local content, call `DismissRemoteConflictAsync(conflictId)`. `Dismissed` means the unresolved record and a durable receipt were atomically updated. A retry, including after restart, returns `AlreadyDismissed`. `NotFound` means no active record or dismissal receipt exists; it is not proof of successful resolution by another action.

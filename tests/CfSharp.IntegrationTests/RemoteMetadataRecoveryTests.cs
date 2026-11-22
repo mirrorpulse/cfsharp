@@ -7,6 +7,75 @@ namespace CfSharp.IntegrationTests;
 public sealed partial class CloudContentConfirmationTests
 {
     [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task UnprovenMetadataCompletionCanBeClosedWithoutRewritingAndResumeTheOriginalBatch()
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, "native-completion-before"));
+        const string relative = "Documents";
+        string path = Path.Combine(fixture.Root, relative);
+        CloudPlaceholderIdentity first = new(Guid.NewGuid(), "unproven-metadata", "remote-r0");
+        CloudPlaceholderIdentity second = new(Guid.NewGuid(), "following-metadata", "remote-r0");
+        await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudDirectoryPlaceholderSpec.CreateBuilder(relative, first).WithInSyncState(true).Build(),
+            CloudDirectoryPlaceholderSpec.CreateBuilder("Next", second).WithInSyncState(true).Build(),
+        ]);
+        CloudPlaceholderMetadata hidden = CloudPlaceholderMetadata.CreateDirectoryBuilder()
+            .WithAttributes(FileAttributes.Directory | FileAttributes.Hidden).Build();
+        CloudRemoteChange uncertain = new("uncertain", CloudRemoteChangeKind.MetadataUpdate, first.RemoteId, "remote-r1",
+            CloudItemKind.Directory, relative, first.ItemId, previousRemoteRevision: "remote-r0", metadata: hidden, cursorAfter: new byte[] { 8 });
+        CloudRemoteChange next = new("next", CloudRemoteChangeKind.MetadataUpdate, second.RemoteId, "remote-r1",
+            CloudItemKind.Directory, "Next", second.ItemId, previousRemoteRevision: "remote-r0", metadata: hidden);
+        CloudRemoteChangeBatch batch = new("metadata-unproven", new byte[] { 7 }, [uncertain, next], new byte[] { 9 });
+        factory!.Armed = true;
+        CloudRemoteApplyResult failed = await fixture.System.ApplyRemoteChangesAsync(batch);
+        Assert.True(failed.RequiresRetry);
+        Assert.Equal(new byte[] { 7 }, failed.SafeCursor.ToArray());
+        Assert.IsType<CloudItemCoordinationException>(failed.Entries[0].Error);
+        Assert.True(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        await fixture.RestartAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.System.ReconcileRemoteMetadataAsync(batch, 0).AsTask());
+        CloudRemoteChangeBatch changed = new(batch.BatchId, batch.InitialCursor, batch.Changes, new byte[] { 10 });
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.System.ReconcileRemoteMetadataAsync(changed, 0).AsTask());
+
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(options: null, source);
+        await feed.StartAsync();
+        Assert.True((await feed.BeginScanAsync()).RequiresFullRescan);
+        File.SetAttributes(path, File.GetAttributes(path) & ~FileAttributes.Hidden);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), CancellationToken.None);
+        CloudRemoteApplyResult stillUnproven = await fixture.System.ApplyRemoteChangesAsync(batch);
+        Assert.True(stillUnproven.RequiresRetry);
+        Assert.Equal(new byte[] { 7 }, stillUnproven.SafeCursor.ToArray());
+
+        CloudRemoteApplyResult closed = await fixture.System.ReconcileRemoteMetadataAsync(batch, 0);
+        Assert.True(closed.RequiresRetry);
+        Assert.Equal(1, closed.AppliedEntryCount);
+        Assert.Equal(new byte[] { 8 }, closed.SafeCursor.ToArray());
+        Assert.Equal(CloudRemoteConflictReason.RemoteMetadataReconciliationRequired, closed.Entries[0].Conflict!.Reason);
+        Assert.Equal(CloudRemoteApplyEntryStatus.NotProcessed, closed.Entries[1].Status);
+        Guid conflictId = Assert.Single(closed.ConflictIds);
+        CloudRemoteApplyResult repeated = await fixture.System.ReconcileRemoteMetadataAsync(batch, 0);
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, repeated.Entries[0].Status);
+        Assert.Empty(repeated.ConflictIds);
+        CloudRemoteApplyEntryResult keepRemote = await fixture.System.ResolveRemoteConflictAsync(conflictId,
+            new(CloudRemoteConflictDecision.KeepRemote));
+        Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, keepRemote.Status);
+
+        CloudRemoteApplyResult resumed = await fixture.System.ApplyRemoteChangesAsync(batch);
+        Assert.False(resumed.RequiresRetry);
+        Assert.Equal(new byte[] { 9 }, resumed.SafeCursor.ToArray());
+        Assert.Equal(CloudRemoteApplyEntryStatus.AlreadyApplied, resumed.Entries[0].Status);
+        Assert.Equal(CloudRemoteApplyEntryStatus.Applied, resumed.Entries[1].Status);
+        Assert.False(File.GetAttributes(path).HasFlag(FileAttributes.Hidden));
+        Assert.True(File.GetAttributes(Path.Combine(fixture.Root, "Next")).HasFlag(FileAttributes.Hidden));
+        await using ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync();
+        Assert.Equal("remote-r0", (await state.Items.GetByItemIdAsync(first.ItemId))!.RemoteRevision);
+        Assert.Null(await state.Checkpoints.GetAsync(RemoteMetadataProjection.Name(batch, 0)));
+        Assert.Equal(conflictId, Assert.Single(await state.Conflicts.ListAsync()).ConflictId);
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData("new revision")]
     [InlineData("same revision")]
@@ -1351,6 +1420,8 @@ public sealed partial class CloudContentConfirmationTests
                             (await Items.GetByRelativePathAsync("Documents", cancellationToken))?.RemoteRevision == "remote-r1",
                         "projection-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
                             .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks > 0),
+                        "native-completion-before" => (await Checkpoints.ListAsync(RemoteMetadataProjection.Prefix, cancellationToken))
+                            .Any(checkpoint => RemoteMetadataProjection.Decode(checkpoint).ProjectedAtTicks == RemoteMetadataProjection.NativeWriteCompleted),
                         "staging-after" => staged is not null,
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
@@ -1395,7 +1466,7 @@ public sealed partial class CloudContentConfirmationTests
                     await inner.CommitAsync(cancellationToken);
                     return;
                 }
-                if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before" or "projection-before"))
+                if (owner._boundary is not ("outcome-before" or "passthrough-confirmation-before" or "projection-before" or "native-completion-before"))
                 { await inner.CommitAsync(cancellationToken); }
                 if (staged is not null)
                 { owner.Staged.TrySetResult(Guid.ParseExact(staged.Name[CloudLocalChangeFeed.SecurityValidationPrefix.Length..], "N")); }

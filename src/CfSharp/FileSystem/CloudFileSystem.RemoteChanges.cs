@@ -270,8 +270,8 @@ public sealed partial class CloudFileSystem
     /// transaction checks still apply, but user-mode deletion does not exclude concurrent
     /// external attribute writes. The conflict is removed only after validated completion.
     /// Calls serialize on this file-system instance; no ownership of caller resources changes.
-    /// LocalDeleteReconciliationRequired conflicts always remain Conflict for every decision:
-    /// they authorize metadata rejection only. Explicit dismissal is the non-destructive close.
+    /// Delete and metadata reconciliation conflicts remain Conflict for every decision.
+    /// Explicit dismissal closes these records after application reconciliation.
     /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
@@ -314,10 +314,10 @@ public sealed partial class CloudFileSystem
         ArgumentNullException.ThrowIfNull(resolution);
         (CloudRemoteConflict conflict, CloudConflictState durableState) =
             await ReadRemoteConflictAsync(conflictId, cancellationToken).ConfigureAwait(false);
-        if (conflict.Reason == CloudRemoteConflictReason.LocalDeleteReconciliationRequired)
+        if (conflict.Reason is CloudRemoteConflictReason.LocalDeleteReconciliationRequired or
+            CloudRemoteConflictReason.RemoteMetadataReconciliationRequired)
         {
-            // This receipt authorizes rejection only. A later occupant must never inherit
-            // destructive authority through a delayed KeepRemote or KeepBoth decision.
+            // Delayed conflict resolution cannot re-execute an uncertain native operation.
             return new(conflict.Change.ChangeId, CloudRemoteApplyEntryStatus.Conflict, conflict);
         }
         if (resolution.Decision is CloudRemoteConflictDecision.Defer or
