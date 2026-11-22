@@ -28,6 +28,8 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
     elseif ($Suite -eq 'AccessJournal') {
         @('FullyQualifiedName~AccessOnlyResidentWriteRetainsOriginalJournalAndGenuineLaterEdit',
             'FullyQualifiedName~NativeFileTimestampAndSameLengthDataWriteRetainTheirOriginalObservations',
+            'FullyQualifiedName~UnconfirmedFileTimestampPassthroughRetainsItsDelayedNotification',
+            'FullyQualifiedName~ConfirmedFileTimestampPassthroughDoesNotUnbindLaterContent',
             'FullyQualifiedName~FileMetadataPassthroughPreventsEarlierAutomaticTicketsFromConsumingContent',
             'FullyQualifiedName~DirectoryAttributeHistoryFencesALateTimestampNotificationAtAReplacementFile',
             'FullyQualifiedName~DelayedFileTimestampCannotBindToDirectoryAtTheSamePath',
@@ -51,6 +53,8 @@ $filter = if ($Suite -eq 'Delete') { 'FullyQualifiedName~OriginalDeleteRecoversI
             'FullyQualifiedName~PassthroughMetadataReopenDistinguishesConfirmedAndAmbiguousOutcomes',
             'FullyQualifiedName~MetadataOutcomeRollbackRecoversOnlyAnOriginalProjection',
             'FullyQualifiedName~MetadataProjectionRollbackRepairsOriginalWriteWithoutMutatingAgain',
+            'FullyQualifiedName~KeepRemoteMetadataRecoversTheSameConflictWithoutRewritingThePlaceholder',
+            'FullyQualifiedName~KeepRemoteMetadataRetainsConflictWhenOriginalItemIsReplacedBeforeFinalization',
             'FullyQualifiedName~UnprovenMetadataCompletionCanBeClosedWithoutRewritingAndResumeTheOriginalBatch',
             'FullyQualifiedName~DirectoryPassthroughWithholdsAnObservationReplacedDuringPublication',
             'FullyQualifiedName~MetadataPreparationFailureCanRetryAfterReconciliation',
