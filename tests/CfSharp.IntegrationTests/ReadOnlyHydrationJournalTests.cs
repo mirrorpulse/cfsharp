@@ -2,6 +2,8 @@ namespace CfSharp.IntegrationTests;
 
 public sealed partial class CloudContentConfirmationTests
 {
+    private const string OriginalSizePath = "original.bin";
+
     [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData(CloudInSyncPolicy.None)]
@@ -205,20 +207,14 @@ public sealed partial class CloudContentConfirmationTests
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         CancellationToken token = deadline.Token;
-        const string original = "original.bin";
+        const string original = OriginalSizePath;
         const string moved = "moved.bin";
         string originalPath = Path.Combine(fixture.Root, original);
         ControlledMetadataSource source = new();
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
         await File.WriteAllTextAsync(originalPath, "local content", token);
-        LocalChangeSourceEvent size = await CaptureNativeModificationAsync(fixture.Root, original, () =>
-        {
-            using FileStream file = new(originalPath, FileMode.Open, FileAccess.Write, FileShare.Read);
-            file.SetLength(4096);
-            file.Flush(flushToDisk: true);
-            return Task.CompletedTask;
-        }, token, LocalChangeSourceAction.SizeModified);
+        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, original, originalPath, token);
         Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
         await source.EmitAsync(new(LocalChangeSourceAction.Created, original));
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
@@ -242,5 +238,59 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(page.Changes[0].ItemId, page.Changes[1].ItemId);
         await using ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(token);
         Assert.Null(await state.Items.GetByRelativePathAsync(original, token));
+    }
+
+    private static Task<LocalChangeSourceEvent> CaptureOrdinarySizeChangeAsync(string root, string relativePath, string fullPath, CancellationToken token) =>
+        CaptureNativeModificationAsync(root, relativePath, () =>
+        {
+            using FileStream file = new(fullPath, FileMode.Open, FileAccess.Write, FileShare.Read);
+            file.SetLength(4096);
+            file.Flush(flushToDisk: true);
+            return Task.CompletedTask;
+        }, token, LocalChangeSourceAction.SizeModified);
+
+    [Trait("Category", "AccessJournal")]
+    [Theory]
+    [InlineData("size-before-discovery")]
+    [InlineData("size-before-commit")]
+    public async Task ReplacedSizeObservationDoesNotDiscoverTheNewOccupant(string boundary)
+    {
+        MetadataFaultFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CancellationToken token = deadline.Token;
+        string path = Path.Combine(fixture.Root, OriginalSizePath);
+        string retiredPath = Path.Combine(fixture.Root, "retired.bin");
+        await File.WriteAllTextAsync(path, "old", token);
+        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, OriginalSizePath, path, token);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        factory!.Armed = true;
+        await source.EmitAsync(size);
+        try
+        {
+            await factory.OutcomePaused.Task.WaitAsync(token);
+            File.Move(path, retiredPath);
+            await File.WriteAllBytesAsync(path, new byte[4096], token);
+        }
+        finally { factory.ResumeOutcome.TrySetResult(); }
+
+        CloudOperationJournalEntry original = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
+        Assert.Null(original.ItemId);
+        Assert.Equal(CloudStateOperationKind.ContentUpdate, original.Kind);
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(token))
+        {
+            Assert.Null(await transaction.Items.GetByRelativePathAsync(OriginalSizePath, token));
+        }
+
+        Assert.True((await feed.BeginScanAsync(token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        CloudLocalChange retained = Assert.Single(page.Changes);
+        Assert.Equal((original.OperationId, original.Sequence, OriginalSizePath), (retained.OperationId, retained.Sequence, retained.RelativePath));
+        Assert.Null(retained.ItemId);
+        Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
+        Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
     }
 }

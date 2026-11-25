@@ -975,13 +975,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
+        CloudLocalFileBinding? sizeBinding = null;
         if (sizeChange is { } size && uncertainDirectory is null)
         {
             if (pendingCreation || pendingMove || pendingDelete)
             {
                 throw new CloudNamespaceObservationUncertainException(size.Identity.IsDirectory);
             }
-            SizeObservationDisposition disposition = InspectSizeObservation(path, current, size);
+            SizeObservationDisposition disposition = InspectSizeObservation(path, current, size, out sizeBinding);
             if (disposition == SizeObservationDisposition.CleanPlaceholder) { return null; }
             if (disposition == SizeObservationDisposition.MissingOrdinaryObject)
             {
@@ -1139,7 +1140,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             ? current
             : previous ?? current;
         // A retained uncertain kind must not be reclassified through a rejected namespace.
-        bool directory = uncertainDirectory ?? (observedState?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath));
+        bool directory = uncertainDirectory ?? sizeChange?.Identity.IsDirectory ??
+            (observedState?.Kind == CloudItemKind.Directory || Directory.Exists(path.FullPath));
         using DirectoryFeedProjection? directoryProjection = uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previousPath is not null
             ? await TryProjectDirectoryAsync().ConfigureAwait(false) : null;
         if (uncertainDirectory is null && kind == CloudLocalChangeKind.Move && previous is not null && current is not null &&
@@ -1197,6 +1199,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 observedAt,
                 cancellationToken).ConfigureAwait(false);
             directoryProjection?.Validate();
+            if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding, directory); }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             directoryProjection?.Validate();
             SignalAvailable();
@@ -1215,13 +1218,16 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (uncertainDirectory is null && directoryProjection is null && discovered)
         {
             itemId = Guid.NewGuid();
+            bool discoveredDirectory = sizeChange?.Identity.IsDirectory ?? Directory.Exists(path.FullPath);
             state = new CloudItemState(
                 itemId.Value,
                 "local:" + itemId.Value.ToString("N"),
                 path.RelativePath,
-                Directory.Exists(path.FullPath) ? CloudItemKind.Directory : CloudItemKind.File,
+                discoveredDirectory ? CloudItemKind.Directory : CloudItemKind.File,
                 remoteRevision: null,
-                localFileId: TryReadDiscoveredFileId(path),
+                // An independent size notice names the object captured by Windows.
+                // Ordinary discovery cannot substitute the path's current occupant.
+                localFileId: sizeBinding is not null ? NtfsFileId(sizeBinding) : TryReadDiscoveredFileId(path),
                 isTombstone: false,
                 observedAt);
         }
@@ -1281,6 +1287,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             observedAt,
             cancellationToken).ConfigureAwait(false);
         directoryProjection?.Validate();
+        if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding, directory); }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (requiresRescan)
         {

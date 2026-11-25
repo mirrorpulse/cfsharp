@@ -10,8 +10,10 @@ public sealed partial class CloudLocalChangeFeed
 {
     private enum SizeObservationDisposition { Content, CleanPlaceholder, MissingOrdinaryObject }
 
-    private SizeObservationDisposition InspectSizeObservation(CloudItemPath path, CloudItemState? owner, LocalSizeChange size)
+    private SizeObservationDisposition InspectSizeObservation(CloudItemPath path, CloudItemState? owner, LocalSizeChange size,
+        out CloudLocalFileBinding? binding)
     {
+        binding = null;
         LocalSecurityChangeIdentity identity = size.Identity;
         CloudItemKind kind = identity.IsDirectory ? CloudItemKind.Directory : CloudItemKind.File;
         bool capturedPlaceholder = size.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder);
@@ -40,6 +42,7 @@ public sealed partial class CloudLocalChangeFeed
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
+            binding = item.LocalBinding;
             if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
             if (owner is not { Kind: CloudItemKind.File } ||
                 !CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
@@ -78,6 +81,28 @@ public sealed partial class CloudLocalChangeFeed
         {
             throw new CloudNamespaceObservationUncertainException(identity.IsDirectory, exception);
         }
+    }
+
+    private void ValidateSizeObservationBinding(CloudItemPath path, CloudLocalFileBinding binding, bool isDirectory)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
+        {
+            throw new CloudNamespaceObservationUncertainException(isDirectory);
+        }
+        try
+        {
+            using SafeFileHandle reference = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+            if (CloudLocalFileBindingPlatform.TryRead(reference.DangerousGetHandle(), _syncRootPath) == binding &&
+                MatchesAttributePath(reference, path))
+            {
+                return;
+            }
+        }
+        catch (Exception exception) when (exception is CloudPathReparsePointException or Win32Exception or IOException or UnauthorizedAccessException)
+        {
+            throw new CloudNamespaceObservationUncertainException(isDirectory, exception);
+        }
+        throw new CloudNamespaceObservationUncertainException(isDirectory);
     }
 
     private static bool IsMissingSizeObservationPath(string path)
