@@ -783,11 +783,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     cancellationToken).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.Modified:
+            case LocalChangeSourceAction.SizeModified:
                 await PersistChangeAsync(
                     CloudLocalChangeKind.ContentUpdate,
                     sourceEvent.RelativePath,
                     previousRelativePath: null,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    sizeChange: sourceEvent.SizeChange).ConfigureAwait(false);
                 break;
             case LocalChangeSourceAction.SecurityModified:
             case LocalChangeSourceAction.AttributesModified:
@@ -816,12 +818,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         string relativePath,
         string? previousRelativePath,
         CancellationToken cancellationToken,
-        LocalChangeSourceEvent? securityObservation = null)
+        LocalChangeSourceEvent? securityObservation = null,
+        LocalSizeChange? sizeChange = null)
     {
         CloudItemPath path;
         try
         {
-            path = securityObservation is null
+            path = securityObservation is null && sizeChange is null
                 ? CloudItemPathResolver.Resolve(_syncRootPath, relativePath, allowRoot: false)
                 : CloudItemPathResolver.ResolveLexically(_syncRootPath, relativePath, allowRoot: false);
         }
@@ -868,7 +871,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 ? await AcquireSecurityOperationAsync(path, securityObservation.Value, cancellationToken).ConfigureAwait(false)
                 : null;
             await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt, null,
-                cancellationToken, securityObservation).ConfigureAwait(false);
+                cancellationToken, securityObservation, sizeChange).ConfigureAwait(false);
         }
         catch (CloudNamespaceObservationUncertainException exception)
         {
@@ -878,7 +881,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             if (kind == CloudLocalChangeKind.ContentUpdate && exception.IsDirectory)
             { kind = CloudLocalChangeKind.MetadataUpdate; }
             await PersistChangeAttemptAsync(kind, path, previousPath, operationId, observedAt, exception.IsDirectory,
-                cancellationToken, securityObservation).ConfigureAwait(false);
+                cancellationToken, securityObservation, sizeChange).ConfigureAwait(false);
         }
         catch (IOException) when (kind == CloudLocalChangeKind.Move)
         {
@@ -919,7 +922,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PersistChangeAttemptAsync(CloudLocalChangeKind kind, CloudItemPath path,
         CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt, bool? uncertainDirectory,
-        CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null)
+        CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null, LocalSizeChange? sizeChange = null)
     {
         using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
         StagedSecurityObservation? staged = null;
@@ -928,7 +931,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
             {
                 staged = await PersistChangeCoreAsync(transaction, kind, path, previousPath, operationId, observedAt,
-                    uncertainDirectory, securityObservation, cancellationToken).ConfigureAwait(false);
+                    uncertainDirectory, securityObservation, sizeChange, cancellationToken).ConfigureAwait(false);
             }
 
             if (staged is not null)
@@ -945,7 +948,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask<StagedSecurityObservation?> PersistChangeCoreAsync(ICloudStateTransaction transaction,
         CloudLocalChangeKind kind, CloudItemPath path, CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt,
-        bool? uncertainDirectory, LocalChangeSourceEvent? securityObservation, CancellationToken cancellationToken)
+        bool? uncertainDirectory, LocalChangeSourceEvent? securityObservation, LocalSizeChange? sizeChange,
+        CancellationToken cancellationToken)
     {
         LocalChangeCheckpoint checkpoint = await ReadCheckpointAsync(transaction, cancellationToken)
             .ConfigureAwait(false);
@@ -971,6 +975,14 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
+        if (sizeChange is { } size && uncertainDirectory is null)
+        {
+            if (pendingCreation || pendingMove || pendingDelete)
+            {
+                throw new CloudNamespaceObservationUncertainException(size.Identity.IsDirectory);
+            }
+            if (IsCleanPlaceholderSizeObservation(path, current, size)) { return null; }
+        }
         bool uncertainFileContent = false;
         if (kind == CloudLocalChangeKind.ContentUpdate)
         {
@@ -980,13 +992,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 cancellationToken).ConfigureAwait(false)).Count != 0;
             bool historicalDirectory = await transaction.Checkpoints.GetAsync(RemoteMetadataIntent.DirectoryTimeObservationName(path.RelativePath),
                 cancellationToken).ConfigureAwait(false) is not null;
-            if (!historicalFile && uncertainDirectory is null && Directory.Exists(path.FullPath))
+            if (!historicalFile && uncertainDirectory is null && (sizeChange?.Identity.IsDirectory ?? Directory.Exists(path.FullPath)))
             {
                 kind = CloudLocalChangeKind.MetadataUpdate;
             }
             else
             {
-                uncertainFileContent = historicalFile || historicalDirectory;
+                uncertainFileContent = historicalFile || historicalDirectory || (sizeChange is not null && uncertainDirectory is not null);
             }
         }
         bool metadataObservation = kind == CloudLocalChangeKind.MetadataUpdate &&
@@ -1327,7 +1339,8 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
     private async ValueTask PublishAsync(LocalChangeSourceEvent sourceEvent)
     {
-        if (sourceEvent.Action is LocalChangeSourceAction.SecuritySubscriptionFailed or LocalChangeSourceAction.AttributeSubscriptionFailed)
+        if (sourceEvent.Action is LocalChangeSourceAction.SecuritySubscriptionFailed or LocalChangeSourceAction.AttributeSubscriptionFailed or
+            LocalChangeSourceAction.SizeSubscriptionFailed)
         {
             if (Interlocked.Exchange(ref _terminalSourceSignaled, 1) != 0) { return; }
             // Fail readers out of band, but close the input only after every subscription

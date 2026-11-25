@@ -194,15 +194,20 @@ internal enum LocalChangeSourceAction
     SecuritySubscriptionFailed,
     AttributesModified,
     AttributeSubscriptionFailed,
+    SizeModified,
+    SizeSubscriptionFailed,
 }
 
 internal readonly record struct LocalChangeSourceEvent(
     LocalChangeSourceAction Action,
     string RelativePath,
     int ErrorCode = 0,
-    LocalSecurityChangeIdentity? SecurityIdentity = null);
+    LocalSecurityChangeIdentity? SecurityIdentity = null,
+    LocalSizeChange? SizeChange = null);
 
 internal readonly record struct LocalSecurityChangeIdentity(ulong VolumeSerialNumber, Guid RootFileId, ulong FileId, ulong ParentFileId, bool IsDirectory);
+
+internal readonly record struct LocalSizeChange(LocalSecurityChangeIdentity Identity, long Length, CloudPlaceholderState PlaceholderState);
 
 internal sealed record LocalChangePayload(
     string RelativePath,

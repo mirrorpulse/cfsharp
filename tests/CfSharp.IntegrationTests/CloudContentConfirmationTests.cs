@@ -167,7 +167,7 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
     private sealed class Fixture : IAsyncDisposable
     {
         private readonly string _directory;
-        private Fixture(string directory, string root, CloudFileSystem system, UnexpectedProvider provider,
+        private Fixture(string directory, string root, CloudFileSystem system, FixtureContentProvider provider,
             SyncRootRegistrationOptions registration)
         {
             _directory = directory;
@@ -181,12 +181,13 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
         internal string Root { get; }
         internal CloudFileSystem System { get; private set; }
         internal CloudFile File { get; private set; }
-        internal UnexpectedProvider Provider { get; }
+        internal FixtureContentProvider Provider { get; }
         internal SyncRootRegistrationOptions Registration { get; }
         private ICloudStateStoreFactory? _restartFactory;
 
         internal static async Task<Fixture> StartAsync(Func<string, ICloudStateStoreFactory>? createStore = null,
-            CloudInSyncPolicy inSyncPolicy = CloudInSyncPolicy.None, bool allowHardLinks = false)
+            CloudInSyncPolicy inSyncPolicy = CloudInSyncPolicy.None, bool allowHardLinks = false, byte[]? hydrationContent = null,
+            CloudHydrationPolicy hydrationPolicy = CloudHydrationPolicy.Progressive)
         {
             // This acceptance fixture fails on unavailable Windows capabilities; it never
             // silently returns success when native confirmation has not actually executed.
@@ -194,11 +195,11 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
             string directory = Path.Combine(Path.GetTempPath(), "CfSharp-confirmation", Guid.NewGuid().ToString("N"));
             string root = Path.Combine(directory, "root");
             Directory.CreateDirectory(root);
-            UnexpectedProvider provider = new();
+            FixtureContentProvider provider = new(hydrationContent);
             string databasePath = Path.Combine(directory, "state.db");
             ICloudStateStoreFactory factory = createStore?.Invoke(databasePath) ?? new SqliteCloudStateStoreFactory(databasePath);
             SyncRootRegistrationOptions registration = SyncRootRegistrationOptions.CreateBuilder("CfSharp Confirmation", "1.0.0-test")
-                .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(CloudHydrationPolicy.Progressive)
+                .WithProviderId(Guid.NewGuid()).WithHydrationPolicy(hydrationPolicy)
                 .WithInSyncPolicy(inSyncPolicy).AllowHardLinks(allowHardLinks).Build();
             CloudFileSystem system = CloudFileSystem.CreateBuilder(root)
                 .WithStateStore(factory)
@@ -240,12 +241,18 @@ public sealed partial class CloudContentConfirmationTests(ITestOutputHelper outp
         }
     }
 
-    private sealed class UnexpectedProvider : ICloudDemandProvider
+    private sealed class FixtureContentProvider(byte[]? hydrationContent) : ICloudDemandProvider
     {
-        internal int Fetches { get; private set; }
+        private int _fetches;
+        internal int Fetches => Volatile.Read(ref _fetches);
+
         public ValueTask<Stream> OpenReadAsync(CloudFileFetchRequest request, CancellationToken cancellationToken)
         {
-            Fetches++;
+            Interlocked.Increment(ref _fetches);
+            if (hydrationContent is not null)
+            {
+                return ValueTask.FromResult<Stream>(new MemoryStream(hydrationContent, writable: false));
+            }
             throw new InvalidOperationException("Confirmation must not hydrate missing content.");
         }
 

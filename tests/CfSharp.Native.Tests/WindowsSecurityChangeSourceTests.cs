@@ -43,13 +43,18 @@ public sealed class WindowsSecurityChangeSourceTests
     public void ExtendedSecurityRecordLayoutAndBoundsMatchTheWindowsContract()
     {
         Assert.Equal(88, Marshal.SizeOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>());
+        Assert.Equal(48, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("FileSize").ToInt32());
+        Assert.Equal(56, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("FileAttributes").ToInt32());
+        Assert.Equal(60, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("ReparsePointTag").ToInt32());
         Assert.Equal(64, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("FileId").ToInt32());
         Assert.Equal(72, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("ParentFileId").ToInt32());
         Assert.Equal(84, Marshal.OffsetOf<WindowsSecurityChangeSource.FileNotifyExtendedInformation>("FileName").ToInt32());
         byte[] name = Encoding.Unicode.GetBytes("before.txt");
         byte[] record = new byte[84 + name.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(4), 3);
+        BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(48), 65537);
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(56), 0x10);
+        BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(60), 0x9000001a);
         BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(64), 0x1000000000001234);
         BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(72), 0x2000000000005678);
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(80), (uint)name.Length);
@@ -59,6 +64,9 @@ public sealed class WindowsSecurityChangeSourceTests
         Assert.Equal(0x1000000000001234ul, change.FileId);
         Assert.Equal(0x2000000000005678ul, change.ParentFileId);
         Assert.True(change.IsDirectory);
+        Assert.Equal(65537, change.FileSize);
+        Assert.Equal(0x10u, change.FileAttributes);
+        Assert.Equal(0x9000001au, change.ReparsePointTag);
         byte[] unpaired = [.. record.AsSpan(0, 84), 0, 0xd8, 0x61, 0];
         BinaryPrimitives.WriteUInt32LittleEndian(unpaired.AsSpan(80), 4);
         string nativeName = Assert.Single(WindowsSecurityChangeSource.Decode(unpaired)).RelativePath;
