@@ -197,7 +197,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 await RequiresMetadataReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations
                 .ListAsync(_options.BatchSize, cancellationToken).ConfigureAwait(false);
-            int validatedCount = await ValidatedMetadataPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
+            int validatedCount = await ValidatedObservationPrefixLengthAsync(transaction, operations, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             ThrowIfFailed();
             // Persistence can clear HasUnpersistedLoss after this snapshot was read. Capture
@@ -290,9 +290,9 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             if (operation is not null)
             {
-                if (await ValidatedMetadataPrefixLengthAsync(transaction, [operation], cancellationToken).ConfigureAwait(false) == 0)
+                if (await ValidatedObservationPrefixLengthAsync(transaction, [operation], cancellationToken).ConfigureAwait(false) == 0)
                 {
-                    throw new InvalidOperationException("The local metadata observation has not completed validation.");
+                    throw new InvalidOperationException("The local observation has not completed validation.");
                 }
                 if (acknowledgement.RemoteRevision is not null && operation.ItemId is Guid itemId)
                 {
@@ -925,7 +925,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken, LocalChangeSourceEvent? securityObservation = null, LocalSizeChange? sizeChange = null)
     {
         using IDisposable? publication = await AcquirePublicationAsync(cancellationToken).ConfigureAwait(false);
-        StagedSecurityObservation? staged = null;
+        IStagedObservation? staged = null;
         try
         {
             await using (ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
@@ -936,8 +936,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
 
             if (staged is not null)
             {
-                staged.Projection.Validate();
-                await PublishValidatedSecurityObservationAsync(staged.Entry, staged.Projection, staged.Observation, cancellationToken).ConfigureAwait(false);
+                await staged.PublishAsync(this, cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -946,7 +945,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
     }
 
-    private async ValueTask<StagedSecurityObservation?> PersistChangeCoreAsync(ICloudStateTransaction transaction,
+    private async ValueTask<IStagedObservation?> PersistChangeCoreAsync(ICloudStateTransaction transaction,
         CloudLocalChangeKind kind, CloudItemPath path, CloudItemPath? previousPath, Guid operationId, DateTimeOffset observedAt,
         bool? uncertainDirectory, LocalChangeSourceEvent? securityObservation, LocalSizeChange? sizeChange,
         CancellationToken cancellationToken)
@@ -1082,12 +1081,12 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             LocalChangePayload uncertain = new(path.RelativePath, previousPath?.RelativePath, directoryObservation, observedAt);
             if (uncertainFileContent)
             {
-                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.ContentUpdate, null,
-                    uncertain.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+                await RetainUnboundObservationAsync(transaction, operationId, uncertain.Encode(), observedAt,
+                    cancellationToken, CloudStateOperationKind.ContentUpdate).ConfigureAwait(false);
             }
             else if (securityObservation is not null || pendingMetadata)
             {
-                await RetainUnboundSecurityObservationAsync(transaction, operationId, uncertain.Encode(), observedAt,
+                await RetainUnboundObservationAsync(transaction, operationId, uncertain.Encode(), observedAt,
                     cancellationToken).ConfigureAwait(false);
             }
             if (uncertainFileContent || ambiguousDirectoryGeneration)
@@ -1263,13 +1262,23 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             observedAt);
         byte[] encoded = payload.Encode();
         CloudOperationJournalEntry entry = new(operationId, operationKind, itemId, encoded, observedAt);
+        StagedSizeObservation? stagedSize = null;
         if (securityObservation is not null)
         {
-            await RetainUnboundSecurityObservationAsync(transaction, operationId, encoded, observedAt, cancellationToken).ConfigureAwait(false);
+            await RetainUnboundObservationAsync(transaction, operationId, encoded, observedAt, cancellationToken).ConfigureAwait(false);
         }
         else if (await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false) is null)
         {
-            await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
+            CloudOperationJournalEntry appended = await transaction.Operations.EnqueueAsync(entry, cancellationToken).ConfigureAwait(false);
+            if (sizeBinding is not null)
+            {
+                RequireJournalAssociationUpdates(transaction);
+                // Commit the row and its validation receipt together. The worker
+                // rechecks the binding after the store releases the transaction.
+                await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), encoded, observedAt),
+                    cancellationToken).ConfigureAwait(false);
+                stagedSize = new(path, sizeBinding, directory, appended);
+            }
         }
 
         bool requiresRescan = uncertainDirectory is not null || directoryProjection?.RequiresRescan == true;
@@ -1295,6 +1304,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         }
 
         directoryProjection?.Validate();
+        if (stagedSize is not null) { return stagedSize; }
         SignalAvailable();
         return null;
 
@@ -1419,7 +1429,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             await RecoverMetadataIntentsAsync(transaction, cancellationToken).ConfigureAwait(false);
         (bool retiredTimeMarkers, bool timeMarkersRequireReconciliation) = await RetireTimeObservationsBeforeStartingAsync(transaction.Checkpoints,
             cancellationToken).ConfigureAwait(false);
-        bool recoveredObservations = await RecoverStagedSecurityObservationsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        bool recoveredObservations = await RecoverStagedObservationsAsync(transaction, cancellationToken).ConfigureAwait(false);
         if (recoveredObservations || metadataRequiresReconciliation || timeMarkersRequireReconciliation)
         {
             await UpsertCheckpointAsync(transaction, checkpoint.Observation, true, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);

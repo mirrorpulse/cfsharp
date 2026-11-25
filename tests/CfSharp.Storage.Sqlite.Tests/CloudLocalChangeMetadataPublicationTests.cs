@@ -38,8 +38,10 @@ public sealed partial class CloudLocalChangeFeedTests
         Assert.True((await reopened.BeginScanAsync()).RequiresFullRescan);
     }
 
-    [Fact]
-    public async Task CommittedUnvalidatedMetadataRecoversUnboundWithItsOriginalSequence()
+    [Theory]
+    [InlineData(CloudStateOperationKind.MetadataUpdate)]
+    [InlineData(CloudStateOperationKind.ContentUpdate)]
+    public async Task CommittedUnvalidatedObservationRecoversUnboundWithItsOriginalSequence(CloudStateOperationKind kind)
     {
         await using ICloudStateStore store = await OpenStoreAsync();
         Guid operationId = Guid.NewGuid();
@@ -51,7 +53,7 @@ public sealed partial class CloudLocalChangeFeedTests
         {
             await interrupted.Items.UpsertAsync(new(itemId, "original", "history.bin", CloudItemKind.File,
                 "accepted", null, false, observedAt));
-            original = await interrupted.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate,
+            original = await interrupted.Operations.EnqueueAsync(new(operationId, kind,
                 itemId, payload, observedAt, attemptCount: 2, retryAfter: observedAt.AddMinutes(1)));
             await interrupted.Checkpoints.UpsertAsync(new(CloudLocalChangeFeed.SecurityValidationPrefix + operationId.ToString("N"),
                 payload, observedAt));

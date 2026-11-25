@@ -331,9 +331,11 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData("size-before-append")]
-    [InlineData("size-before-commit")]
-    public async Task ReplacedTrackedSizeObservationRemainsUnboundBeforeCommit(string boundary)
+    [InlineData("size-before-append", true)]
+    [InlineData("size-before-commit", true)]
+    [InlineData("size-publication-committed", true)]
+    [InlineData("size-publication-committed", false)]
+    public async Task TrackedSizeObservationPublishesOnlyVerifiedAssociation(string boundary, bool replace)
     {
         MetadataFaultFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
@@ -351,16 +353,39 @@ public sealed partial class CloudContentConfirmationTests
         await feed.AcknowledgeAsync([created.OperationId], token);
         factory!.Armed = true;
         await source.EmitAsync(size);
+        CloudOperationJournalEntry? provisional = null;
         try
         {
             await factory.OutcomePaused.Task.WaitAsync(token);
-            File.Move(path, retiredPath);
-            await File.WriteAllBytesAsync(path, new byte[4096], token);
+            if (replace)
+            {
+                File.Move(path, retiredPath);
+                await File.WriteAllBytesAsync(path, new byte[4096], token);
+            }
+            if (boundary == "size-publication-committed")
+            {
+                provisional = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
+                Assert.Equal(created.ItemId, provisional.ItemId);
+                CloudLocalChangePage waiting = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+                Assert.False(waiting.RequiresFullRescan);
+                Assert.Empty(waiting.Changes);
+                Assert.True(waiting.HasMore);
+                Assert.Equal(0, waiting.LastScannedSequence);
+                await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeAsync([provisional.OperationId], token).AsTask());
+            }
         }
         finally { factory.ResumeOutcome.TrySetResult(); }
 
+        CloudLocalChangeBatch published = await feed.ReadBatchAsync(token);
+        Assert.Equal(replace, published.RequiresFullRescan);
+        if (replace) { await WaitForMetadataRescanMarkerAsync(factory.Store!, token); }
         CloudOperationJournalEntry original = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
-        Assert.Null(original.ItemId);
+        if (provisional is not null)
+        {
+            Assert.Equal((provisional.OperationId, provisional.Sequence), (original.OperationId, original.Sequence));
+        }
+        Guid? expectedItemId = replace ? null : created.ItemId;
+        Assert.Equal(expectedItemId, original.ItemId);
         Assert.Equal(CloudStateOperationKind.ContentUpdate, original.Kind);
         await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(token))
         {
@@ -368,14 +393,17 @@ public sealed partial class CloudContentConfirmationTests
             Assert.Equal((created.ItemId, OriginalSizePath), (retainedOwner.ItemId, retainedOwner.RelativePath));
         }
 
-        Assert.True((await feed.BeginScanAsync(token)).RequiresFullRescan);
-        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
+        if (replace)
+        {
+            await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
+            Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
+            Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
+        }
         CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
         CloudLocalChange retained = Assert.Single(page.Changes);
         Assert.Equal((original.OperationId, original.Sequence, OriginalSizePath), (retained.OperationId, retained.Sequence, retained.RelativePath));
-        Assert.Null(retained.ItemId);
-        Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
-        Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
+        Assert.Equal(expectedItemId, retained.ItemId);
+        await feed.AcknowledgeAsync([retained.OperationId], token);
     }
 
     [Trait("Category", "AccessJournal")]

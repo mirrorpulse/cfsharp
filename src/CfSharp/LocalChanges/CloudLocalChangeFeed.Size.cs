@@ -10,6 +10,18 @@ public sealed partial class CloudLocalChangeFeed
 {
     private enum SizeObservationDisposition { Content, CleanPlaceholder, Unbound }
 
+    private sealed record StagedSizeObservation(CloudItemPath Path, CloudLocalFileBinding Binding,
+        bool IsDirectory, CloudOperationJournalEntry Entry) : IStagedObservation
+    {
+        public ValueTask PublishAsync(CloudLocalChangeFeed feed, CancellationToken cancellationToken)
+        {
+            feed.ValidateSizeObservationBinding(Path, Binding, IsDirectory);
+            return feed.CompleteValidatedObservationAsync(Entry.OperationId, Entry.Sequence, cancellationToken);
+        }
+
+        public void Dispose() { }
+    }
+
     private SizeObservationDisposition InspectSizeObservation(CloudItemPath path, CloudItemState owner, LocalSizeChange size,
         out CloudLocalFileBinding? binding)
     {

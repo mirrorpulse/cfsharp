@@ -1749,6 +1749,8 @@ public sealed partial class CloudContentConfirmationTests
                         "conflict-outcome-before" => owner.CancelConflictOutcome is { } configured &&
                             await Conflicts.GetAsync(configured.ConflictId, cancellationToken) is null,
                         "staging-after" or "staging-paused-after" => staged is not null,
+                        "size-publication-committed" => (await Operations.ListAsync(2, cancellationToken))
+                            .Any(row => row.Kind == CloudStateOperationKind.ContentUpdate && row.ItemId.HasValue),
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
                         "overlapping-outcome" => intents.Any(intent => intent.Completed && !intent.OutcomeConfirmed),
@@ -1779,7 +1781,7 @@ public sealed partial class CloudContentConfirmationTests
                     return;
                 }
                 if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or
-                    "rescan-awaiting-authorization" or "staging-paused-after")
+                    "rescan-awaiting-authorization" or "staging-paused-after" or "size-publication-committed")
                 {
                     await inner.CommitAsync(cancellationToken);
                     owner.OutcomePaused.TrySetResult();

@@ -126,7 +126,7 @@ public sealed partial class CloudLocalChangeFeed
         bool rescan = scan.RequiresFullRescan || HasUnpersistedLoss ||
             ScanIsInvalidated(scan) ||
             await RequiresScanReconciliationAsync(transaction, cancellationToken).ConfigureAwait(false);
-        int validatedCount = rescan ? 0 : await ValidatedMetadataPrefixLengthAsync(transaction, journalPage.Operations, cancellationToken).ConfigureAwait(false);
+        int validatedCount = rescan ? 0 : await ValidatedObservationPrefixLengthAsync(transaction, journalPage.Operations, cancellationToken).ConfigureAwait(false);
         bool pendingValidation = validatedCount < journalPage.Operations.Count;
         CloudLocalChange[] changes = rescan ? [] : journalPage.Operations.Take(validatedCount).Select(DecodeScannedChange).ToArray();
         long lastScanned = pendingValidation
