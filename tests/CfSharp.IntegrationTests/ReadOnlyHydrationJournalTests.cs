@@ -321,4 +321,59 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
         Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
     }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task OrdinarySizeObservationDoesNotReuseAnUnboundPlaceholderItem()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CancellationToken token = deadline.Token;
+        string relativePath = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        string retiredPath = Path.Combine(fixture.Root, "retired.bin");
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "original-size-placeholder", "revision-1");
+        (await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudFilePlaceholderSpec.CreateBuilder(relativePath, identity, 4096).WithInSyncState(true).Build(),
+        ], cancellationToken: token)).ThrowIfAnyFailed();
+        CloudItemState original;
+        await using (ICloudStateTransaction transaction = await factory!.Store!.BeginTransactionAsync(token))
+        {
+            original = Assert.IsType<CloudItemState>(await transaction.Items.GetByRelativePathAsync(relativePath, token));
+            Assert.Equal(identity.ItemId, original.ItemId);
+            Assert.Null(original.LocalFileId);
+        }
+
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        File.Move(path, retiredPath);
+        await File.WriteAllTextAsync(path, "replacement", token);
+        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, relativePath, path, token);
+        Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
+        // Deliver Size before the name source has projected the replacement.
+        await source.EmitAsync(size);
+
+        CloudOperationJournalEntry observation = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
+        Assert.Equal(CloudStateOperationKind.ContentUpdate, observation.Kind);
+        Assert.Null(observation.ItemId);
+        await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(token))
+        {
+            CloudItemState retained = Assert.IsType<CloudItemState>(await transaction.Items.GetByRelativePathAsync(relativePath, token));
+            Assert.Equal((original.ItemId, original.RemoteId, original.RemoteRevision, original.LocalFileId, original.UpdatedAt),
+                (retained.ItemId, retained.RemoteId, retained.RemoteRevision, retained.LocalFileId, retained.UpdatedAt));
+        }
+
+        Assert.True((await feed.BeginScanAsync(token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        CloudLocalChange change = Assert.Single(page.Changes);
+        Assert.Equal((observation.OperationId, observation.Sequence, relativePath), (change.OperationId, change.Sequence, change.RelativePath));
+        Assert.Null(change.ItemId);
+        await feed.AcknowledgeAsync([change.OperationId], token);
+        Assert.Empty(await AccessRowsAsync(factory));
+        Assert.Equal("replacement"u8.ToArray(), (await File.ReadAllBytesAsync(path, token))[..11]);
+        Assert.True(File.Exists(retiredPath));
+    }
 }

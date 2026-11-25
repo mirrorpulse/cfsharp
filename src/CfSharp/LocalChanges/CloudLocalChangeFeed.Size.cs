@@ -29,10 +29,14 @@ public sealed partial class CloudLocalChangeFeed
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
             LocalCloudItemInspection item = CloudItemInspector.Inspect(reference, path.FullPath, kind, _syncRootPath);
+            // The native notice identifies today's object. To reuse an existing row for
+            // an ordinary object, its recorded FileId must also identify that object.
             if (NtfsFileId(item.LocalBinding) is not long fileId || unchecked((ulong)fileId) != identity.FileId ||
                 item.LocalBinding?.VolumeSerialNumber != identity.VolumeSerialNumber ||
                 item.LocalBinding.SyncRootFileId != identity.RootFileId ||
-                (owner?.LocalFileId is long recorded && recorded != fileId) || owner?.IsTombstone == true ||
+                (owner is not null && (owner.IsTombstone || owner.Kind != kind ||
+                    (!capturedPlaceholder && owner.LocalFileId is null) ||
+                    (owner.LocalFileId is long recorded && recorded != fileId))) ||
                 !MatchesAttributePath(reference, path))
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);

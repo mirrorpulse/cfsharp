@@ -28,10 +28,12 @@ for a known file placeholder produces no content row when the native notice and 
 object agree on identity, logical length and in-sync state, and Windows reports only validated
 data. If the object was replaced or the captured and current states disagree, the feed retains an
 unbound observation and requires reconciliation. Discovery uses the validated file ID and
-rechecks the path binding before committing the item and journal row. A size notice delayed
-past the removal of an ordinary name also stays unbound, while the ordered name subscription
-tracks the removal or move. Last-write notifications remain independent, so a same-length local
-write overlapping hydration can still be read and acknowledged separately.
+rechecks the path binding before committing the item and journal row. A size notice for an
+ordinary file can reuse an existing item ID only when its durable native file ID matches the
+observed object. A size notice delayed past the removal of an ordinary name also stays unbound,
+while the ordered name subscription tracks the removal or move. Last-write notifications remain
+independent, so a same-length local write overlapping hydration can still be read and
+acknowledged separately.
 
 For newly discovered ordinary files and directories, the feed also retains the native NTFS file
 reference in the official item row. A later attribute record can bind to that exact object without
