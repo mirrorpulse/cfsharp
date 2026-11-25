@@ -1661,7 +1661,7 @@ public sealed partial class CloudContentConfirmationTests
             public ICloudItemStateRepository Items => inner.Items;
             public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites ||
                 owner._boundary is "rescan-before-preparation" or "metadata-cancel-preparation" or
-                    "size-before-discovery" or "size-before-commit" ? this : inner.Checkpoints;
+                    "size-before-append" or "size-before-commit" ? this : inner.Checkpoints;
             public ICloudOperationJournal Operations => inner.Operations;
             public ICloudConflictRepository Conflicts => inner.Conflicts;
             public ICloudRemoteBatchRepository RemoteBatches => owner.OverlappingWrites ? this : inner.RemoteBatches;
@@ -1669,9 +1669,9 @@ public sealed partial class CloudContentConfirmationTests
 
             async ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken)
             {
-                if (owner._boundary == "size-before-discovery" && name == RemoteMetadataIntent.DirectoryTimeObservationName(OriginalSizePath))
+                if (owner._boundary == "size-before-append" && name == RemoteMetadataIntent.DirectoryTimeObservationName(OriginalSizePath))
                 {
-                    await PauseSizeDiscoveryAsync("size-before-discovery", cancellationToken);
+                    await PauseSizeDiscoveryAsync("size-before-append", cancellationToken);
                 }
                 return await inner.Checkpoints.GetAsync(name, cancellationToken);
             }

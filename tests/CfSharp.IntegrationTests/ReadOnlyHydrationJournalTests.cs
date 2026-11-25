@@ -278,10 +278,62 @@ public sealed partial class CloudContentConfirmationTests
         }, token, LocalChangeSourceAction.SizeModified);
 
     [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task SizeBeforeRenamePreservesTheOriginalItemId()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CancellationToken token = deadline.Token;
+        const string renamed = "renamed.bin";
+        string originalPath = Path.Combine(fixture.Root, OriginalSizePath);
+        string renamedPath = Path.Combine(fixture.Root, renamed);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        await File.WriteAllTextAsync(originalPath, "original", token);
+        await source.EmitAsync(new(LocalChangeSourceAction.Created, OriginalSizePath));
+        CloudOperationJournalEntry created = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
+        Guid itemId = Assert.IsType<Guid>(created.ItemId);
+        await feed.AcknowledgeAsync([created.OperationId], token);
+
+        File.Move(originalPath, renamedPath);
+        await source.EmitAsync(await CaptureOrdinarySizeChangeAsync(fixture.Root, renamed, renamedPath, token));
+        CloudOperationJournalEntry size = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
+        Assert.Null(size.ItemId);
+        await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(token))
+        {
+            Assert.Null(await state.Items.GetByRelativePathAsync(renamed, token));
+            Assert.Equal(itemId, (await state.Items.GetByRelativePathAsync(OriginalSizePath, token))!.ItemId);
+        }
+
+        await source.EmitAsync(new(LocalChangeSourceAction.RenamedOldName, OriginalSizePath));
+        await source.EmitAsync(new(LocalChangeSourceAction.RenamedNewName, renamed));
+        await WaitForAccessRowsAsync(factory, rows => rows.Count == 2);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        Assert.False(page.RequiresFullRescan);
+        Assert.Collection(page.Changes,
+            change =>
+            {
+                Assert.Equal((size.OperationId, size.Sequence, renamed), (change.OperationId, change.Sequence, change.RelativePath));
+                Assert.Equal(CloudLocalChangeKind.ContentUpdate, change.Kind);
+                Assert.Null(change.ItemId);
+            },
+            change =>
+            {
+                Assert.Equal(CloudLocalChangeKind.Move, change.Kind);
+                Assert.Equal((itemId, OriginalSizePath, renamed), (change.ItemId, change.PreviousRelativePath, change.RelativePath));
+            });
+        await using ICloudStateTransaction confirmed = await factory.Store!.BeginTransactionAsync(token);
+        CloudItemState owner = Assert.Single(await confirmed.Items.ListSubtreeAsync(string.Empty, token));
+        Assert.Equal((itemId, renamed), (owner.ItemId, owner.RelativePath));
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData("size-before-discovery")]
+    [InlineData("size-before-append")]
     [InlineData("size-before-commit")]
-    public async Task ReplacedSizeObservationDoesNotDiscoverTheNewOccupant(string boundary)
+    public async Task ReplacedTrackedSizeObservationRemainsUnboundBeforeCommit(string boundary)
     {
         MetadataFaultFactory? factory = null;
         await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
@@ -294,6 +346,9 @@ public sealed partial class CloudContentConfirmationTests
         ControlledMetadataSource source = new();
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
+        await source.EmitAsync(new(LocalChangeSourceAction.Created, OriginalSizePath));
+        CloudOperationJournalEntry created = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
+        await feed.AcknowledgeAsync([created.OperationId], token);
         factory!.Armed = true;
         await source.EmitAsync(size);
         try
@@ -309,7 +364,8 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudStateOperationKind.ContentUpdate, original.Kind);
         await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(token))
         {
-            Assert.Null(await transaction.Items.GetByRelativePathAsync(OriginalSizePath, token));
+            CloudItemState retainedOwner = Assert.Single(await transaction.Items.ListSubtreeAsync(string.Empty, token));
+            Assert.Equal((created.ItemId, OriginalSizePath), (retainedOwner.ItemId, retainedOwner.RelativePath));
         }
 
         Assert.True((await feed.BeginScanAsync(token)).RequiresFullRescan);

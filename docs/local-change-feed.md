@@ -27,11 +27,11 @@ hydration increases physical allocation and leaves the logical length unchanged.
 for a known file placeholder produces no content row when the native notice and the current
 object agree on identity, logical length and in-sync state, and Windows reports only validated
 data. If the object was replaced or the captured and current states disagree, the feed retains an
-unbound observation and requires reconciliation. Discovery uses the validated file ID and
-rechecks the path binding before committing the item and journal row. A size notice for an
-ordinary file can reuse an existing item ID only when its durable native file ID matches the
-observed object. A size notice delayed past the removal of an ordinary name also stays unbound,
-while the ordered name subscription tracks the removal or move. Last-write notifications remain
+unbound observation and requires reconciliation. A size notice for a path without an item row
+stays unbound. The ordered name subscription establishes ownership, including when Size arrives
+before a rename or after an ordinary name disappears. A size notice for an ordinary file can
+reuse an existing item ID only when its durable native file ID matches the observed object.
+The feed rechecks that binding before committing the journal row. Last-write notifications remain
 independent, so a same-length local write overlapping hydration can still be read and
 acknowledged separately.
 

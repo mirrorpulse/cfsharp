@@ -982,15 +982,18 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             {
                 throw new CloudNamespaceObservationUncertainException(size.Identity.IsDirectory);
             }
-            SizeObservationDisposition disposition = InspectSizeObservation(path, current, size, out sizeBinding);
+            SizeObservationDisposition disposition = current is null
+                ? SizeObservationDisposition.Unbound
+                : InspectSizeObservation(path, current, size, out sizeBinding);
             if (disposition == SizeObservationDisposition.CleanPlaceholder) { return null; }
-            if (disposition == SizeObservationDisposition.MissingOrdinaryObject)
+            if (disposition == SizeObservationDisposition.Unbound)
             {
-                // The independent size source can lag the ordered name/time source.
-                // A missing ordinary name is not proof of watcher loss. Keep the
-                // historical observation without rediscovering the old name.
-                LocalChangePayload historical = new(path.RelativePath, null, IsDirectory: false, observedAt);
-                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.ContentUpdate, null,
+                // The independent size source can arrive on either side of a rename.
+                // Only the ordered name/time source can establish namespace ownership.
+                LocalChangePayload historical = new(path.RelativePath, null, size.Identity.IsDirectory, observedAt);
+                CloudStateOperationKind operation = size.Identity.IsDirectory
+                    ? CloudStateOperationKind.MetadataUpdate : CloudStateOperationKind.ContentUpdate;
+                await transaction.Operations.EnqueueAsync(new(operationId, operation, null,
                     historical.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
                 await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt,
                     cancellationToken).ConfigureAwait(false);
@@ -1218,16 +1221,13 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         if (uncertainDirectory is null && directoryProjection is null && discovered)
         {
             itemId = Guid.NewGuid();
-            bool discoveredDirectory = sizeChange?.Identity.IsDirectory ?? Directory.Exists(path.FullPath);
             state = new CloudItemState(
                 itemId.Value,
                 "local:" + itemId.Value.ToString("N"),
                 path.RelativePath,
-                discoveredDirectory ? CloudItemKind.Directory : CloudItemKind.File,
+                Directory.Exists(path.FullPath) ? CloudItemKind.Directory : CloudItemKind.File,
                 remoteRevision: null,
-                // An independent size notice names the object captured by Windows.
-                // Ordinary discovery cannot substitute the path's current occupant.
-                localFileId: sizeBinding is not null ? NtfsFileId(sizeBinding) : TryReadDiscoveredFileId(path),
+                localFileId: TryReadDiscoveredFileId(path),
                 isTombstone: false,
                 observedAt);
         }
