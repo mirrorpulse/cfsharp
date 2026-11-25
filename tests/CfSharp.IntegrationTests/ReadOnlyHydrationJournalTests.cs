@@ -150,11 +150,17 @@ public sealed partial class CloudContentConfirmationTests
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
 
-        LocalChangeSourceEvent hydration = await CaptureNativeModificationAsync(fixture.Root, name, async () =>
-        {
-            Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
-        }, token, LocalChangeSourceAction.SizeModified);
-        Assert.True(hydration.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
+        CloudItemSnapshot hydrated = await fixture.File.InspectAsync(token);
+        Assert.True(hydrated.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(hydrated.LocalBinding);
+        long fileId = Assert.IsType<long>(hydrated.LocalFileId);
+        // The live-feed tests cover the real size subscription. Freeze the native
+        // snapshot here so the delayed-delivery test does not depend on whether
+        // Windows generates a size notice for this particular allocation.
+        LocalSizeChange size = new(new(binding.VolumeSerialNumber, binding.SyncRootFileId,
+            unchecked((ulong)fileId), ParentFileId: 0, IsDirectory: false), bytes.Length, hydrated.PlaceholderState);
+        LocalChangeSourceEvent hydration = new(LocalChangeSourceAction.SizeModified, name, SizeChange: size);
         LocalChangeSourceEvent write = await CaptureNativeModificationAsync(fixture.Root, name, async () =>
         {
             await using FileStream writer = new(path, FileMode.Open, FileAccess.Write, FileShare.Read);
@@ -205,8 +211,14 @@ public sealed partial class CloudContentConfirmationTests
         ControlledMetadataSource source = new();
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
-        LocalChangeSourceEvent size = await CaptureNativeModificationAsync(fixture.Root, original,
-            () => File.WriteAllTextAsync(originalPath, "local content", token), token, LocalChangeSourceAction.SizeModified);
+        await File.WriteAllTextAsync(originalPath, "local content", token);
+        LocalChangeSourceEvent size = await CaptureNativeModificationAsync(fixture.Root, original, () =>
+        {
+            using FileStream file = new(originalPath, FileMode.Open, FileAccess.Write, FileShare.Read);
+            file.SetLength(4096);
+            file.Flush(flushToDisk: true);
+            return Task.CompletedTask;
+        }, token, LocalChangeSourceAction.SizeModified);
         Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
         await source.EmitAsync(new(LocalChangeSourceAction.Created, original));
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
