@@ -191,4 +191,44 @@ public sealed partial class CloudContentConfirmationTests
         await WaitForAccessRowsAsync(factory, rows => rows.Any(row => row.Kind == CloudStateOperationKind.Create &&
             LocalChangePayload.Decode(row.Payload).RelativePath == name));
     }
+
+    [Fact]
+    public async Task DelayedOrdinarySizeNoticeDoesNotInterruptTheOrderedMove()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path));
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
+        CancellationToken token = deadline.Token;
+        const string original = "original.bin";
+        const string moved = "moved.bin";
+        string originalPath = Path.Combine(fixture.Root, original);
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        LocalChangeSourceEvent size = await CaptureNativeModificationAsync(fixture.Root, original,
+            () => File.WriteAllTextAsync(originalPath, "local content", token), token, LocalChangeSourceAction.SizeModified);
+        Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
+        await source.EmitAsync(new(LocalChangeSourceAction.Created, original));
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
+        File.Move(originalPath, Path.Combine(fixture.Root, moved));
+        await source.EmitAsync(new(LocalChangeSourceAction.RenamedOldName, original));
+        await source.EmitAsync(new(LocalChangeSourceAction.RenamedNewName, moved));
+        await source.EmitAsync(size);
+        await WaitForAccessRowsAsync(factory!, rows => rows.Count == 3);
+
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        Assert.False(page.RequiresFullRescan);
+        Assert.Collection(page.Changes,
+            change => { Assert.Equal(CloudLocalChangeKind.Create, change.Kind); Assert.NotNull(change.ItemId); },
+            change => { Assert.Equal(CloudLocalChangeKind.Move, change.Kind); Assert.Equal(moved, change.RelativePath); },
+            change =>
+            {
+                Assert.Equal(CloudLocalChangeKind.ContentUpdate, change.Kind);
+                Assert.Equal(original, change.RelativePath);
+                Assert.Null(change.ItemId);
+            });
+        Assert.Equal(page.Changes[0].ItemId, page.Changes[1].ItemId);
+        await using ICloudStateTransaction state = await factory!.Store!.BeginTransactionAsync(token);
+        Assert.Null(await state.Items.GetByRelativePathAsync(original, token));
+    }
 }

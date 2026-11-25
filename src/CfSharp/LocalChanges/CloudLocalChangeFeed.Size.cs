@@ -8,10 +8,13 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
-    private bool IsCleanPlaceholderSizeObservation(CloudItemPath path, CloudItemState? owner, LocalSizeChange size)
+    private enum SizeObservationDisposition { Content, CleanPlaceholder, MissingOrdinaryObject }
+
+    private SizeObservationDisposition InspectSizeObservation(CloudItemPath path, CloudItemState? owner, LocalSizeChange size)
     {
         LocalSecurityChangeIdentity identity = size.Identity;
         CloudItemKind kind = identity.IsDirectory ? CloudItemKind.Directory : CloudItemKind.File;
+        bool capturedPlaceholder = size.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder);
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
         {
             throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
@@ -33,12 +36,11 @@ public sealed partial class CloudLocalChangeFeed
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
 
-            bool capturedPlaceholder = size.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder);
             if (capturedPlaceholder != item.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder))
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
-            if (kind != CloudItemKind.File || !capturedPlaceholder) { return false; }
+            if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
             if (owner is not { Kind: CloudItemKind.File } ||
                 !CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
                 placeholder.ItemId != owner.ItemId || placeholder.RemoteId != owner.RemoteId ||
@@ -59,7 +61,16 @@ public sealed partial class CloudLocalChangeFeed
                 // Preserve the original without letting it authorize an upload.
                 throw new CloudNamespaceObservationUncertainException(isDirectory: false);
             }
-            return inSyncNow;
+            return inSyncNow ? SizeObservationDisposition.CleanPlaceholder : SizeObservationDisposition.Content;
+        }
+        catch (Win32Exception exception) when (kind == CloudItemKind.File && !capturedPlaceholder && exception.NativeErrorCode is 2 or 3)
+        {
+            return SizeObservationDisposition.MissingOrdinaryObject;
+        }
+        catch (CloudNamespaceObservationUncertainException) when (kind == CloudItemKind.File && !capturedPlaceholder &&
+            IsMissingSizeObservationPath(path.FullPath))
+        {
+            return SizeObservationDisposition.MissingOrdinaryObject;
         }
         catch (Exception exception) when (exception is not CloudNamespaceObservationUncertainException &&
             exception is (CloudPathReparsePointException or CloudFilesException or Win32Exception or
@@ -67,5 +78,12 @@ public sealed partial class CloudLocalChangeFeed
         {
             throw new CloudNamespaceObservationUncertainException(identity.IsDirectory, exception);
         }
+    }
+
+    private static bool IsMissingSizeObservationPath(string path)
+    {
+        try { _ = File.GetAttributes(path); }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException) { return true; }
+        return false;
     }
 }

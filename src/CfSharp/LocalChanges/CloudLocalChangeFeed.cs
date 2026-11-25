@@ -981,7 +981,22 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             {
                 throw new CloudNamespaceObservationUncertainException(size.Identity.IsDirectory);
             }
-            if (IsCleanPlaceholderSizeObservation(path, current, size)) { return null; }
+            SizeObservationDisposition disposition = InspectSizeObservation(path, current, size);
+            if (disposition == SizeObservationDisposition.CleanPlaceholder) { return null; }
+            if (disposition == SizeObservationDisposition.MissingOrdinaryObject)
+            {
+                // The independent size source can lag the ordered name/time source.
+                // A missing ordinary name is not proof of watcher loss. Keep the
+                // historical observation without rediscovering the old name.
+                LocalChangePayload historical = new(path.RelativePath, null, IsDirectory: false, observedAt);
+                await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.ContentUpdate, null,
+                    historical.Encode(), observedAt), cancellationToken).ConfigureAwait(false);
+                await UpsertCheckpointAsync(transaction, observation, checkpoint.RequiresFullRescan, observedAt,
+                    cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                SignalAvailable();
+                return null;
+            }
         }
         bool uncertainFileContent = false;
         if (kind == CloudLocalChangeKind.ContentUpdate)
