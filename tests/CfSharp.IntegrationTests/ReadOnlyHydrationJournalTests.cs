@@ -342,6 +342,59 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Fact]
+    public async Task SizeAfterRevisionAcknowledgementRemainsBoundToTheSamePlaceholder()
+    {
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path), hydrationContent: "seed"u8.ToArray());
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(25));
+        CancellationToken token = deadline.Token;
+        string name = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "acked-size-owner", "revision-1");
+        (await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudFilePlaceholderSpec.CreateBuilder(name, identity, 4).WithInSyncState(true).Build(),
+        ], cancellationToken: token)).ThrowIfAnyFailed();
+        Assert.Equal("seed"u8.ToArray(), await File.ReadAllBytesAsync(path, token));
+        CloudItemSnapshot original = await fixture.File.InspectAsync(token);
+        await fixture.File.UpdatePlaceholderAsync(CloudPlaceholderPatch.CreateBuilder().WithInSyncState(false).Build(), token);
+
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        await source.EmitAsync(await CaptureContentGrowthAsync(fixture.Root, name, path, (byte)'1', token));
+        CloudLocalChangeBatch firstBatch = await feed.ReadBatchAsync(token);
+        Assert.False(firstBatch.RequiresFullRescan);
+        CloudLocalChange first = Assert.Single(firstBatch.Changes);
+        Assert.Equal((CloudLocalChangeKind.ContentUpdate, identity.ItemId, name), (first.Kind, first.ItemId, first.RelativePath));
+        await feed.AcknowledgeAsync([new CloudLocalChangeAcknowledgement(first.OperationId, "revision-2")], token);
+        await using (ICloudStateTransaction transaction = await factory!.Store!.BeginTransactionAsync(token))
+        {
+            CloudItemState owner = Assert.IsType<CloudItemState>(await transaction.Items.GetByItemIdAsync(identity.ItemId, token));
+            Assert.Equal("revision-2", owner.RemoteRevision);
+            Assert.Null(await transaction.Operations.GetAsync(first.OperationId, token));
+        }
+        Assert.Equal(identity.Encode(), (await fixture.File.InspectAsync(token)).PlaceholderIdentity.ToArray());
+
+        LocalChangeSourceEvent secondNotice = await CaptureContentGrowthAsync(fixture.Root, name, path, (byte)'2', token);
+        CloudItemSnapshot resized = await fixture.File.InspectAsync(token);
+        Assert.Equal(6L, secondNotice.SizeChange!.Value.Length);
+        Assert.Equal((original.LocalBinding, 6L), (resized.LocalBinding, resized.Length));
+        Assert.True(resized.ModifiedDataSize > 0);
+        Assert.Equal(identity.Encode(), resized.PlaceholderIdentity.ToArray());
+        await source.EmitAsync(secondNotice);
+        CloudLocalChangeBatch secondBatch = await feed.ReadBatchAsync(token);
+        Assert.False(secondBatch.RequiresFullRescan);
+        CloudLocalChange second = Assert.Single(secondBatch.Changes);
+        Assert.Equal((first.Kind, first.ItemId, first.RelativePath), (second.Kind, second.ItemId, second.RelativePath));
+        Assert.NotEqual(first.OperationId, second.OperationId);
+        Assert.True(second.Sequence > first.Sequence);
+        await feed.AcknowledgeAsync([second.OperationId], token);
+        Assert.Empty(await AccessRowsAsync(factory!));
+        Assert.Equal("seed12"u8.ToArray(), await File.ReadAllBytesAsync(path, token));
+    }
+
+    [Trait("Category", "AccessJournal")]
+    [Fact]
     public async Task SizeBeforeRenamePreservesTheOriginalItemId()
     {
         AccessJournalFactory? factory = null;

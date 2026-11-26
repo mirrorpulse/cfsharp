@@ -30,11 +30,13 @@ data. A placeholder can become out of sync from an attribute edit. The feed asso
 out-of-sync size notice with a file only when Windows reports modified data. If the object was
 replaced, the captured and current states disagree, or modified data cannot be confirmed, the
 feed retains an unbound observation and requires reconciliation. A size notice for a path
-without an item row stays unbound. The ordered name subscription establishes ownership, including when Size arrives
-before a rename or after an ordinary name disappears. A size notice for an ordinary file can
-reuse an existing item ID only when its durable native file ID matches the observed object.
-The feed rechecks the native binding and any placeholder's item ID, remote ID and revision
-before and after committing the journal row. A durable validation
+without an item row stays unbound. The ordered name subscription establishes ownership, including
+when Size arrives before a rename or after an ordinary name disappears. A size notice for an
+ordinary file can reuse an existing item ID only when its durable native file ID matches the
+observed object. An acknowledgement can advance the stored remote revision independently of the
+placeholder. The feed matches the placeholder's item ID and remote ID against the stored item,
+then rechecks the native binding and complete native identity, including its revision, before
+and after committing the journal row. A durable validation
 receipt withholds the row from reads and acknowledgement until the second check. If the object
 changed or the feed stopped during publication, reconciliation exposes the original operation
 with the same ID and sequence and no item association. Last-write notifications remain

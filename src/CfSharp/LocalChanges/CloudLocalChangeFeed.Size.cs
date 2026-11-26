@@ -62,10 +62,11 @@ public sealed partial class CloudLocalChangeFeed
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
             CloudPlaceholderIdentity? placeholder = null;
+            // A revision ACK can advance the official row without rewriting the native
+            // revision. Capture the actual native value for both publication checks.
             if (capturedPlaceholder &&
                 (!CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out placeholder) ||
-                    placeholder.ItemId != owner.ItemId || placeholder.RemoteId != owner.RemoteId ||
-                    placeholder.RemoteRevision != owner.RemoteRevision))
+                    placeholder.ItemId != owner.ItemId || placeholder.RemoteId != owner.RemoteId))
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
