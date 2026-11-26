@@ -974,7 +974,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
         IReadOnlyList<CloudStateCheckpoint> deletes = await transaction.Checkpoints.ListAsync(RemoteDeleteIntent.Prefix, cancellationToken).ConfigureAwait(false);
         bool pendingDelete = deletes.Select(value => RemoteDeleteIntent.Decode(value.Value)).Any(intent =>
             intent.Contains(path.RelativePath) || (previousPath is not null && intent.Contains(previousPath.Value.RelativePath)));
-        CloudLocalFileBinding? sizeBinding = null;
+        SizeObservationBinding? sizeBinding = null;
         if (sizeChange is { } size && uncertainDirectory is null)
         {
             if (pendingCreation || pendingMove || pendingDelete)
@@ -1201,7 +1201,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 observedAt,
                 cancellationToken).ConfigureAwait(false);
             directoryProjection?.Validate();
-            if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding, directory); }
+            if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding); }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             directoryProjection?.Validate();
             SignalAvailable();
@@ -1277,7 +1277,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                 // rechecks the binding after the store releases the transaction.
                 await transaction.Checkpoints.UpsertAsync(new(SecurityValidationName(operationId), encoded, observedAt),
                     cancellationToken).ConfigureAwait(false);
-                stagedSize = new(path, sizeBinding, directory, appended);
+                stagedSize = new(path, sizeBinding, appended);
             }
         }
 
@@ -1296,7 +1296,7 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
             observedAt,
             cancellationToken).ConfigureAwait(false);
         directoryProjection?.Validate();
-        if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding, directory); }
+        if (sizeBinding is not null) { ValidateSizeObservationBinding(path, sizeBinding); }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (requiresRescan)
         {

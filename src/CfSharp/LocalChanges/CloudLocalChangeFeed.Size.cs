@@ -10,12 +10,15 @@ public sealed partial class CloudLocalChangeFeed
 {
     private enum SizeObservationDisposition { Content, CleanPlaceholder, Unbound }
 
-    private sealed record StagedSizeObservation(CloudItemPath Path, CloudLocalFileBinding Binding,
-        bool IsDirectory, CloudOperationJournalEntry Entry) : IStagedObservation
+    private sealed record SizeObservationBinding(CloudLocalFileBinding Local, CloudItemKind Kind,
+        CloudPlaceholderIdentity? Placeholder);
+
+    private sealed record StagedSizeObservation(CloudItemPath Path, SizeObservationBinding Binding,
+        CloudOperationJournalEntry Entry) : IStagedObservation
     {
         public ValueTask PublishAsync(CloudLocalChangeFeed feed, CancellationToken cancellationToken)
         {
-            feed.ValidateSizeObservationBinding(Path, Binding, IsDirectory);
+            feed.ValidateSizeObservationBinding(Path, Binding);
             return feed.CompleteValidatedObservationAsync(Entry.OperationId, Entry.Sequence, cancellationToken);
         }
 
@@ -23,7 +26,7 @@ public sealed partial class CloudLocalChangeFeed
     }
 
     private SizeObservationDisposition InspectSizeObservation(CloudItemPath path, CloudItemState owner, LocalSizeChange size,
-        out CloudLocalFileBinding? binding)
+        out SizeObservationBinding? binding)
     {
         binding = null;
         LocalSecurityChangeIdentity identity = size.Identity;
@@ -58,14 +61,16 @@ public sealed partial class CloudLocalChangeFeed
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
-            binding = item.LocalBinding;
-            if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
-            if (!CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out CloudPlaceholderIdentity? placeholder) ||
-                placeholder.ItemId != owner.ItemId || placeholder.RemoteId != owner.RemoteId ||
-                placeholder.RemoteRevision != owner.RemoteRevision)
+            CloudPlaceholderIdentity? placeholder = null;
+            if (capturedPlaceholder &&
+                (!CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out placeholder) ||
+                    placeholder.ItemId != owner.ItemId || placeholder.RemoteId != owner.RemoteId ||
+                    placeholder.RemoteRevision != owner.RemoteRevision))
             {
-                throw new CloudNamespaceObservationUncertainException(isDirectory: false);
+                throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
+            binding = new(item.LocalBinding, kind, placeholder);
+            if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
 
             // On Windows, hydration can change allocation and signal Size while the
             // placeholder remains in sync. A logical data modification clears in-sync.
@@ -98,8 +103,9 @@ public sealed partial class CloudLocalChangeFeed
         }
     }
 
-    private void ValidateSizeObservationBinding(CloudItemPath path, CloudLocalFileBinding binding, bool isDirectory)
+    private void ValidateSizeObservationBinding(CloudItemPath path, SizeObservationBinding binding)
     {
+        bool isDirectory = binding.Kind == CloudItemKind.Directory;
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299))
         {
             throw new CloudNamespaceObservationUncertainException(isDirectory);
@@ -107,13 +113,19 @@ public sealed partial class CloudLocalChangeFeed
         try
         {
             using SafeFileHandle reference = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
-            if (CloudLocalFileBindingPlatform.TryRead(reference.DangerousGetHandle(), _syncRootPath) == binding &&
-                MatchesAttributePath(reference, path))
+            LocalCloudItemInspection item = CloudItemInspector.Inspect(reference, path.FullPath, binding.Kind, _syncRootPath);
+            // An in-place CFAPI update can change the cloud identity while preserving the NTFS file ID.
+            bool sameIdentity = binding.Placeholder is null
+                ? !item.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder)
+                : CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out CloudPlaceholderIdentity? current) &&
+                    binding.Placeholder.Equals(current);
+            if (item.LocalBinding == binding.Local && sameIdentity && MatchesAttributePath(reference, path))
             {
                 return;
             }
         }
-        catch (Exception exception) when (exception is CloudPathReparsePointException or Win32Exception or IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or
+            Win32Exception or UnauthorizedAccessException or InvalidOperationException or IOException)
         {
             throw new CloudNamespaceObservationUncertainException(isDirectory, exception);
         }

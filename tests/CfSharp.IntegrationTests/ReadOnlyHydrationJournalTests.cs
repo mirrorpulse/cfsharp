@@ -242,7 +242,7 @@ public sealed partial class CloudContentConfirmationTests
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
         await File.WriteAllTextAsync(originalPath, "local content", token);
-        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, original, originalPath, token);
+        LocalChangeSourceEvent size = await CaptureSizeChangeAsync(fixture.Root, original, originalPath, token);
         Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
         await source.EmitAsync(new(LocalChangeSourceAction.Created, original));
         await WaitForAccessRowsAsync(factory!, rows => rows.Count == 1);
@@ -268,7 +268,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Null(await state.Items.GetByRelativePathAsync(original, token));
     }
 
-    private static Task<LocalChangeSourceEvent> CaptureOrdinarySizeChangeAsync(string root, string relativePath, string fullPath, CancellationToken token) =>
+    private static Task<LocalChangeSourceEvent> CaptureSizeChangeAsync(string root, string relativePath, string fullPath, CancellationToken token) =>
         CaptureNativeModificationAsync(root, relativePath, () =>
         {
             using FileStream file = new(fullPath, FileMode.Open, FileAccess.Write, FileShare.Read);
@@ -298,7 +298,7 @@ public sealed partial class CloudContentConfirmationTests
         await feed.AcknowledgeAsync([created.OperationId], token);
 
         File.Move(originalPath, renamedPath);
-        await source.EmitAsync(await CaptureOrdinarySizeChangeAsync(fixture.Root, renamed, renamedPath, token));
+        await source.EmitAsync(await CaptureSizeChangeAsync(fixture.Root, renamed, renamedPath, token));
         CloudOperationJournalEntry size = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
         Assert.Null(size.ItemId);
         await using (ICloudStateTransaction state = await factory.Store!.BeginTransactionAsync(token))
@@ -331,33 +331,72 @@ public sealed partial class CloudContentConfirmationTests
 
     [Trait("Category", "AccessJournal")]
     [Theory]
-    [InlineData("size-before-append", true)]
-    [InlineData("size-before-commit", true)]
-    [InlineData("size-publication-committed", true)]
-    [InlineData("size-publication-committed", false)]
-    public async Task TrackedSizeObservationPublishesOnlyVerifiedAssociation(string boundary, bool replace)
+    [InlineData("size-before-append", true, false)]
+    [InlineData("size-before-commit", true, false)]
+    [InlineData("size-publication-committed", true, false)]
+    [InlineData("size-publication-committed", false, false)]
+    [InlineData("size-publication-committed", true, true)]
+    [InlineData("size-publication-committed", false, true)]
+    public async Task TrackedSizeObservationPublishesOnlyVerifiedAssociation(string boundary, bool replace, bool placeholder)
     {
         MetadataFaultFactory? factory = null;
-        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary));
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path, boundary), hydrationContent: "old"u8.ToArray());
         using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(20));
         CancellationToken token = deadline.Token;
         string path = Path.Combine(fixture.Root, OriginalSizePath);
         string retiredPath = Path.Combine(fixture.Root, "retired.bin");
-        await File.WriteAllTextAsync(path, "old", token);
-        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, OriginalSizePath, path, token);
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "size-owner", "revision-1");
+        if (placeholder)
+        {
+            (await fixture.System.Root.CreatePlaceholdersAsync([
+                CloudFilePlaceholderSpec.CreateBuilder(OriginalSizePath, identity, 3).WithInSyncState(true).Build(),
+            ], cancellationToken: token)).ThrowIfAnyFailed();
+            Assert.Equal("old"u8.ToArray(), await File.ReadAllBytesAsync(path, token));
+            // Capture the resize after the placeholder is already out of sync so the
+            // test pauses publication, independent of the timing of the native flag change.
+            await fixture.System.GetFile(OriginalSizePath).UpdatePlaceholderAsync(
+                CloudPlaceholderPatch.CreateBuilder().WithInSyncState(false).Build(), token);
+        }
+        else { await File.WriteAllTextAsync(path, "old", token); }
+        LocalChangeSourceEvent size = await CaptureSizeChangeAsync(fixture.Root, OriginalSizePath, path, token);
+        Assert.Equal(placeholder, size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
+        if (placeholder)
+        {
+            CloudItemSnapshot resized = await fixture.System.GetFile(OriginalSizePath).InspectAsync(token);
+            Assert.False(size.SizeChange.Value.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
+            Assert.Equal(CloudSynchronizationState.NotInSync, resized.SynchronizationState);
+            Assert.Equal(resized.Length, size.SizeChange.Value.Length);
+        }
         ControlledMetadataSource source = new();
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
         await feed.StartAsync(token);
-        await source.EmitAsync(new(LocalChangeSourceAction.Created, OriginalSizePath));
-        CloudOperationJournalEntry created = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
-        await feed.AcknowledgeAsync([created.OperationId], token);
+        Guid ownerId = identity.ItemId;
+        if (!placeholder)
+        {
+            await source.EmitAsync(new(LocalChangeSourceAction.Created, OriginalSizePath));
+            CloudOperationJournalEntry created = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
+            ownerId = Assert.IsType<Guid>(created.ItemId);
+            await feed.AcknowledgeAsync([created.OperationId], token);
+        }
         factory!.Armed = true;
         await source.EmitAsync(size);
         CloudOperationJournalEntry? provisional = null;
         try
         {
             await factory.OutcomePaused.Task.WaitAsync(token);
-            if (replace)
+            if (replace && placeholder)
+            {
+                CloudFile file = fixture.System.GetFile(OriginalSizePath);
+                CloudItemSnapshot before = await file.InspectAsync(token);
+                Assert.Equal(identity.Encode(), before.PlaceholderIdentity.ToArray());
+                CloudPlaceholderIdentity revised = new(identity.ItemId, identity.RemoteId, "revision-2");
+                Assert.Equal(0, ReplaceNativeIdentity(path, revised));
+                CloudItemSnapshot after = await file.InspectAsync(token);
+                Assert.NotNull(before.LocalBinding);
+                Assert.Equal(before.LocalBinding, after.LocalBinding);
+                Assert.Equal(revised.Encode(), after.PlaceholderIdentity.ToArray());
+            }
+            else if (replace)
             {
                 File.Move(path, retiredPath);
                 await File.WriteAllBytesAsync(path, new byte[4096], token);
@@ -365,7 +404,7 @@ public sealed partial class CloudContentConfirmationTests
             if (boundary == "size-publication-committed")
             {
                 provisional = await WaitForSingleMetadataJournalEntryAsync(factory.Store!, token);
-                Assert.Equal(created.ItemId, provisional.ItemId);
+                Assert.Equal(ownerId, provisional.ItemId);
                 CloudLocalChangePage waiting = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
                 Assert.False(waiting.RequiresFullRescan);
                 Assert.Empty(waiting.Changes);
@@ -384,20 +423,24 @@ public sealed partial class CloudContentConfirmationTests
         {
             Assert.Equal((provisional.OperationId, provisional.Sequence), (original.OperationId, original.Sequence));
         }
-        Guid? expectedItemId = replace ? null : created.ItemId;
+        Guid? expectedItemId = replace ? null : ownerId;
         Assert.Equal(expectedItemId, original.ItemId);
         Assert.Equal(CloudStateOperationKind.ContentUpdate, original.Kind);
         await using (ICloudStateTransaction transaction = await factory.Store!.BeginTransactionAsync(token))
         {
             CloudItemState retainedOwner = Assert.Single(await transaction.Items.ListSubtreeAsync(string.Empty, token));
-            Assert.Equal((created.ItemId, OriginalSizePath), (retainedOwner.ItemId, retainedOwner.RelativePath));
+            Assert.Equal((ownerId, OriginalSizePath), (retainedOwner.ItemId, retainedOwner.RelativePath));
+            if (placeholder) { Assert.Equal(identity.RemoteRevision, retainedOwner.RemoteRevision); }
         }
 
         if (replace)
         {
             await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
-            Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
-            Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
+            if (!placeholder)
+            {
+                Assert.Equal(new byte[4096], await File.ReadAllBytesAsync(path, token));
+                Assert.Equal((byte)'o', (await File.ReadAllBytesAsync(retiredPath, token))[0]);
+            }
         }
         CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
         CloudLocalChange retained = Assert.Single(page.Changes);
@@ -434,7 +477,7 @@ public sealed partial class CloudContentConfirmationTests
         await feed.StartAsync(token);
         File.Move(path, retiredPath);
         await File.WriteAllTextAsync(path, "replacement", token);
-        LocalChangeSourceEvent size = await CaptureOrdinarySizeChangeAsync(fixture.Root, relativePath, path, token);
+        LocalChangeSourceEvent size = await CaptureSizeChangeAsync(fixture.Root, relativePath, path, token);
         Assert.False(size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
         // Deliver Size before the name source has projected the replacement.
         await source.EmitAsync(size);
