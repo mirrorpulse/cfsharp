@@ -38,7 +38,7 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(CloudSynchronizationState.InSync, hydrated.SynchronizationState);
         Assert.Equal(0, hydrated.ModifiedDataSize);
         Assert.Equal(before.LastWriteTime, hydrated.LastWriteTime);
-        await source.WaitForFenceAsync(factory!, "read-finished", CaptureHydratedSize(fixture.File.RelativePath, hydrated));
+        await source.WaitForFenceAsync(factory!, "read-finished", SizeFromPlaceholderSnapshot(fixture.File.RelativePath, hydrated));
         IReadOnlyList<CloudOperationJournalEntry> afterRead = await AccessRowsAsync(factory!);
         Assert.DoesNotContain(afterRead, row => row.Kind == CloudStateOperationKind.ContentUpdate &&
             LocalChangePayload.Decode(row.Payload).RelativePath == fixture.File.RelativePath);
@@ -109,7 +109,7 @@ public sealed partial class CloudContentConfirmationTests
             CloudItemSnapshot partial = await fixture.File.InspectAsync(token);
             Assert.Equal(CloudContentAvailability.PartiallyAvailable, partial.ContentAvailability);
             Assert.Equal(CloudSynchronizationState.InSync, partial.SynchronizationState);
-            await source.WaitForFenceAsync(factory!, "partial-read-finished", CaptureHydratedSize(fixture.File.RelativePath, partial));
+            await source.WaitForFenceAsync(factory!, "partial-read-finished", SizeFromPlaceholderSnapshot(fixture.File.RelativePath, partial));
             Assert.DoesNotContain(await AccessRowsAsync(factory!), IsHydrationContentRow);
         }
         int firstFetches = fixture.Provider.Fetches;
@@ -125,7 +125,7 @@ public sealed partial class CloudContentConfirmationTests
         CloudItemSnapshot complete = await fixture.File.InspectAsync(token);
         Assert.Equal((original, identity.ItemId, identity.RemoteRevision), (complete.LocalBinding, complete.ItemId, complete.RemoteRevision));
         Assert.Equal(CloudSynchronizationState.InSync, complete.SynchronizationState);
-        await restartedSource.WaitForFenceAsync(factory!, "complete-read-finished", CaptureHydratedSize(fixture.File.RelativePath, complete));
+        await restartedSource.WaitForFenceAsync(factory!, "complete-read-finished", SizeFromPlaceholderSnapshot(fixture.File.RelativePath, complete));
         Assert.DoesNotContain(await AccessRowsAsync(factory!), IsHydrationContentRow);
         CloudLocalChangePage page = await reopened.ReadPageAsync(await reopened.BeginScanAsync(token), 0, 100, token);
         Assert.False(page.RequiresFullRescan);
@@ -158,7 +158,8 @@ public sealed partial class CloudContentConfirmationTests
 
         Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
         CloudItemSnapshot hydrated = await fixture.File.InspectAsync(token);
-        LocalChangeSourceEvent hydration = CaptureHydratedSize(name, hydrated);
+        Assert.Equal(CloudSynchronizationState.InSync, hydrated.SynchronizationState);
+        LocalChangeSourceEvent hydration = SizeFromPlaceholderSnapshot(name, hydrated);
         LocalChangeSourceEvent write = await CaptureNativeModificationAsync(fixture.Root, name, async () =>
         {
             await using FileStream writer = new(path, FileMode.Open, FileAccess.Write, FileShare.Read);
@@ -189,13 +190,65 @@ public sealed partial class CloudContentConfirmationTests
         Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
     }
 
-    private static LocalChangeSourceEvent CaptureHydratedSize(string relativePath, CloudItemSnapshot hydrated)
+    [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task ReadOnlyHydrationAfterAttributeEditRetainsUnboundSizeObservation()
     {
-        Assert.True(hydrated.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
-        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(hydrated.LocalBinding);
-        long fileId = Assert.IsType<long>(hydrated.LocalFileId);
+        byte[] bytes = new byte[65_537];
+        new Random(20261125).NextBytes(bytes);
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path),
+            CloudInSyncPolicy.TrackAll, hydrationContent: bytes);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(25));
+        CancellationToken token = deadline.Token;
+        string name = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "metadata-only-hydration", "revision-1");
+        (await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudFilePlaceholderSpec.CreateBuilder(name, identity, bytes.Length).WithInSyncState(true).Build(),
+        ], cancellationToken: token)).ThrowIfAnyFailed();
+        CloudItemSnapshot before = await fixture.File.InspectAsync(token);
+        Assert.Equal(CloudSynchronizationState.InSync, before.SynchronizationState);
+        Assert.Equal(CloudContentAvailability.OnlineOnly, before.ContentAvailability);
+
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+        CloudItemSnapshot metadataOnly = await fixture.File.InspectAsync(token);
+        Assert.Equal(CloudSynchronizationState.NotInSync, metadataOnly.SynchronizationState);
+        Assert.Equal(CloudContentAvailability.OnlineOnly, metadataOnly.ContentAvailability);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
+        Assert.True(fixture.Provider.Fetches > 0);
+        CloudItemSnapshot hydrated = await fixture.File.InspectAsync(token);
+        Assert.Equal(CloudSynchronizationState.NotInSync, hydrated.SynchronizationState);
+        Assert.False(hydrated.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
+        Assert.Equal(0, hydrated.ModifiedDataSize);
+        Assert.True(hydrated.OnDiskDataSize > metadataOnly.OnDiskDataSize);
+        Assert.Equal((before.LocalBinding, before.Length, before.LastWriteTime),
+            (hydrated.LocalBinding, hydrated.Length, hydrated.LastWriteTime));
+
+        // Allocation notifications can be coalesced. Deliver the Size record from
+        // the actual post-hydration snapshot through the controlled source.
+        await source.EmitAsync(SizeFromPlaceholderSnapshot(name, hydrated));
+        CloudOperationJournalEntry observation = await WaitForSingleMetadataJournalEntryAsync(factory!.Store!, token);
+        Assert.Equal(CloudStateOperationKind.ContentUpdate, observation.Kind);
+        Assert.Null(observation.ItemId);
+        Assert.True((await feed.BeginScanAsync(token)).RequiresFullRescan);
+        await feed.AcknowledgeFullRescanAsync(feed.BeginFullRescan(), token);
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        CloudLocalChange change = Assert.Single(page.Changes);
+        Assert.Equal((observation.OperationId, observation.Sequence, name, (Guid?)null),
+            (change.OperationId, change.Sequence, change.RelativePath, change.ItemId));
+        await feed.AcknowledgeAsync([change.OperationId], token);
+    }
+
+    private static LocalChangeSourceEvent SizeFromPlaceholderSnapshot(string relativePath, CloudItemSnapshot snapshot)
+    {
+        CloudLocalFileBinding binding = Assert.IsType<CloudLocalFileBinding>(snapshot.LocalBinding);
+        long fileId = Assert.IsType<long>(snapshot.LocalFileId);
         LocalSizeChange size = new(new(binding.VolumeSerialNumber, binding.SyncRootFileId, unchecked((ulong)fileId),
-            ParentFileId: 0, IsDirectory: false), Assert.IsType<long>(hydrated.Length), hydrated.PlaceholderState);
+            ParentFileId: 0, IsDirectory: false), Assert.IsType<long>(snapshot.Length), snapshot.PlaceholderState);
         return new(LocalChangeSourceAction.SizeModified, relativePath, SizeChange: size);
     }
 
@@ -273,6 +326,16 @@ public sealed partial class CloudContentConfirmationTests
         {
             using FileStream file = new(fullPath, FileMode.Open, FileAccess.Write, FileShare.Read);
             file.SetLength(4096);
+            file.Flush(flushToDisk: true);
+            return Task.CompletedTask;
+        }, token, LocalChangeSourceAction.SizeModified);
+
+    private static Task<LocalChangeSourceEvent> CaptureContentGrowthAsync(string root, string relativePath, string fullPath,
+        byte value, CancellationToken token) =>
+        CaptureNativeModificationAsync(root, relativePath, () =>
+        {
+            using FileStream file = new(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+            file.WriteByte(value);
             file.Flush(flushToDisk: true);
             return Task.CompletedTask;
         }, token, LocalChangeSourceAction.SizeModified);
@@ -358,7 +421,9 @@ public sealed partial class CloudContentConfirmationTests
                 CloudPlaceholderPatch.CreateBuilder().WithInSyncState(false).Build(), token);
         }
         else { await File.WriteAllTextAsync(path, "old", token); }
-        LocalChangeSourceEvent size = await CaptureSizeChangeAsync(fixture.Root, OriginalSizePath, path, token);
+        LocalChangeSourceEvent size = placeholder
+            ? await CaptureContentGrowthAsync(fixture.Root, OriginalSizePath, path, 42, token)
+            : await CaptureSizeChangeAsync(fixture.Root, OriginalSizePath, path, token);
         Assert.Equal(placeholder, size.SizeChange!.Value.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder));
         if (placeholder)
         {
@@ -366,6 +431,7 @@ public sealed partial class CloudContentConfirmationTests
             Assert.False(size.SizeChange.Value.PlaceholderState.HasFlag(CloudPlaceholderState.InSync));
             Assert.Equal(CloudSynchronizationState.NotInSync, resized.SynchronizationState);
             Assert.Equal(resized.Length, size.SizeChange.Value.Length);
+            Assert.True(resized.ModifiedDataSize > 0);
         }
         ControlledMetadataSource source = new();
         await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);

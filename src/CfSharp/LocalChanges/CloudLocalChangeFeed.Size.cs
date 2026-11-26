@@ -72,16 +72,18 @@ public sealed partial class CloudLocalChangeFeed
             binding = new(item.LocalBinding, kind, placeholder);
             if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
 
-            // On Windows, hydration can change allocation and signal Size while the
-            // placeholder remains in sync. A logical data modification clears in-sync.
+            // Hydration can signal Size when allocation grows. Metadata changes can
+            // already have cleared in-sync, so that flag alone cannot prove a data edit.
             // Keep last-write notifications independent, including overlapping writes.
             bool capturedInSync = size.PlaceholderState.HasFlag(CloudPlaceholderState.InSync);
             bool inSyncNow = item.SynchronizationState == CloudSynchronizationState.InSync;
             if (capturedInSync != inSyncNow || item.Length != size.Length ||
-                (inSyncNow && (item.ModifiedDataSize != 0 || item.OnDiskDataSize != item.ValidatedDataSize)))
+                (inSyncNow
+                    ? item.ModifiedDataSize != 0 || item.OnDiskDataSize != item.ValidatedDataSize
+                    : item.ModifiedDataSize is not > 0))
             {
-                // This can be a delayed allocation notice delivered after a genuine edit.
-                // Preserve the original without letting it authorize an upload.
+                // A Size notice has no previous logical length. Without evidence of
+                // modified data, retain it for reconciliation, including length-only edits.
                 throw new CloudNamespaceObservationUncertainException(isDirectory: false);
             }
             return inSyncNow ? SizeObservationDisposition.CleanPlaceholder : SizeObservationDisposition.Content;
