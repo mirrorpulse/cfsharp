@@ -26,10 +26,12 @@ Size notifications have their own subscription because Windows can report a size
 hydration increases physical allocation and leaves the logical length unchanged. A size notice
 for a known file placeholder produces no content row when the native notice and the current
 object agree on identity, logical length and in-sync state, and Windows reports only validated
-data. A placeholder can become out of sync from an attribute edit. The feed associates an
-out-of-sync size notice with a file only when Windows reports modified data. If the object was
-replaced, the captured and current states disagree, or modified data cannot be confirmed, the
-feed retains an unbound observation and requires reconciliation. A size notice for a path
+data. A placeholder can become out of sync from an attribute edit, and a later write can change
+the modified-data count before an older size notice is processed. An out-of-sync size notice
+can bind only when the native record's last-write and change times still match the file and
+Windows reports modified data. The feed checks those times again around the journal commit.
+If the object was replaced, the captured and current states disagree, or modified data cannot be
+confirmed, the feed retains an unbound observation and requires reconciliation. A size notice for a path
 without an item row stays unbound. The ordered name subscription establishes ownership, including
 when Size arrives before a rename or after an ordinary name disappears. A size notice for an
 ordinary file can reuse an existing item ID only when its durable native file ID matches the

@@ -219,7 +219,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                 : CfPlaceholderState.Invalid;
             PublishCore(new(LocalChangeSourceAction.SizeModified, change.RelativePath,
                 SizeChange: new(identity, change.FileSize, state == CfPlaceholderState.Invalid
-                    ? CloudPlaceholderState.None : (CloudPlaceholderState)state)), fromSecurityPump: true);
+                    ? CloudPlaceholderState.None : (CloudPlaceholderState)state, change.LastWriteTime, change.ChangeTime)), fromSecurityPump: true);
         }
     }
 

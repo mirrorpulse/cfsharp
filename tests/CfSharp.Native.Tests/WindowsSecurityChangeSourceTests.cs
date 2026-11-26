@@ -52,6 +52,8 @@ public sealed class WindowsSecurityChangeSourceTests
         byte[] name = Encoding.Unicode.GetBytes("before.txt");
         byte[] record = new byte[84 + name.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(4), 3);
+        BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(16), 134022528000000000);
+        BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(24), 134022528000000002);
         BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(48), 65537);
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(56), 0x10);
         BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(60), 0x9000001a);
@@ -65,6 +67,8 @@ public sealed class WindowsSecurityChangeSourceTests
         Assert.Equal(0x2000000000005678ul, change.ParentFileId);
         Assert.True(change.IsDirectory);
         Assert.Equal(65537, change.FileSize);
+        Assert.Equal(134022528000000000, change.LastWriteTime);
+        Assert.Equal(134022528000000002, change.ChangeTime);
         Assert.Equal(0x10u, change.FileAttributes);
         Assert.Equal(0x9000001au, change.ReparsePointTag);
         byte[] unpaired = [.. record.AsSpan(0, 84), 0, 0xd8, 0x61, 0];

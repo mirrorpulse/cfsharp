@@ -207,7 +207,8 @@ internal readonly record struct LocalChangeSourceEvent(
 
 internal readonly record struct LocalSecurityChangeIdentity(ulong VolumeSerialNumber, Guid RootFileId, ulong FileId, ulong ParentFileId, bool IsDirectory);
 
-internal readonly record struct LocalSizeChange(LocalSecurityChangeIdentity Identity, long Length, CloudPlaceholderState PlaceholderState);
+internal readonly record struct LocalSizeChange(LocalSecurityChangeIdentity Identity, long Length,
+    CloudPlaceholderState PlaceholderState, long LastWriteTime, long ChangeTime);
 
 internal sealed record LocalChangePayload(
     string RelativePath,

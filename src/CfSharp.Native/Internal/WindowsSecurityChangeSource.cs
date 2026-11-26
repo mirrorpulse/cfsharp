@@ -185,6 +185,8 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
                 FileAttributes = record.FileAttributes,
                 ReparsePointTag = record.ReparsePointTag,
                 FileSize = record.FileSize,
+                LastWriteTime = record.LastModificationTime,
+                ChangeTime = record.LastChangeTime,
             });
             if (record.NextEntryOffset == 0) { return changes.ToArray(); }
             if (record.NextEntryOffset < end || record.NextEntryOffset > buffer.Length || (record.NextEntryOffset & 3) != 0)
@@ -245,4 +247,6 @@ internal readonly record struct WindowsSecurityChange(string RelativePath, ulong
     internal uint FileAttributes { get; init; }
     internal uint ReparsePointTag { get; init; }
     internal long FileSize { get; init; }
+    internal long LastWriteTime { get; init; }
+    internal long ChangeTime { get; init; }
 }

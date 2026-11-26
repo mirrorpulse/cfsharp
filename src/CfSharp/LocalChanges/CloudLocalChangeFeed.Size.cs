@@ -11,7 +11,7 @@ public sealed partial class CloudLocalChangeFeed
     private enum SizeObservationDisposition { Content, CleanPlaceholder, Unbound }
 
     private sealed record SizeObservationBinding(CloudLocalFileBinding Local, CloudItemKind Kind,
-        CloudPlaceholderIdentity? Placeholder);
+        CloudPlaceholderIdentity? Placeholder, LocalSizeChange? ContentObservation = null);
 
     private sealed record StagedSizeObservation(CloudItemPath Path, SizeObservationBinding Binding,
         CloudOperationJournalEntry Entry) : IStagedObservation
@@ -44,8 +44,8 @@ public sealed partial class CloudLocalChangeFeed
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
             LocalCloudItemInspection item = CloudItemInspector.Inspect(reference, path.FullPath, kind, _syncRootPath);
-            // The native notice identifies today's object. To reuse an existing row for
-            // an ordinary object, its recorded FileId must also identify that object.
+            // Match the notice to the current object. Reusing an ordinary item's
+            // existing row also requires its recorded FileId to identify that object.
             if (NtfsFileId(item.LocalBinding) is not long fileId || unchecked((ulong)fileId) != identity.FileId ||
                 item.LocalBinding?.VolumeSerialNumber != identity.VolumeSerialNumber ||
                 item.LocalBinding.SyncRootFileId != identity.RootFileId ||
@@ -70,8 +70,11 @@ public sealed partial class CloudLocalChangeFeed
             {
                 throw new CloudNamespaceObservationUncertainException(identity.IsDirectory);
             }
-            binding = new(item.LocalBinding, kind, placeholder);
-            if (kind != CloudItemKind.File || !capturedPlaceholder) { return SizeObservationDisposition.Content; }
+            if (kind != CloudItemKind.File || !capturedPlaceholder)
+            {
+                binding = new(item.LocalBinding, kind, placeholder);
+                return SizeObservationDisposition.Content;
+            }
 
             // Hydration can signal Size when allocation grows. Metadata changes can
             // already have cleared in-sync, so that flag alone cannot prove a data edit.
@@ -81,13 +84,16 @@ public sealed partial class CloudLocalChangeFeed
             if (capturedInSync != inSyncNow || item.Length != size.Length ||
                 (inSyncNow
                     ? item.ModifiedDataSize != 0 || item.OnDiskDataSize != item.ValidatedDataSize
-                    : item.ModifiedDataSize is not > 0))
+                    : !MatchesSizeContentObservation(item, size)))
             {
-                // A Size notice has no previous logical length. Without evidence of
-                // modified data, retain it for reconciliation, including length-only edits.
+                // The current dirty ranges may belong to a later write. Preserve the
+                // original for reconciliation if its native timestamps disagree.
                 throw new CloudNamespaceObservationUncertainException(isDirectory: false);
             }
-            return inSyncNow ? SizeObservationDisposition.CleanPlaceholder : SizeObservationDisposition.Content;
+            if (inSyncNow) { return SizeObservationDisposition.CleanPlaceholder; }
+
+            binding = new(item.LocalBinding, kind, placeholder, size);
+            return SizeObservationDisposition.Content;
         }
         catch (Win32Exception exception) when (kind == CloudItemKind.File && !capturedPlaceholder && exception.NativeErrorCode is 2 or 3)
         {
@@ -122,7 +128,8 @@ public sealed partial class CloudLocalChangeFeed
                 ? !item.PlaceholderState.HasFlag(CloudPlaceholderState.Placeholder)
                 : CloudPlaceholderIdentity.TryDecode(item.PlaceholderIdentity, out CloudPlaceholderIdentity? current) &&
                     binding.Placeholder.Equals(current);
-            if (item.LocalBinding == binding.Local && sameIdentity && MatchesAttributePath(reference, path))
+            if (item.LocalBinding == binding.Local && sameIdentity && MatchesAttributePath(reference, path) &&
+                (binding.ContentObservation is not { } observation || MatchesSizeContentObservation(item, observation)))
             {
                 return;
             }
@@ -134,6 +141,12 @@ public sealed partial class CloudLocalChangeFeed
         }
         throw new CloudNamespaceObservationUncertainException(isDirectory);
     }
+
+    private static bool MatchesSizeContentObservation(LocalCloudItemInspection item, LocalSizeChange size) =>
+        item.SynchronizationState == CloudSynchronizationState.NotInSync &&
+        item.Length == size.Length && item.ModifiedDataSize is > 0 &&
+        size.LastWriteTime > 0 && item.LastWriteTime?.ToFileTime() == size.LastWriteTime &&
+        size.ChangeTime > 0 && item.ChangeTime == size.ChangeTime;
 
     private static bool IsMissingSizeObservationPath(string path)
     {
