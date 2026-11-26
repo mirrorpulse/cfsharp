@@ -9,6 +9,8 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
+    // Keep metadata receipts readable across upgrades. SQLite schema 11 fences readers
+    // that cannot recover the staged ContentUpdate rows also referenced by this prefix.
     internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
     private long _validatedObservationSequence;
 

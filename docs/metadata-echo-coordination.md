@@ -149,8 +149,9 @@ outcome commit throws after persisting, replay can report `AlreadyApplied`, whil
 requires reconciliation for that entry. If only the confirmation write fails, the known apply
 outcome stays successful and any unconfirmed receipt remains conservative. A legacy passthrough
 receipt without durable evidence of a successful native write requires reconciliation.
-The official SQLite store upgrades to schema 10 before writing remote metadata receipts. Preview.15
-and other older SQLite providers reject the upgraded database before opening it for application work.
+The official SQLite store upgrades to schema 11 before opening for application work. This protects
+the remote metadata receipts introduced in schema 10 and the staged content observations added in
+schema 11. Preview.16 and other older SQLite providers reject the upgraded database.
 Upgrade `CfSharp` and `CfSharp.Storage.Sqlite` together. File-system startup rejects an older official
 SQLite factory or store before starting the runtime. Custom stores that adapt SQLite are responsible
 for using a provider that establishes the same downgrade protection.

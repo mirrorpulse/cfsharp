@@ -176,7 +176,7 @@ to settle a move after later edits instead of clearing or overwriting them.
 
 ### Compatibility and limits
 
-The official SQLite provider upgrades schemas 0–9 in place to **schema 10**, retaining existing
+The official SQLite provider upgrades schemas 0–10 in place to **schema 11**, retaining existing
 repositories and enforcing foreign keys. Schema 9 introduced retained generations at the same path.
 The version check prevents older providers from opening incompatible recovery state. Use matching
 core and provider packages.

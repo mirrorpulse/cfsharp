@@ -43,13 +43,13 @@ public sealed partial class CloudLocalChangeFeedTests
     [InlineData(CloudStateOperationKind.ContentUpdate)]
     public async Task CommittedUnvalidatedObservationRecoversUnboundWithItsOriginalSequence(CloudStateOperationKind kind)
     {
-        await using ICloudStateStore store = await OpenStoreAsync();
         Guid operationId = Guid.NewGuid();
         Guid itemId = Guid.NewGuid();
         DateTimeOffset observedAt = DateTimeOffset.UtcNow;
         byte[] payload = new LocalChangePayload("history.bin", null, false, observedAt).Encode();
         CloudOperationJournalEntry original;
-        await using (ICloudStateTransaction interrupted = await store.BeginTransactionAsync())
+        await using (ICloudStateStore previous = await OpenStoreAsync())
+        await using (ICloudStateTransaction interrupted = await previous.BeginTransactionAsync())
         {
             await interrupted.Items.UpsertAsync(new(itemId, "original", "history.bin", CloudItemKind.File,
                 "accepted", null, false, observedAt));
@@ -59,6 +59,7 @@ public sealed partial class CloudLocalChangeFeedTests
                 payload, observedAt));
             await interrupted.CommitAsync();
         }
+        await using ICloudStateStore store = await OpenStoreAsync();
         await using CloudLocalChangeFeed feed = CreateFeed(store, new FakeSource());
         await feed.StartAsync();
         await using (ICloudStateTransaction read = await store.BeginTransactionAsync())
