@@ -39,7 +39,9 @@ then rechecks the native binding and complete native identity, including its rev
 and after committing the journal row. A durable validation
 receipt withholds the row from reads and acknowledgement until the second check. If the object
 changed or the feed stopped during publication, reconciliation exposes the original operation
-with the same ID and sequence and no item association. Last-write notifications remain
+with the same ID and sequence and no item association. Remote application encountering such a
+pending association returns a retryable entry and leaves its safe cursor at the previous durable
+entry. Last-write notifications remain
 independent, so a same-length local write overlapping hydration can still be read and acknowledged
 separately.
 

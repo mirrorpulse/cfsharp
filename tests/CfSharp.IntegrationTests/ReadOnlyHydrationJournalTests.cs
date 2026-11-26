@@ -500,6 +500,7 @@ public sealed partial class CloudContentConfirmationTests
         factory!.Armed = true;
         await source.EmitAsync(size);
         CloudOperationJournalEntry? provisional = null;
+        CloudRemoteChangeBatch? remoteBatch = null;
         try
         {
             await factory.OutcomePaused.Task.WaitAsync(token);
@@ -530,6 +531,27 @@ public sealed partial class CloudContentConfirmationTests
                 Assert.True(waiting.HasMore);
                 Assert.Equal(0, waiting.LastScannedSequence);
                 await Assert.ThrowsAsync<InvalidOperationException>(() => feed.AcknowledgeAsync([provisional.OperationId], token).AsTask());
+
+                if (placeholder)
+                {
+                    CloudRemoteChange remote = new("remote-size", CloudRemoteChangeKind.FileUpsert, identity.RemoteId, "revision-3",
+                        CloudItemKind.File, OriginalSizePath, ownerId, previousRemoteRevision: identity.RemoteRevision,
+                        length: 4, metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
+                    remoteBatch = new("size-awaiting-validation", new byte[] { 7 }, [remote], new byte[] { 8 });
+                    CloudRemoteApplyResult waitingRemote = await fixture.System.ApplyRemoteChangesAsync(remoteBatch, cancellationToken: token);
+                    Assert.True(waitingRemote.RequiresRetry);
+                    Assert.Equal(new byte[] { 7 }, waitingRemote.SafeCursor.ToArray());
+                    CloudRemoteApplyEntryResult deferred = Assert.Single(waitingRemote.Entries);
+                    Assert.Equal(CloudRemoteApplyEntryStatus.Failed, deferred.Status);
+                    Assert.IsType<IOException>(deferred.Error);
+                    Assert.Empty(waitingRemote.ConflictIds);
+                    await using ICloudStateTransaction read = await factory.Store!.BeginTransactionAsync(token);
+                    Assert.Empty(await read.Conflicts.ListAsync(cancellationToken: token));
+                    CloudRemoteBatchState progress = Assert.IsType<CloudRemoteBatchState>(
+                        await read.RemoteBatches.GetAsync(remoteBatch.BatchId, token));
+                    Assert.Equal(0, progress.AppliedEntryCount);
+                    Assert.Equal(new byte[] { 7 }, progress.Cursor.ToArray());
+                }
             }
         }
         finally { factory.ResumeOutcome.TrySetResult(); }
@@ -550,6 +572,30 @@ public sealed partial class CloudContentConfirmationTests
             CloudItemState retainedOwner = Assert.Single(await transaction.Items.ListSubtreeAsync(string.Empty, token));
             Assert.Equal((ownerId, OriginalSizePath), (retainedOwner.ItemId, retainedOwner.RelativePath));
             if (placeholder) { Assert.Equal(identity.RemoteRevision, retainedOwner.RemoteRevision); }
+            Assert.Empty(await transaction.Conflicts.ListAsync(cancellationToken: token));
+        }
+
+        if (remoteBatch is not null && !replace)
+        {
+            // The same batch can now use the validated observation as evidence of real local work.
+            while (true)
+            {
+                await using (ICloudStateTransaction read = await factory.Store!.BeginTransactionAsync(token))
+                {
+                    if (await read.Checkpoints.GetAsync(CloudLocalChangeFeed.SecurityValidationName(original.OperationId), token) is null)
+                    {
+                        break;
+                    }
+                }
+                await Task.Delay(20, token);
+            }
+            CloudRemoteApplyResult replay = await fixture.System.ApplyRemoteChangesAsync(remoteBatch, cancellationToken: token);
+            Assert.False(replay.RequiresRetry);
+            Assert.Equal(new byte[] { 8 }, replay.SafeCursor.ToArray());
+            CloudRemoteApplyEntryResult conflict = Assert.Single(replay.Entries);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Conflict, conflict.Status);
+            Assert.Equal(CloudRemoteConflictReason.Content, conflict.Conflict!.Reason);
+            Assert.Single(replay.ConflictIds);
         }
 
         if (replace)

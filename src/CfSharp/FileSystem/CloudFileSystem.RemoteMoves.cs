@@ -84,8 +84,8 @@ public sealed partial class CloudFileSystem
         }
 
         CloudRemoteApplyOptions policy = request.Options;
-        IReadOnlyList<CloudOperationJournalEntry> localOperations = await transaction.Operations.ListByItemIdAsync(
-            original.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CloudOperationJournalEntry> localOperations = await ReadValidatedRemoteLocalOperationsAsync(
+            transaction, original.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
         if (effectiveOptions.PreserveUnsynchronizedLocalContent && localOperations.Count != 0)
         {
             throw new IOException("Local operations changed during remote move preparation.");
@@ -154,7 +154,7 @@ public sealed partial class CloudFileSystem
             : intent.Original;
         CloudItemState? occupant = await transaction.Items.GetByRelativePathAsync(change.RelativePath, cancellationToken).ConfigureAwait(false);
         if (!SameRemoteItemState(current, expected) || (occupant is not null && occupant.ItemId != expected.ItemId) ||
-            !RemoteNamespaceEvidence.FingerprintOperations(await transaction.Operations.ListByItemIdAsync(expected.ItemId, int.MaxValue,
+            !RemoteNamespaceEvidence.FingerprintOperations(await ReadValidatedRemoteLocalOperationsAsync(transaction, expected.ItemId, int.MaxValue,
                 cancellationToken).ConfigureAwait(false)).AsSpan().SequenceEqual(intent.LocalOperationsFingerprint))
         {
             throw RemoteMoveUnresolved(intent, "durable projection validation");

@@ -165,7 +165,7 @@ public sealed partial class CloudFileSystem
             }
 
             IReadOnlyList<CloudOperationJournalEntry> operations = state is null ? [] :
-                await transaction.Operations.ListByItemIdAsync(state.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
+                await ReadValidatedRemoteLocalOperationsAsync(transaction, state.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
             if (effectiveOptions.PreserveUnsynchronizedLocalContent && (state is null || operations.Count != 0))
             {
                 throw DeleteUnresolved(request, "local work changed during preparation");
@@ -365,7 +365,7 @@ public sealed partial class CloudFileSystem
         }
 
         IReadOnlyList<CloudOperationJournalEntry> operations = expected is null ? [] :
-            await transaction.Operations.ListByItemIdAsync(expected.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
+            await ReadValidatedRemoteLocalOperationsAsync(transaction, expected.ItemId, int.MaxValue, cancellationToken).ConfigureAwait(false);
         if (!member.OperationsFingerprint.AsSpan().SequenceEqual(RemoteNamespaceEvidence.FingerprintOperations(operations)))
         {
             throw DeleteUnresolved(request, "changed original local operations");

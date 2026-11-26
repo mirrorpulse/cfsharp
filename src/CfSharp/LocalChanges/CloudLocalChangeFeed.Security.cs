@@ -14,7 +14,7 @@ public sealed partial class CloudLocalChangeFeed
     internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
     private long _validatedObservationSequence;
 
-    private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
+    internal static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
     private static async ValueTask<StagedSecurityObservation> StageMetadataObservationAsync(ICloudStateTransaction transaction,
         SecurityFeedProjection projection, CloudItemState owner, CloudItemPath path, LocalChangeSourceEvent sourceEvent,
@@ -87,10 +87,8 @@ public sealed partial class CloudLocalChangeFeed
         IReadOnlyList<CloudOperationJournalEntry> operations, CancellationToken cancellationToken)
     {
         if (operations.Count == 0) { return 0; }
-        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
-            cancellationToken).ConfigureAwait(false);
-        if (receipts.Count == 0) { return operations.Count; }
-        HashSet<string> pending = new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
+        HashSet<string>? pending = await ReadPendingObservationValidationsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        if (pending is null) { return operations.Count; }
         long validated = Volatile.Read(ref _validatedObservationSequence);
         for (int index = 0; index < operations.Count; index++)
         {
@@ -98,6 +96,14 @@ public sealed partial class CloudLocalChangeFeed
             if (operation.Sequence > validated && pending.Contains(SecurityValidationName(operation.OperationId))) { return index; }
         }
         return operations.Count;
+    }
+
+    internal static async ValueTask<HashSet<string>?> ReadPendingObservationValidationsAsync(ICloudStateTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
+            cancellationToken).ConfigureAwait(false);
+        return receipts.Count == 0 ? null : new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
     }
 
     private static async ValueTask<CloudStateOperationKind> RetainUnboundObservationAsync(ICloudStateTransaction transaction, Guid operationId,

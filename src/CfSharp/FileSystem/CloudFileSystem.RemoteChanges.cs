@@ -69,6 +69,8 @@ public sealed partial class CloudFileSystem
     /// caller; replay rereads durable state, including when a commit completed before throwing.
     /// A metadata update whose native object changes before outcome publication retains its
     /// recovery evidence and the prior safe cursor.
+    /// An entry that encounters a local journal association awaiting identity validation
+    /// fails with a retryable outcome and retains the prior safe cursor.
     /// Cancellation after native success finishes item projection without cancellation and may
     /// leave outcome publication for replay. This protocol covers file moves submitted through
     /// this method; it cannot authenticate historical file moves without original evidence or
@@ -284,6 +286,8 @@ public sealed partial class CloudFileSystem
     /// </remarks>
     /// <exception cref="KeyNotFoundException">The conflict no longer exists.</exception>
     /// <exception cref="InvalidDataException">The durable conflict envelope is corrupt.</exception>
+    /// <exception cref="IOException">A local observation for the item is still awaiting
+    /// identity validation. Retry with the same conflict identifier.</exception>
     public async ValueTask<CloudRemoteApplyEntryResult> ResolveRemoteConflictAsync(
         Guid conflictId,
         CloudRemoteConflictResolution resolution,
@@ -1049,7 +1053,8 @@ public sealed partial class CloudFileSystem
         CloudItemState? localState = byRemoteId ?? byItemId ?? byPreviousPath ?? pathState;
         IReadOnlyList<CloudOperationJournalEntry> operations = localState is null
             ? []
-            : await transaction.Operations.ListByItemIdAsync(
+            : await ReadValidatedRemoteLocalOperationsAsync(
+                    transaction,
                     localState.ItemId,
                     maximumCount: int.MaxValue,
                     cancellationToken)
@@ -1062,6 +1067,24 @@ public sealed partial class CloudFileSystem
             byPath,
             byPreviousPath,
             operations);
+    }
+
+    private static async ValueTask<IReadOnlyList<CloudOperationJournalEntry>> ReadValidatedRemoteLocalOperationsAsync(
+        ICloudStateTransaction transaction, Guid itemId, int maximumCount, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations.ListByItemIdAsync(
+            itemId, maximumCount, cancellationToken).ConfigureAwait(false);
+        if (operations.Count == 0) { return operations; }
+
+        // Inspect the receipt in the same transaction as the journal row. Waiting
+        // while holding that transaction could block the worker that clears it.
+        HashSet<string>? pending = await CloudLocalChangeFeed.ReadPendingObservationValidationsAsync(
+            transaction, cancellationToken).ConfigureAwait(false);
+        if (pending is not null && operations.Any(operation => pending.Contains(CloudLocalChangeFeed.SecurityValidationName(operation.OperationId))))
+        {
+            throw new IOException($"A local journal observation for item '{itemId}' is awaiting identity validation. Retry the original remote change.");
+        }
+        return operations;
     }
 
     private async ValueTask<Guid> RegisterRemoteEchoSuppressionAsync(
@@ -1234,8 +1257,8 @@ public sealed partial class CloudFileSystem
             {
                 throw new RemotePlaceholderWriteConflictException(CloudRemoteConflictReason.Metadata);
             }
-            IReadOnlyList<CloudOperationJournalEntry> operations = await transaction.Operations.ListByItemIdAsync(
-                itemId, maximumCount: 1, cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<CloudOperationJournalEntry> operations = await ReadValidatedRemoteLocalOperationsAsync(
+                transaction, itemId, maximumCount: 1, cancellationToken).ConfigureAwait(false);
             if (operations.Count != 0)
             {
                 throw new RemotePlaceholderWriteConflictException(change.Kind == CloudRemoteChangeKind.MetadataUpdate
