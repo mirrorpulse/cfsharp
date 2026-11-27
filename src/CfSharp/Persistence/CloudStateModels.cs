@@ -359,6 +359,8 @@ public sealed class CloudRemoteBatchState
 /// <summary>Represents a durable provider-originated local-change suppression record.</summary>
 public sealed class CloudEchoSuppressionState
 {
+    internal const string RemoteChangePayloadPrefix = "remote-change/v1|";
+    private static readonly byte[] s_remoteChangePayloadPrefix = System.Text.Encoding.UTF8.GetBytes(RemoteChangePayloadPrefix);
     private readonly byte[] _payload;
 
     /// <summary>Initializes a suppression record and copies its CfSharp-defined payload.</summary>
@@ -427,6 +429,9 @@ public sealed class CloudEchoSuppressionState
 
     /// <summary>Gets the number of matching local observations that may still be consumed.</summary>
     public int RemainingObservations { get; }
+
+    internal bool IsRemoteUpsertContentEcho =>
+        Kind == CloudStateOperationKind.ContentUpdate && _payload.AsSpan().StartsWith(s_remoteChangePayloadPrefix);
 
     internal bool Matches(
         CloudStateOperationKind observedKind,

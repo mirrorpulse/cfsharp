@@ -5,6 +5,94 @@ public sealed partial class CloudContentConfirmationTests
     private const string OriginalSizePath = "original.bin";
 
     [Trait("Category", "AccessJournal")]
+    [Fact]
+    public async Task RemoteResizeSizeNoticeCannotHideASubsequentSameLengthWrite()
+    {
+        byte[] bytes = new byte[4096];
+        new Random(20261127).NextBytes(bytes);
+        AccessJournalFactory? factory = null;
+        await using Fixture fixture = await Fixture.StartAsync(path => factory = new(path), hydrationContent: bytes);
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(25));
+        CancellationToken token = deadline.Token;
+        string name = fixture.File.RelativePath;
+        string path = fixture.File.FullPath;
+        CloudPlaceholderIdentity identity = new(Guid.NewGuid(), "remote-resize-echo", "revision-1");
+        (await fixture.System.Root.CreatePlaceholdersAsync([
+            CloudFilePlaceholderSpec.CreateBuilder(name, identity, 0).WithInSyncState(true).Build(),
+        ], cancellationToken: token)).ThrowIfAnyFailed();
+
+        ControlledMetadataSource source = new();
+        await using CloudLocalChangeFeed feed = fixture.System.CreateLocalChangeFeed(null, source);
+        await feed.StartAsync(token);
+        CloudRemoteChange resize = new("resize", CloudRemoteChangeKind.FileUpsert, identity.RemoteId, "revision-2",
+            CloudItemKind.File, name, identity.ItemId, previousRemoteRevision: identity.RemoteRevision, length: bytes.Length,
+            metadata: CloudPlaceholderMetadata.CreateFileBuilder().Build());
+        LocalChangeSourceEvent size = await CaptureNativeModificationAsync(fixture.Root, name, async () =>
+        {
+            CloudRemoteApplyResult result = await fixture.System.ApplyRemoteChangesAsync(
+                new("remote-resize-echo", Array.Empty<byte>(), [resize], new byte[] { 1 }), cancellationToken: token);
+            Assert.Equal(CloudRemoteApplyEntryStatus.Applied, Assert.Single(result.Entries).Status);
+        }, token, LocalChangeSourceAction.SizeModified);
+        CloudItemSnapshot resized = await fixture.File.InspectAsync(token);
+        Assert.Equal((bytes.LongLength, CloudSynchronizationState.InSync, 0L),
+            (resized.Length, resized.SynchronizationState, resized.ModifiedDataSize));
+        Assert.Equal(bytes.LongLength, size.SizeChange!.Value.Length);
+
+        await source.EmitAsync(size);
+        await DrainThroughMarkerAsync("resize-drained");
+        Assert.Empty(await AccessRowsAsync(factory!));
+        CloudEchoSuppressionState originalTicket;
+        await using (ICloudStateTransaction read = await factory!.Store!.BeginTransactionAsync(token))
+        {
+            originalTicket = Assert.Single(await read.EchoSuppressions.ListActiveAsync(DateTimeOffset.UtcNow, token));
+            Assert.Equal((CloudStateOperationKind.ContentUpdate, identity.ItemId), (originalTicket.Kind, originalTicket.ItemId));
+        }
+
+        // A remote resize can emit only Size, leaving its ContentUpdate ticket available
+        // for the genuine LastWrite that follows the first read of the new revision.
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
+        bytes[0] ^= 0xff;
+        LocalChangeSourceEvent write = await CaptureNativeModificationAsync(fixture.Root, name, async () =>
+        {
+            await using FileStream writer = new(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+            writer.WriteByte(bytes[0]);
+            await writer.FlushAsync(token);
+        }, token);
+        CloudItemSnapshot edited = await fixture.File.InspectAsync(token);
+        Assert.Equal(resized.Length, edited.Length);
+        Assert.True(edited.ModifiedDataSize > 0);
+        await source.EmitAsync(write);
+        await DrainThroughMarkerAsync("write-drained");
+
+        CloudOperationJournalEntry original = Assert.Single(await AccessRowsAsync(factory!));
+        Assert.Equal((CloudStateOperationKind.ContentUpdate, identity.ItemId), (original.Kind, original.ItemId));
+        await using (ICloudStateTransaction read = await factory!.Store!.BeginTransactionAsync(token))
+        {
+            CloudEchoSuppressionState unused = Assert.IsType<CloudEchoSuppressionState>(
+                await read.EchoSuppressions.GetAsync(originalTicket.SuppressionId, token));
+            Assert.Equal(originalTicket.RemainingObservations, unused.RemainingObservations);
+        }
+        CloudLocalChangePage page = await feed.ReadPageAsync(await feed.BeginScanAsync(token), 0, 10, token);
+        Assert.False(page.RequiresFullRescan);
+        CloudLocalChange local = Assert.Single(page.Changes);
+        Assert.Equal((original.OperationId, original.Sequence, identity.ItemId, name),
+            (local.OperationId, local.Sequence, local.ItemId, local.RelativePath));
+        await feed.AcknowledgeAsync([local.OperationId], token);
+        Assert.Empty(await AccessRowsAsync(factory!));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(path, token));
+
+        async Task DrainThroughMarkerAsync(string marker)
+        {
+            Directory.CreateDirectory(Path.Combine(fixture.Root, marker));
+            await source.EmitAsync(new(LocalChangeSourceAction.Created, marker));
+            await WaitForAccessRowsAsync(factory!, rows => rows.Any(row => LocalChangePayload.Decode(row.Payload).RelativePath == marker));
+            CloudOperationJournalEntry fence = Assert.Single(await AccessRowsAsync(factory!),
+                row => LocalChangePayload.Decode(row.Payload).RelativePath == marker);
+            await feed.AcknowledgeAsync([fence.OperationId], token);
+        }
+    }
+
+    [Trait("Category", "AccessJournal")]
     [Theory]
     [InlineData(CloudInSyncPolicy.None)]
     [InlineData(CloudInSyncPolicy.TrackAll)]

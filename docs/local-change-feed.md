@@ -321,6 +321,10 @@ Provider-originated writes can be wrapped by `SuppressProviderEchoAsync` so they
 uploads. Hydration, pinning, and availability transitions are not local upload operations by
 themselves.
 
+An automatic file upsert ticket can consume a content notification only while the matching
+placeholder is in sync and Windows reports no modified data. A clean Size notification may
+leave a ticket active. A subsequent local write with modified data still enters the journal.
+
 ### Acknowledging uploaded snapshots
 
 Each observed change has its own durable operation identifier, including repeated notifications for the same path. Acknowledge only the identifiers whose snapshots have completed uploading. An acknowledgement does not cover subsequent observations. Consumers must tolerate redundant uploads rather than assume pending events are coalesced.

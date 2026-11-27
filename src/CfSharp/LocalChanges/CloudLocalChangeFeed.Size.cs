@@ -148,6 +148,26 @@ public sealed partial class CloudLocalChangeFeed
         size.LastWriteTime > 0 && item.LastWriteTime?.ToFileTime() == size.LastWriteTime &&
         size.ChangeTime > 0 && item.ChangeTime == size.ChangeTime;
 
+    private static bool IsCleanRemoteUpsertFile(CloudItemPath path, CloudItemState owner)
+    {
+        if (owner.IsTombstone || !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)) { return false; }
+        try
+        {
+            using SafeFileHandle reference = WindowsFileMetadata.OpenMetadataReference(path.FullPath);
+            LocalCloudItemInspection current = CloudItemInspector.Inspect(reference, path.FullPath, CloudItemKind.File);
+            return current.SynchronizationState == CloudSynchronizationState.InSync && current.ModifiedDataSize == 0 &&
+                CloudPlaceholderIdentity.TryDecode(current.PlaceholderIdentity, out CloudPlaceholderIdentity? identity) &&
+                identity.ItemId == owner.ItemId && identity.RemoteId == owner.RemoteId &&
+                (owner.LocalFileId is null || owner.LocalFileId == current.LocalFileId) && MatchesAttributePath(reference, path);
+        }
+        catch (Exception exception) when (exception is CloudPathReparsePointException or CloudFilesException or
+            Win32Exception or UnauthorizedAccessException or InvalidOperationException or IOException)
+        {
+            // Without a clean native match, leave the observation in the journal path.
+            return false;
+        }
+    }
+
     private static bool IsMissingSizeObservationPath(string path)
     {
         try { _ = File.GetAttributes(path); }

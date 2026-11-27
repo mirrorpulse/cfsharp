@@ -1173,9 +1173,28 @@ public sealed partial class CloudLocalChangeFeed : IDisposable, IAsyncDisposable
                     CloudDirectoryStateProjection.SamePath(candidate.RelativePath, path.RelativePath)) &&
                 (await ReadMetadataIntentsAsync(transaction, cancellationToken, observedState.ItemId).ConfigureAwait(false))
                     .Any(intent => intent.Passthrough && !intent.Superseded && intent.Covers(path.RelativePath));
-            suppression = suppressions.FirstOrDefault(candidate => candidate.Kind != CloudStateOperationKind.MetadataUpdate && (RemoteCreationIntent.IsCreationEcho(candidate)
-                ? !bypassCreationContentEcho && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState)
-                : candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId)));
+            bool? cleanUpsertTarget = null;
+            suppression = suppressions.FirstOrDefault(MatchesSuppression);
+
+            bool MatchesSuppression(CloudEchoSuppressionState candidate)
+            {
+                if (candidate.Kind == CloudStateOperationKind.MetadataUpdate) { return false; }
+                if (RemoteCreationIntent.IsCreationEcho(candidate))
+                {
+                    return !bypassCreationContentEcho && MatchesRemoteCreationEcho(candidate, operationKind, path, observedState);
+                }
+                if (!candidate.Matches(operationKind, path.RelativePath, previousPath?.RelativePath, observedState?.ItemId))
+                {
+                    return false;
+                }
+                if (observedState is { Kind: CloudItemKind.File } && candidate.IsRemoteUpsertContentEcho)
+                {
+                    // A clean Size notice can be the provider's only notification. A
+                    // remaining upsert ticket must not consume a later local write.
+                    return cleanUpsertTarget ??= IsCleanRemoteUpsertFile(path, observedState);
+                }
+                return true;
+            }
         }
 
         if (suppression is not null)
