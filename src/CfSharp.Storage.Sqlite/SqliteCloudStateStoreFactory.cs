@@ -843,7 +843,7 @@ internal sealed class SqlitePathHandleLease : IDisposable
 
 internal static class SqliteSchema
 {
-    internal const int CurrentVersion = 10;
+    internal const int CurrentVersion = 11;
     internal const string PathCollationName = "CFSHARP_UNICODE_NOCASE";
 
     private static ValueTask<SqliteCloudStateTransaction> BeginSchemaTransactionAsync(
@@ -985,8 +985,9 @@ internal static class SqliteSchema
 
             if (version < CurrentVersion)
             {
-                // Remote metadata receipts use existing tables, but a schema-9 reader
-                // would ignore pending reconciliation. Commit the fence before opening the store.
+                // Recovery receipts use existing tables. Schema-9 readers ignore remote
+                // metadata receipts, and schema-10 readers cannot recover staged ContentUpdate
+                // rows. Commit the version fence before opening the store.
                 await using SqliteCloudStateTransaction transaction = await BeginSchemaTransactionAsync(
                     connection, databasePath, cancellationToken).ConfigureAwait(false);
                 await using SqliteCommand upgrade = transaction.CreateCommand(

@@ -27,7 +27,7 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     internal WindowsSecurityChangeSource(string path, int capacity, Action<WindowsSecurityChange> changed,
         Action<int, bool> error, Action? beforeRearm = null, uint notifyFilter = 0x100)
     {
-        if (notifyFilter is not (0x100 or 0x4)) { throw new ArgumentOutOfRangeException(nameof(notifyFilter)); }
+        if (notifyFilter is not (0x100 or 0x4 or 0x8)) { throw new ArgumentOutOfRangeException(nameof(notifyFilter)); }
         _changed = changed;
         _error = error;
         _beforeRearm = beforeRearm;
@@ -180,7 +180,14 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
             int end = checked(header + (int)record.FileNameLength);
             if (record.Action != 3) { throw new InvalidDataException("Unexpected action in a metadata-only subscription."); }
             changes.Add(new(new string(MemoryMarshal.Cast<byte, char>(buffer[header..end])), record.FileId,
-                record.ParentFileId, (record.FileAttributes & 0x10) != 0));
+                record.ParentFileId, (record.FileAttributes & 0x10) != 0)
+            {
+                FileAttributes = record.FileAttributes,
+                ReparsePointTag = record.ReparsePointTag,
+                FileSize = record.FileSize,
+                LastWriteTime = record.LastModificationTime,
+                ChangeTime = record.LastChangeTime,
+            });
             if (record.NextEntryOffset == 0) { return changes.ToArray(); }
             if (record.NextEntryOffset < end || record.NextEntryOffset > buffer.Length || (record.NextEntryOffset & 3) != 0)
             { throw new InvalidDataException("The security notification link is invalid."); }
@@ -235,4 +242,11 @@ internal sealed partial class WindowsSecurityChangeSource : IAsyncDisposable
     private static unsafe partial bool CancelIoEx(SafeFileHandle directory, NativeOverlapped* overlapped);
 }
 
-internal readonly record struct WindowsSecurityChange(string RelativePath, ulong FileId, ulong ParentFileId, bool IsDirectory);
+internal readonly record struct WindowsSecurityChange(string RelativePath, ulong FileId, ulong ParentFileId, bool IsDirectory)
+{
+    internal uint FileAttributes { get; init; }
+    internal uint ReparsePointTag { get; init; }
+    internal long FileSize { get; init; }
+    internal long LastWriteTime { get; init; }
+    internal long ChangeTime { get; init; }
+}

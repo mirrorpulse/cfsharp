@@ -21,6 +21,8 @@ internal sealed class LocalCloudItemInspection
 
     internal DateTimeOffset? LastWriteTime { get; init; }
 
+    internal long ChangeTime { get; init; }
+
     internal DateTimeOffset? LastAccessTime { get; init; }
 
     internal CloudPlaceholderState PlaceholderState { get; init; }
@@ -161,6 +163,7 @@ internal static partial class CloudItemInspector
             Length = length,
             CreationTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.CreationTime)),
             LastWriteTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.LastWriteTime)),
+            ChangeTime = basic.ChangeTime,
             LastAccessTime = ToDateTimeOffset(DateTime.FromFileTimeUtc(basic.LastAccessTime)),
             PlaceholderState = placeholderState,
             ContentAvailability = GetContentAvailability(

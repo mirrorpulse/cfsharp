@@ -17,11 +17,36 @@ attribute suppression requires the explicit caller guarantee described in
 [metadata echo coordination](metadata-echo-coordination.md). Security and data notifications bypass
 that authorization as well. Windows can report an attribute
 change during a rename without changing resident bytes. That observation remains metadata; the
-independent size, last-write and creation-time subscription still reports conservative content
-candidates, including same-length writes before, between or after successive renames. No content
-read, timestamp heuristic, in-sync flag or rename window suppresses a data notification. An attribute
+independent last-write and creation-time subscription still reports conservative content
+candidates, including same-length writes before, between or after successive renames. An attribute
 record delivered after its path has moved or been replaced remains an unbound metadata observation
 requiring reconciliation, rather than discovering a new object at the historical path.
+
+Size notifications have their own subscription because Windows can report a size change when
+hydration increases physical allocation and leaves the logical length unchanged. A size notice
+for a known file placeholder produces no content row when the native notice and the current
+object agree on identity, logical length and in-sync state, and Windows reports only validated
+data. A placeholder can become out of sync from an attribute edit, and a later write can change
+the modified-data count before an older size notice is processed. An out-of-sync size notice
+can bind only when the native record's last-write and change times still match the file and
+Windows reports modified data. The feed checks those times again around the journal commit.
+If the object was replaced, the captured and current states disagree, or modified data cannot be
+confirmed, the feed retains an unbound observation and requires reconciliation. A size notice for a path
+without an item row stays unbound. The ordered name subscription establishes ownership, including
+when Size arrives before a rename or after an ordinary name disappears. A size notice for an
+ordinary file can reuse an existing item ID only when its durable native file ID matches the
+observed object. An acknowledgement can advance the stored remote revision independently of the
+placeholder. The feed matches the placeholder's item ID and remote ID against the stored item,
+then rechecks the native binding and complete native identity, including its revision, before
+and after committing the journal row. A durable validation
+receipt withholds the row from reads and acknowledgement until the second check. If the object
+changed or the feed stopped during publication, reconciliation exposes the original operation
+with the same ID and sequence and no item association. Remote application encountering such a
+pending association returns a retryable entry and leaves its safe cursor at the previous durable
+entry. Last-write notifications remain
+independent, so a same-length local write overlapping hydration can still be read and acknowledged
+separately.
+
 For newly discovered ordinary files and directories, the feed also retains the native NTFS file
 reference in the official item row. A later attribute record can bind to that exact object without
 requiring a placeholder identity. Older ordinary rows without that binding remain unbound until
@@ -295,6 +320,10 @@ alone cannot establish historical native ownership.
 Provider-originated writes can be wrapped by `SuppressProviderEchoAsync` so they do not become
 uploads. Hydration, pinning, and availability transitions are not local upload operations by
 themselves.
+
+An automatic file upsert ticket can consume a content notification only while the matching
+placeholder is in sync and Windows reports no modified data. A clean Size notification may
+leave a ticket active. A subsequent local write with modified data still enters the journal.
 
 ### Acknowledging uploaded snapshots
 

@@ -11,7 +11,7 @@ internal interface ILocalChangeSource : IAsyncDisposable
 }
 
 /// <summary>
-/// Combines the Windows data/name watcher and identity-bearing attribute and security notifications
+/// Combines the Windows name and time watcher with identity-bearing size, attribute and security notifications
 /// into the immutable local-change source contract.
 /// </summary>
 internal sealed class WindowsLocalChangeSource : ILocalChangeSource
@@ -26,6 +26,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
     private FileSystemWatcher? _watcher;
     private WindowsSecurityChangeSource? _securityWatcher;
     private WindowsSecurityChangeSource? _attributeWatcher;
+    private WindowsSecurityChangeSource? _sizeWatcher;
     private Func<LocalChangeSourceEvent, ValueTask>? _eventHandler;
     private int _disposed;
     private Task? _disposal;
@@ -64,7 +65,6 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                     IncludeSubdirectories = true,
                     NotifyFilter = NotifyFilters.FileName |
                         NotifyFilters.DirectoryName |
-                        NotifyFilters.Size |
                         NotifyFilters.LastWrite |
                         NotifyFilters.CreationTime,
                     InternalBufferSize = _bufferCapacity,
@@ -85,6 +85,10 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
                 _securityWatcher = new(_rootPath, _bufferCapacity, OnSecurityChanged, OnSecurityError, _beforeSecurityRearm);
                 _beforeAttributeStart?.Invoke();
                 _attributeWatcher = new(_rootPath, _bufferCapacity, OnAttributesChanged, OnAttributeError, notifyFilter: 0x4);
+                // Hydration can raise Size without changing the logical file length.
+                // Keep that observation separate from last-write notices, including
+                // when both arrive for a real write that races hydration.
+                _sizeWatcher = new(_rootPath, _bufferCapacity, OnSizeChanged, OnSizeError, notifyFilter: 0x8);
             }
         }
         catch (Exception startupFailure)
@@ -116,19 +120,28 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         FileSystemWatcher? watcher;
         WindowsSecurityChangeSource? security;
         WindowsSecurityChangeSource? attributes;
+        WindowsSecurityChangeSource? size;
         lock (_gate)
         {
             watcher = _watcher;
             _watcher = null;
             security = _securityWatcher;
             attributes = _attributeWatcher;
+            size = _sizeWatcher;
         }
 
         try
         {
             try
             {
-                if (attributes is not null) { await attributes.DisposeAsync().ConfigureAwait(false); }
+                try
+                {
+                    if (size is not null) { await size.DisposeAsync().ConfigureAwait(false); }
+                }
+                finally
+                {
+                    if (attributes is not null) { await attributes.DisposeAsync().ConfigureAwait(false); }
+                }
             }
             finally
             {
@@ -144,6 +157,7 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
             {
                 _securityWatcher = null;
                 _attributeWatcher = null;
+                _sizeWatcher = null;
                 _eventHandler = null;
             }
             watcher?.Dispose();
@@ -185,11 +199,38 @@ internal sealed class WindowsLocalChangeSource : ILocalChangeSource
         {
             if (_attributeWatcher is not null)
             {
-                // Loss of either metadata subscription invalidates the feed until rebuilt.
+                // Loss of a metadata subscription invalidates the feed until rebuilt.
                 PublishCore(new(terminal ? LocalChangeSourceAction.AttributeSubscriptionFailed :
                     error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error, string.Empty, error),
                     fromSecurityPump: true);
             }
+        }
+    }
+
+    private void OnSizeChanged(WindowsSecurityChange change)
+    {
+        lock (_gate)
+        {
+            if (_sizeWatcher is null) { return; }
+            LocalSecurityChangeIdentity identity = new(_sizeWatcher.VolumeSerialNumber, _sizeWatcher.RootFileId,
+                change.FileId, change.ParentFileId, change.IsDirectory);
+            CfPlaceholderState state = OperatingSystem.IsWindowsVersionAtLeast(10, 0, 16299)
+                ? CfApi.CfGetPlaceholderStateFromAttributeTag(change.FileAttributes, change.ReparsePointTag)
+                : CfPlaceholderState.Invalid;
+            PublishCore(new(LocalChangeSourceAction.SizeModified, change.RelativePath,
+                SizeChange: new(identity, change.FileSize, state == CfPlaceholderState.Invalid
+                    ? CloudPlaceholderState.None : (CloudPlaceholderState)state, change.LastWriteTime, change.ChangeTime)), fromSecurityPump: true);
+        }
+    }
+
+    private void OnSizeError(int error, bool terminal)
+    {
+        lock (_gate)
+        {
+            if (_sizeWatcher is null) { return; }
+            PublishCore(new(terminal ? LocalChangeSourceAction.SizeSubscriptionFailed :
+                error == 1022 ? LocalChangeSourceAction.Overflow : LocalChangeSourceAction.Error, string.Empty, error),
+                fromSecurityPump: true);
         }
     }
 

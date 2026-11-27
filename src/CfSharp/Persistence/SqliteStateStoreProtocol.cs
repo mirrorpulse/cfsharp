@@ -9,7 +9,7 @@ internal interface ISqliteStateStoreProtocol
 
 internal static class SqliteStateStoreProtocol
 {
-    private const int MinimumSchemaVersion = 10;
+    private const int MinimumSchemaVersion = 11;
 
     internal static void EnsureCompatible(object provider)
     {
@@ -17,7 +17,7 @@ internal static class SqliteStateStoreProtocol
             provider is not ISqliteStateStoreProtocol { SchemaVersion: >= MinimumSchemaVersion })
         {
             throw new NotSupportedException(
-                "This CfSharp version requires CfSharp.Storage.Sqlite with schema 10 or later. Upgrade both packages together.");
+                $"This CfSharp version requires CfSharp.Storage.Sqlite with schema {MinimumSchemaVersion} or later. Upgrade both packages together.");
         }
     }
 }

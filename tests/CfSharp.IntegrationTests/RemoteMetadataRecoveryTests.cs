@@ -1660,14 +1660,21 @@ public sealed partial class CloudContentConfirmationTests
             private bool _writesReconciliation;
             public ICloudItemStateRepository Items => inner.Items;
             public ICloudCheckpointRepository Checkpoints => owner.OverlappingWrites ||
-                owner._boundary is "rescan-before-preparation" or "metadata-cancel-preparation" ? this : inner.Checkpoints;
+                owner._boundary is "rescan-before-preparation" or "metadata-cancel-preparation" or
+                    "size-before-append" or "size-before-commit" ? this : inner.Checkpoints;
             public ICloudOperationJournal Operations => inner.Operations;
             public ICloudConflictRepository Conflicts => inner.Conflicts;
             public ICloudRemoteBatchRepository RemoteBatches => owner.OverlappingWrites ? this : inner.RemoteBatches;
             public ICloudEchoSuppressionRepository EchoSuppressions => inner.EchoSuppressions;
 
-            ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken) =>
-                inner.Checkpoints.GetAsync(name, cancellationToken);
+            async ValueTask<CloudStateCheckpoint?> ICloudCheckpointRepository.GetAsync(string name, CancellationToken cancellationToken)
+            {
+                if (owner._boundary == "size-before-append" && name == RemoteMetadataIntent.DirectoryTimeObservationName(OriginalSizePath))
+                {
+                    await PauseSizeDiscoveryAsync("size-before-append", cancellationToken);
+                }
+                return await inner.Checkpoints.GetAsync(name, cancellationToken);
+            }
             async ValueTask<IReadOnlyList<CloudStateCheckpoint>> ICloudCheckpointRepository.ListAsync(string namePrefix, CancellationToken cancellationToken)
             {
                 // For a protected write, the first per-item lookup is preflight. The
@@ -1692,6 +1699,16 @@ public sealed partial class CloudContentConfirmationTests
                 _writesReconciliation |= checkpoint.Name.StartsWith(RemoteMetadataIntent.Prefix, StringComparison.Ordinal) &&
                     RemoteMetadataIntent.Decode(checkpoint).RequiresReconciliation;
                 await inner.Checkpoints.UpsertAsync(checkpoint, cancellationToken);
+                if (checkpoint.Name == CloudLocalChangeFeed.CheckpointName)
+                {
+                    await PauseSizeDiscoveryAsync("size-before-commit", cancellationToken);
+                }
+            }
+            private async ValueTask PauseSizeDiscoveryAsync(string boundary, CancellationToken cancellationToken)
+            {
+                if (!owner.Armed || owner._boundary != boundary || Interlocked.Exchange(ref owner._failed, 1) != 0) { return; }
+                owner.OutcomePaused.TrySetResult();
+                await owner.ResumeOutcome.Task.WaitAsync(cancellationToken);
             }
             ValueTask ICloudCheckpointRepository.RemoveAsync(string name, CancellationToken cancellationToken)
             {
@@ -1732,6 +1749,8 @@ public sealed partial class CloudContentConfirmationTests
                         "conflict-outcome-before" => owner.CancelConflictOutcome is { } configured &&
                             await Conflicts.GetAsync(configured.ConflictId, cancellationToken) is null,
                         "staging-after" or "staging-paused-after" => staged is not null,
+                        "size-publication-committed" => (await Operations.ListAsync(2, cancellationToken))
+                            .Any(row => row.Kind == CloudStateOperationKind.ContentUpdate && row.ItemId.HasValue),
                         "passthrough-confirmation-before" => intents.Any(intent => intent.OutcomeConfirmed),
                         "rescan-awaiting-authorization" => intents.Any(intent => intent.OutcomeConfirmed),
                         "overlapping-outcome" => intents.Any(intent => intent.Completed && !intent.OutcomeConfirmed),
@@ -1762,7 +1781,7 @@ public sealed partial class CloudContentConfirmationTests
                     return;
                 }
                 if (owner._boundary is "preparation-paused-after" or "native-projection-paused-after" or
-                    "rescan-awaiting-authorization" or "staging-paused-after")
+                    "rescan-awaiting-authorization" or "staging-paused-after" or "size-publication-committed")
                 {
                     await inner.CommitAsync(cancellationToken);
                     owner.OutcomePaused.TrySetResult();

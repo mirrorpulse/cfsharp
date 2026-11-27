@@ -9,10 +9,12 @@ namespace CfSharp;
 
 public sealed partial class CloudLocalChangeFeed
 {
+    // Keep metadata receipts readable across upgrades. SQLite schema 11 fences readers
+    // that cannot recover the staged ContentUpdate rows also referenced by this prefix.
     internal const string SecurityValidationPrefix = "cfsharp/security-validation/v1/";
-    private long _validatedAttributeSequence;
+    private long _validatedObservationSequence;
 
-    private static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
+    internal static string SecurityValidationName(Guid operationId) => SecurityValidationPrefix + operationId.ToString("N");
 
     private static async ValueTask<StagedSecurityObservation> StageMetadataObservationAsync(ICloudStateTransaction transaction,
         SecurityFeedProjection projection, CloudItemState owner, CloudItemPath path, LocalChangeSourceEvent sourceEvent,
@@ -65,28 +67,29 @@ public sealed partial class CloudLocalChangeFeed
         if (projection.AllowsRename)
         {
             projection.Validate();
-            // The worker serializes publication, so one monotonic watermark covers all
-            // successfully validated rows without retaining an unbounded per-operation cache.
-            Volatile.Write(ref _validatedAttributeSequence, published.Sequence);
-            SignalAvailable();
-            // Eligibility is established above, without another publication commit window.
-            // A crash before this bookkeeping completes leaves the receipt for safe recovery.
-            await using ICloudStateTransaction completed = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            await completed.Checkpoints.RemoveAsync(receipt, cancellationToken).ConfigureAwait(false);
-            await completed.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await CompleteValidatedObservationAsync(published.OperationId, published.Sequence, cancellationToken).ConfigureAwait(false);
         }
         else { SignalAvailable(); }
     }
 
-    private async ValueTask<int> ValidatedMetadataPrefixLengthAsync(ICloudStateTransaction transaction,
+    private async ValueTask CompleteValidatedObservationAsync(Guid operationId, long sequence, CancellationToken cancellationToken)
+    {
+        // One worker serializes publication. Advance the watermark only after the
+        // native binding is checked, then remove the durable recovery receipt.
+        Volatile.Write(ref _validatedObservationSequence, sequence);
+        SignalAvailable();
+        await using ICloudStateTransaction transaction = await _stateStore.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<int> ValidatedObservationPrefixLengthAsync(ICloudStateTransaction transaction,
         IReadOnlyList<CloudOperationJournalEntry> operations, CancellationToken cancellationToken)
     {
         if (operations.Count == 0) { return 0; }
-        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
-            cancellationToken).ConfigureAwait(false);
-        if (receipts.Count == 0) { return operations.Count; }
-        HashSet<string> pending = new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
-        long validated = Volatile.Read(ref _validatedAttributeSequence);
+        HashSet<string>? pending = await ReadPendingObservationValidationsAsync(transaction, cancellationToken).ConfigureAwait(false);
+        if (pending is null) { return operations.Count; }
+        long validated = Volatile.Read(ref _validatedObservationSequence);
         for (int index = 0; index < operations.Count; index++)
         {
             CloudOperationJournalEntry operation = operations[index];
@@ -95,19 +98,35 @@ public sealed partial class CloudLocalChangeFeed
         return operations.Count;
     }
 
-    private static async ValueTask RetainUnboundSecurityObservationAsync(ICloudStateTransaction transaction, Guid operationId,
-        ReadOnlyMemory<byte> payload, DateTimeOffset observedAt, CancellationToken cancellationToken)
+    internal static async ValueTask<HashSet<string>?> ReadPendingObservationValidationsAsync(ICloudStateTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
+            cancellationToken).ConfigureAwait(false);
+        return receipts.Count == 0 ? null : new(receipts.Select(receipt => receipt.Name), StringComparer.Ordinal);
+    }
+
+    private static async ValueTask<CloudStateOperationKind> RetainUnboundObservationAsync(ICloudStateTransaction transaction, Guid operationId,
+        ReadOnlyMemory<byte> payload, DateTimeOffset observedAt, CancellationToken cancellationToken,
+        CloudStateOperationKind? kind = CloudStateOperationKind.MetadataUpdate)
     {
         CloudOperationJournalEntry? existing = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
+        // Size receipts commit with their journal row. A receipt with no row can
+        // come from the initial staging transaction for a metadata observation.
+        CloudStateOperationKind operationKind = kind ?? existing?.Kind ?? CloudStateOperationKind.MetadataUpdate;
+        if (operationKind is not (CloudStateOperationKind.MetadataUpdate or CloudStateOperationKind.ContentUpdate) ||
+            (existing is not null && existing.Kind != operationKind))
+        {
+            throw new InvalidDataException("An observation validation receipt references a different operation kind.");
+        }
         if (existing is null)
         {
-            await transaction.Operations.EnqueueAsync(new(operationId, CloudStateOperationKind.MetadataUpdate, null,
+            await transaction.Operations.EnqueueAsync(new(operationId, operationKind, null,
                 payload.Span, observedAt), cancellationToken).ConfigureAwait(false);
         }
         else if (existing.ItemId is not null)
         {
             RequireJournalAssociationUpdates(transaction);
-            if (existing.Kind != CloudStateOperationKind.MetadataUpdate) { throw new InvalidDataException("A metadata validation receipt references a different operation kind."); }
             // The row may already have committed while its validation receipt still withheld
             // delivery. Clear only its association, preserving ordering and retry metadata.
             CloudOperationJournalEntry unbound = new(existing.OperationId, existing.Kind, null,
@@ -119,17 +138,18 @@ public sealed partial class CloudLocalChangeFeed
             CloudOperationJournalEntry? retained = await transaction.Operations.GetAsync(operationId, cancellationToken).ConfigureAwait(false);
             if (retained is null || retained.ItemId is not null)
             {
-                throw new NotSupportedException("The custom operation journal must clear an item's association during metadata recovery. The validation receipt remains pending.");
+                throw new NotSupportedException("The custom operation journal must clear an item's association during observation recovery. The validation receipt remains pending.");
             }
             if (retained.OperationId != existing.OperationId || retained.Sequence != existing.Sequence || retained.Kind != existing.Kind ||
                 retained.CreatedAt != existing.CreatedAt || retained.AttemptCount != existing.AttemptCount || retained.RetryAfter != existing.RetryAfter ||
                 !retained.Payload.Span.SequenceEqual(existing.Payload.Span))
             {
-                throw new InvalidDataException("The custom operation journal changed the original metadata observation during recovery.");
+                throw new InvalidDataException("The custom operation journal changed the original observation during recovery.");
             }
         }
 
         await transaction.Checkpoints.RemoveAsync(SecurityValidationName(operationId), cancellationToken).ConfigureAwait(false);
+        return operationKind;
     }
 
     private static void RequireJournalAssociationUpdates(ICloudStateTransaction transaction)
@@ -140,7 +160,7 @@ public sealed partial class CloudLocalChangeFeed
         }
     }
 
-    private static async ValueTask<bool> RecoverStagedSecurityObservationsAsync(ICloudStateTransaction transaction,
+    private static async ValueTask<bool> RecoverStagedObservationsAsync(ICloudStateTransaction transaction,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<CloudStateCheckpoint> receipts = await transaction.Checkpoints.ListAsync(SecurityValidationPrefix,
@@ -149,13 +169,13 @@ public sealed partial class CloudLocalChangeFeed
         {
             if (!Guid.TryParseExact(receipt.Name.AsSpan(SecurityValidationPrefix.Length), "N", out Guid operationId) || operationId == Guid.Empty)
             {
-                throw new InvalidDataException("A staged security observation has an invalid operation identifier.");
+                throw new InvalidDataException("A staged observation has an invalid operation identifier.");
             }
 
             LocalChangePayload payload = LocalChangePayload.Decode(receipt.Value);
-            await RetainUnboundSecurityObservationAsync(transaction, operationId, receipt.Value, payload.ObservedAt,
-                cancellationToken).ConfigureAwait(false);
-            if (payload.IsDirectory)
+            CloudStateOperationKind kind = await RetainUnboundObservationAsync(transaction, operationId, receipt.Value, payload.ObservedAt,
+                cancellationToken, kind: null).ConfigureAwait(false);
+            if (payload.IsDirectory || kind == CloudStateOperationKind.ContentUpdate)
             {
                 CloudItemState? owner = await transaction.Items.GetByRelativePathAsync(payload.RelativePath, cancellationToken).ConfigureAwait(false);
                 await RetainMetadataObservationProtectionAsync(transaction.Checkpoints, payload.RelativePath, owner,
@@ -168,9 +188,20 @@ public sealed partial class CloudLocalChangeFeed
         return receipts.Count != 0;
     }
 
-    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection,
-        LocalChangeSourceEvent Observation) : IDisposable
+    private interface IStagedObservation : IDisposable
     {
+        ValueTask PublishAsync(CloudLocalChangeFeed feed, CancellationToken cancellationToken);
+    }
+
+    private sealed record StagedSecurityObservation(CloudOperationJournalEntry Entry, SecurityFeedProjection Projection,
+        LocalChangeSourceEvent Observation) : IStagedObservation
+    {
+        public ValueTask PublishAsync(CloudLocalChangeFeed feed, CancellationToken cancellationToken)
+        {
+            Projection.Validate();
+            return feed.PublishValidatedSecurityObservationAsync(Entry, Projection, Observation, cancellationToken);
+        }
+
         public void Dispose() => Projection.Dispose();
     }
 
